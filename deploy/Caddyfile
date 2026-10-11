@@ -1,0 +1,25 @@
+www.openrotmg.org {
+    redir https://openrotmg.org{uri} permanent
+}
+
+openrotmg.org {
+    encode zstd gzip
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy strict-origin-when-cross-origin
+    }
+    @private path /dev /dev/*
+    handle @private {
+        respond "Development control is not public" 403
+    }
+    @backend path /game /client.swf /legacy-api/* /vendor/* /sfx/* /health
+    handle @backend {
+        reverse_proxy 127.0.0.1:18923 {
+            header_up X-Forwarded-For {http.request.remote.host}
+        }
+    }
+    handle {
+        root * /opt/openrotmg/site
+        file_server
+    }
+}

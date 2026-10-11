@@ -1,12 +1,13 @@
+mod config;
 mod content;
 mod crypto;
 mod server;
 mod store;
 mod wire;
 mod world;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use rand::RngCore;
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<()> {
     let filter = match std::env::var("RUST_LOG") {
@@ -18,12 +19,10 @@ async fn main() -> Result<()> {
         .with_env_filter(filter)
         .json()
         .init();
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let client = root
-        .parent()
-        .context("workspace parent missing")?
-        .join("client");
-    let state = root.join(".local");
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let (config, dev_control) = config::Config::load(&args)?;
+    let client = config.client;
+    let state = config.state;
     std::fs::create_dir_all(&state)?;
     #[cfg(unix)]
     {
@@ -36,21 +35,18 @@ async fn main() -> Result<()> {
             "missing client asset {file}; run python3 ../client/run.py --prepare-only"
         );
     }
-    let args: Vec<_> = std::env::args().skip(1).collect();
-    ensure!(
-        args.iter().all(|s| s == "--dev-control"),
-        "usage: cargo run -- [--dev-control]"
-    );
-    let content = Arc::new(content::Content::load(&root.join("data"))?);
+    let content = Arc::new(content::Content::load(&config.data)?);
     let map = Arc::new(content::Map::load(
-        &root.join("data/tutorial.wmap"),
+        &config.data.join("tutorial.wmap"),
         &content,
     )?);
     let keys = Arc::new(crypto::Keys::load(&state)?);
     let swf = Arc::new(keys.client(&client.join("client.swf"))?);
     let store = store::Store::open(&state.join("game.db"))?;
-    let world = world::Handle::spawn(world::World::new(content.clone(), map)?);
-    let control = if args.iter().any(|s| s == "--dev-control") {
+    let mut world = world::World::new(content.clone(), map)?;
+    world.max_players = config.max_players;
+    let world = world::Handle::spawn(world);
+    let control = if dev_control {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
         let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -75,12 +71,17 @@ async fn main() -> Result<()> {
         keys,
         content,
         swf,
-        origin: "http://127.0.0.1:18923".into(),
+        origin: config.origin,
+        sfx: config.data.join("sfx"),
+        max_players: config.max_players,
+        behind_proxy: config.behind_proxy,
+        requests: Arc::default(),
+        connections: Arc::new(tokio::sync::Semaphore::new(config.max_players * 2)),
         control,
         owners: Arc::default(),
         bots: Arc::default(),
         quarantined: Arc::default(),
         shutdown: tokio::sync::watch::channel(false).0,
     };
-    server::serve(app, "127.0.0.1:18923".parse()?, client).await
+    server::serve(app, config.bind, client).await
 }

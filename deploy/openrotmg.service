@@ -1,0 +1,20 @@
+[Unit]
+Description=Open RotMG game server
+After=network.target
+
+[Service]
+User=openrotmg
+Group=openrotmg
+ExecStart=/opt/openrotmg/server/openrotmg --config /etc/openrotmg/config.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/openrotmg
+
+[Install]
+WantedBy=multi-user.target

@@ -140,6 +140,7 @@ pub struct World {
     pub tick: u64,
     next_id: i32,
     pub max_tick_us: u64,
+    pub max_players: usize,
 }
 type Job = Box<dyn FnOnce(&mut World) + Send>;
 #[derive(Clone)]
@@ -245,6 +246,7 @@ impl World {
             tick: 0,
             next_id: 100_000,
             max_tick_us: 0,
+            max_players: 85,
         })
     }
     pub fn map_info(&self) -> Vec<u8> {
@@ -262,7 +264,10 @@ impl World {
     }
     pub fn enter(&mut self, ch: Character, tx: Option<Output>) -> Result<i32> {
         ensure!(ch.alive && ch.hp > 0, "dead character");
-        ensure!(self.players.len() < 85, "development world full");
+        ensure!(
+            self.players.len() < self.max_players,
+            "development world full"
+        );
         ensure!(
             !self
                 .players

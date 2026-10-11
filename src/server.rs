@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use axum::{
     Json, Router,
     extract::{
-        Form, State,
+        ConnectInfo, DefaultBodyLimit, Form, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode},
@@ -20,7 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -39,7 +39,7 @@ impl Drop for Owner {
 impl App {
     fn claim(&self, id: i32) -> Result<Owner> {
         let mut owners = self.owners.lock().expect("ownership registry poisoned");
-        ensure!(owners.len() < 85, "development world full");
+        ensure!(owners.len() < self.max_players, "development world full");
         ensure!(owners.insert(id), "account already has an active session");
         Ok(Owner {
             registry: self.owners.clone(),
@@ -56,6 +56,11 @@ pub struct App {
     pub content: Arc<Content>,
     pub swf: Arc<Vec<u8>>,
     pub origin: String,
+    pub sfx: PathBuf,
+    pub max_players: usize,
+    pub behind_proxy: bool,
+    pub requests: Arc<Mutex<HashMap<IpAddr, (std::time::Instant, u32)>>>,
+    pub connections: Arc<tokio::sync::Semaphore>,
     pub control: Option<String>,
     pub owners: Arc<Mutex<BTreeSet<i32>>>,
     pub bots: Arc<Mutex<BTreeMap<i32, Owner>>>,
@@ -71,7 +76,61 @@ fn error(e: anyhow::Error) -> Response {
     )
         .into_response()
 }
-async fn chars(State(a): State<App>, Form(form): Form<HashMap<String, String>>) -> Response {
+fn admit(a: &App, headers: &HeaderMap, peer: SocketAddr) -> Result<bool> {
+    if let Some(origin) = headers.get("origin") {
+        ensure!(origin.to_str()? == a.origin, "unapproved request origin");
+    }
+    let ip = if a.behind_proxy {
+        headers
+            .get("x-forwarded-for")
+            .context("proxy must supply X-Forwarded-For")?
+            .to_str()?
+            .parse::<IpAddr>()
+            .context("proxy must supply one client IP")?
+    } else {
+        peer.ip()
+    };
+    Ok(rate_allow(
+        &mut a.requests.lock().expect("request registry poisoned"),
+        ip,
+        std::time::Instant::now(),
+    ))
+}
+fn rate_allow(
+    requests: &mut HashMap<IpAddr, (std::time::Instant, u32)>,
+    ip: IpAddr,
+    now: std::time::Instant,
+) -> bool {
+    requests.retain(|_, (start, _)| now.duration_since(*start).as_secs() < 60);
+    if requests.len() >= 4096 && !requests.contains_key(&ip) {
+        return false;
+    }
+    let (_, count) = requests.entry(ip).or_insert((now, 0));
+    *count = count.saturating_add(1);
+    if *count == 21 {
+        tracing::warn!(%ip, "guest entry rate exceeded");
+    }
+    *count <= 20
+}
+fn limited() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [("content-type", "application/xml"), ("retry-after", "60")],
+        "<Error>Too many guest entry requests; retry in one minute.</Error>",
+    )
+        .into_response()
+}
+async fn chars(
+    State(a): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    match admit(&a, &headers, peer) {
+        Ok(true) => {}
+        Ok(false) => return limited(),
+        Err(e) => return error(e),
+    }
     let result: Result<String> = async {
         let guid = form.get("guid").context("guid is required")?.clone();
         ensure!(
@@ -112,14 +171,32 @@ async fn swf(State(a): State<App>) -> Response {
 async fn health(State(a): State<App>) -> Response {
     match a.world.call(|w|Ok(serde_json::json!({"status":"development","players":w.players.len(),"entities":w.entities.len(),"projectiles":w.bullets.len(),"tick":w.tick,"max_tick_us":w.max_tick_us}))).await{Ok(v)=>Json(v).into_response(),Err(e)=>error(e)}
 }
-async fn websocket(State(a): State<App>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    if let Some(origin) = headers.get("origin")
-        && origin.to_str().ok() != Some(a.origin.as_str())
-    {
+async fn websocket(
+    State(a): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if headers.get("origin").and_then(|v| v.to_str().ok()) != Some(a.origin.as_str()) {
         return (StatusCode::FORBIDDEN, "unapproved WebSocket origin").into_response();
     }
+    match admit(&a, &headers, peer) {
+        Ok(true) => {}
+        Ok(false) => return limited(),
+        Err(e) => return error(e),
+    }
+    let Ok(permit) = a.connections.clone().try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "game connection limit reached",
+        )
+            .into_response();
+    };
     ws.max_message_size(1_048_576)
-        .on_upgrade(move |socket| connection(socket, a))
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            connection(socket, a).await
+        })
 }
 fn fail(description: &str) -> Packet {
     let mut o = Writer::new();
@@ -376,8 +453,10 @@ async fn connection(socket: WebSocket, a: App) {
     let mut player = None;
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut serial = 0;
+    let mut packet_window = std::time::Instant::now();
+    let mut packet_count = 0usize;
     loop {
-        tokio::select! {incoming=wsin.next()=>match incoming{Some(Ok(Message::Binary(bytes)))=>{match codec.feed(&bytes){Ok(packets)=>{let mut failed=false;for packet in packets{let id=packet.id;if let Err(e)=handle(&a,packet,&mut account,&mut player,&tx,&lost).await{tracing::error!(account=account.as_ref().map(|o|o.id),player,packet=id,error=%e,"game command rejected");if matches!(id,30|65){let mut o=Writer::new();o.i32(1);if wsout.send(Message::Binary(codec.frame(4,o.0).into())).await.is_err(){failed=true;break;}continue;}let f=fail(&e.to_string());let _=wsout.send(Message::Binary(codec.frame(f.id,f.body).into())).await;failed=true;break;}}if failed{break;}},Err(e)=>{tracing::error!(error=%e,"invalid packet stream");break;}}},Some(Ok(Message::Ping(bytes)))=>{if wsout.send(Message::Pong(bytes)).await.is_err(){break}},Some(Ok(Message::Close(_)))|None=>break,Some(Ok(_))=>{tracing::warn!("non-binary game message rejected");break},Some(Err(e))=>{tracing::warn!(error=%e,"WebSocket failed");break}},
+        tokio::select! {incoming=wsin.next()=>match incoming{Some(Ok(Message::Binary(bytes)))=>{match codec.feed(&bytes){Ok(packets)=>{if packet_window.elapsed().as_secs()>=1{packet_window=std::time::Instant::now();packet_count=0;}packet_count=packet_count.saturating_add(packets.len());if packet_count>512{tracing::warn!(player,"input packet rate exceeded");break;}let mut failed=false;for packet in packets{let id=packet.id;if let Err(e)=handle(&a,packet,&mut account,&mut player,&tx,&lost).await{tracing::error!(account=account.as_ref().map(|o|o.id),player,packet=id,error=%e,"game command rejected");if matches!(id,30|65){let mut o=Writer::new();o.i32(1);if wsout.send(Message::Binary(codec.frame(4,o.0).into())).await.is_err(){failed=true;break;}continue;}let f=fail(&e.to_string());let _=wsout.send(Message::Binary(codec.frame(f.id,f.body).into())).await;failed=true;break;}}if failed{break;}},Err(e)=>{tracing::error!(error=%e,"invalid packet stream");break;}}},Some(Ok(Message::Ping(bytes)))=>{if wsout.send(Message::Pong(bytes)).await.is_err(){break}},Some(Ok(Message::Close(_)))|None=>break,Some(Ok(_))=>{tracing::warn!("non-binary game message rejected");break},Some(Err(e))=>{tracing::warn!(error=%e,"WebSocket failed");break}},
         _=shutdown.changed()=>break,
         _=lost_rx.changed()=>{tracing::warn!(player,"closing slow game connection before its state diverges");break;},
         _=&mut deadline,if player.is_none()=>{tracing::warn!("game selection deadline exceeded");break;},
@@ -605,12 +684,7 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
     let app = Router::new()
         .route("/legacy-api/char/list", post(chars))
         .route("/legacy-api/char/fame", post(fame))
-        .nest_service(
-            "/sfx",
-            tower_http::services::ServeDir::new(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data/sfx"),
-            ),
-        )
+        .nest_service("/sfx", tower_http::services::ServeDir::new(a.sfx.clone()))
         .route("/client.swf", get(swf))
         .route("/game", get(websocket))
         .route("/health", get(health))
@@ -632,54 +706,58 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
             "/vendor",
             tower_http::services::ServeDir::new(client.join("vendor")),
         )
+        .layer(DefaultBodyLimit::max(1_048_576))
         .with_state(a.clone());
-    tracing::info!(address=%bind,"game frontdoor listening");
+    tracing::info!(address=%bind,origin=%a.origin,max_players=a.max_players,behind_proxy=a.behind_proxy,"game frontdoor listening");
     let shutdown = a.clone();
     let failure = Arc::new(Mutex::new(None));
     let report = failure.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let result: Result<()> = async {
-                shutdown_signal().await?;
-                tracing::info!("saving active characters before shutdown");
-                let _ = shutdown.shutdown.send(true);
-                let bots: Vec<_> = shutdown
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let result: Result<()> = async {
+            shutdown_signal().await?;
+            tracing::info!("saving active characters before shutdown");
+            let _ = shutdown.shutdown.send(true);
+            let bots: Vec<_> = shutdown
+                .bots
+                .lock()
+                .expect("bot registry poisoned")
+                .keys()
+                .copied()
+                .collect();
+            for id in bots {
+                depart(&shutdown, id).await?;
+                shutdown
                     .bots
                     .lock()
                     .expect("bot registry poisoned")
-                    .keys()
-                    .copied()
-                    .collect();
-                for id in bots {
-                    depart(&shutdown, id).await?;
-                    shutdown
-                        .bots
-                        .lock()
-                        .expect("bot registry poisoned")
-                        .remove(&id);
-                }
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-                while !shutdown
-                    .owners
-                    .lock()
-                    .expect("ownership registry poisoned")
-                    .is_empty()
-                {
-                    ensure!(
-                        tokio::time::Instant::now() < deadline,
-                        "shutdown save timed out; inspect quarantined characters and logs"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-                Ok(())
+                    .remove(&id);
             }
-            .await;
-            if let Err(e) = result {
-                tracing::error!(error=%e,"shutdown persistence failed");
-                *report.lock().expect("shutdown report poisoned") = Some(e.to_string());
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !shutdown
+                .owners
+                .lock()
+                .expect("ownership registry poisoned")
+                .is_empty()
+            {
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "shutdown save timed out; inspect quarantined characters and logs"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-        })
-        .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::error!(error=%e,"shutdown persistence failed");
+            *report.lock().expect("shutdown report poisoned") = Some(e.to_string());
+        }
+    })
+    .await?;
     if let Some(e) = failure.lock().expect("shutdown report poisoned").take() {
         bail!("{e}");
     }
@@ -694,4 +772,37 @@ async fn shutdown_signal() -> Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn guest_rate_is_bounded_and_expires() {
+        let mut requests = HashMap::new();
+        let now = std::time::Instant::now();
+        let ip = "192.0.2.1".parse().unwrap();
+        for _ in 0..20 {
+            assert!(rate_allow(&mut requests, ip, now));
+        }
+        assert!(!rate_allow(&mut requests, ip, now));
+        assert!(rate_allow(&mut requests, "192.0.2.2".parse().unwrap(), now));
+        assert!(rate_allow(
+            &mut requests,
+            ip,
+            now + std::time::Duration::from_secs(60)
+        ));
+        assert_eq!(requests.len(), 1);
+        for n in 1..=4096 {
+            requests.insert(
+                IpAddr::V6(std::net::Ipv6Addr::from(n as u128)),
+                (now + std::time::Duration::from_secs(60), 1),
+            );
+        }
+        assert!(!rate_allow(
+            &mut requests,
+            "192.0.2.3".parse().unwrap(),
+            now + std::time::Duration::from_secs(60)
+        ));
+    }
 }
