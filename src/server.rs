@@ -179,7 +179,7 @@ async fn handle(
             ensure!(version == "123.5.1", "unsupported client build {version}");
             let game = r.i32()?;
             ensure!(
-                (-4..=-1).contains(&game),
+                (-4..=0).contains(&game),
                 "unsupported world entry {game}; only the explicit development fixture routes are available"
             );
             let guid = a.keys.decrypt(&r.utf()?)?;
