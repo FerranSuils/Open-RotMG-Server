@@ -113,10 +113,10 @@ async fn health(State(a): State<App>) -> Response {
     match a.world.call(|w|Ok(serde_json::json!({"status":"development","players":w.players.len(),"entities":w.entities.len(),"projectiles":w.bullets.len(),"tick":w.tick,"max_tick_us":w.max_tick_us}))).await{Ok(v)=>Json(v).into_response(),Err(e)=>error(e)}
 }
 async fn websocket(State(a): State<App>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
-    if let Some(origin) = headers.get("origin") {
-        if origin.to_str().ok() != Some(a.origin.as_str()) {
-            return (StatusCode::FORBIDDEN, "unapproved WebSocket origin").into_response();
-        }
+    if let Some(origin) = headers.get("origin")
+        && origin.to_str().ok() != Some(a.origin.as_str())
+    {
+        return (StatusCode::FORBIDDEN, "unapproved WebSocket origin").into_response();
     }
     ws.max_message_size(1_048_576)
         .on_upgrade(move |socket| connection(socket, a))
@@ -155,22 +155,21 @@ async fn handle(
     tx: &mpsc::Sender<Packet>,
     lost: &tokio::sync::watch::Sender<bool>,
 ) -> Result<()> {
-    if let Some(id) = *player {
-        if matches!(packet.id, 7 | 38 | 30 | 65 | 33 | 42 | 3)
-            && a.world
-                .call(move |w| {
-                    let p = w.players.get(&id).context("player missing")?;
-                    Ok(p.death_pending || !p.character.alive)
-                })
-                .await?
-        {
-            tracing::debug!(
-                player = id,
-                packet = packet.id,
-                "ignored queued command from dying character"
-            );
-            return Ok(());
-        }
+    if let Some(id) = *player
+        && matches!(packet.id, 7 | 38 | 30 | 65 | 33 | 42 | 3)
+        && a.world
+            .call(move |w| {
+                let p = w.players.get(&id).context("player missing")?;
+                Ok(p.death_pending || !p.character.alive)
+            })
+            .await?
+    {
+        tracing::debug!(
+            player = id,
+            packet = packet.id,
+            "ignored queued command from dying character"
+        );
+        return Ok(());
     }
     let mut r = Reader::new(&packet.body);
     match packet.id {
@@ -386,15 +385,15 @@ async fn connection(socket: WebSocket, a: App) {
         _=ping.tick()=>{if account.is_some(){serial+=1;let mut o=Writer::new();o.i32(serial);if wsout.send(Message::Binary(codec.frame(wire::PING,o.0).into())).await.is_err(){break;}}}
         }
     }
-    if let Some(id) = player {
-        if let Err(e) = depart(&a, id).await {
-            tracing::error!(player=id,error=%e,"disconnect save failed; avatar retained for diagnosis");
-            if let Some(owner) = account.take() {
-                a.quarantined
-                    .lock()
-                    .expect("quarantine registry poisoned")
-                    .push(owner);
-            }
+    if let Some(id) = player
+        && let Err(e) = depart(&a, id).await
+    {
+        tracing::error!(player=id,error=%e,"disconnect save failed; avatar retained for diagnosis");
+        if let Some(owner) = account.take() {
+            a.quarantined
+                .lock()
+                .expect("quarantine registry poisoned")
+                .push(owner);
         }
     }
 }
@@ -506,10 +505,10 @@ async fn script(State(a): State<App>, headers: HeaderMap, Json(input): Json<Scri
         for step in input.steps {
             tokio::select!{_=tokio::time::sleep_until(start+std::time::Duration::from_millis(step.at_ms))=>{},_=shutdown.changed()=>bail!("server is shutting down")};
             let id = input.player;
-            if let Some(action) = step.action {
-                if let Some(plan) = a.world.call(move |w| w.action(id, action)).await? {
-                    persist(&a, plan).await?;
-                }
+            if let Some(action) = step.action
+                && let Some(plan) = a.world.call(move |w| w.action(id, action)).await?
+            {
+                persist(&a, plan).await?;
             }
             frames.push(a.world.call(move |w| w.observe(id)).await?);
         }

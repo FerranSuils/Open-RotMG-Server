@@ -93,12 +93,10 @@ CREATE TABLE IF NOT EXISTS deaths(character INTEGER PRIMARY KEY REFERENCES chara
     }
     pub async fn authenticate(&self, guid: String) -> Result<i32> {
         self.call(move |c| {
-            Ok(
-                c.query_row("SELECT id FROM accounts WHERE guid=?1", [guid], |r| {
-                    r.get(0)
-                })
-                .context("unknown account; load character list first")?,
-            )
+            c.query_row("SELECT id FROM accounts WHERE guid=?1", [guid], |r| {
+                r.get(0)
+            })
+            .context("unknown account; load character list first")
         })
         .await
     }

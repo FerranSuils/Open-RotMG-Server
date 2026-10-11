@@ -88,7 +88,7 @@ impl Bullet {
     pub fn position(&self, now: u64) -> Pos {
         let age = (now - self.born) as f32;
         let d = age * self.spec.speed / 10000.;
-        let phase = if self.id % 2 == 0 {
+        let phase = if self.id.is_multiple_of(2) {
             0.
         } else {
             std::f32::consts::PI
@@ -154,7 +154,8 @@ impl Handle {
             let mut timer = tokio::time::interval(std::time::Duration::from_millis(50));
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tokio::select! {_ =timer.tick()=>{let start=Instant::now();world.step();let us=start.elapsed().as_micros()as u64;world.max_tick_us=world.max_tick_us.max(us);if us>25_000{tracing::warn!(tick=world.tick,elapsed_us=us,"slow simulation tick");}if world.tick%100==0{tracing::info!(tick=world.tick,players=world.players.len(),entities=world.entities.len(),bullets=world.bullets.len(),max_tick_us=world.max_tick_us,"world health");world.max_tick_us=0;}},job=rx.recv()=>match job{Some(f)=>f(&mut world),None=>break}}
+                tokio::select! {_ =timer.tick()=>{let start=Instant::now();world.step();let us=start.elapsed().as_micros()as u64;world.max_tick_us=world.max_tick_us.max(us);if us>25_000{tracing::warn!(tick=world.tick,elapsed_us=us,"slow simulation tick");}
+                if world.tick.is_multiple_of(100){tracing::info!(tick=world.tick,players=world.players.len(),entities=world.entities.len(),bullets=world.bullets.len(),max_tick_us=world.max_tick_us,"world health");world.max_tick_us=0;}},job=rx.recv()=>match job{Some(f)=>f(&mut world),None=>break}}
             }
         });
         Self { tx }
@@ -174,14 +175,14 @@ impl Handle {
     }
 }
 fn send(p: &Player, id: u8, body: Vec<u8>) {
-    if let Some(tx) = &p.tx {
-        if tx.packets.try_send(Packet { id, body }).is_err() {
-            let _ = tx.lost.send(true);
-            tracing::warn!(
-                character = p.character.id,
-                "slow/closed connection; packet queue full"
-            );
-        }
+    if let Some(tx) = &p.tx
+        && tx.packets.try_send(Packet { id, body }).is_err()
+    {
+        let _ = tx.lost.send(true);
+        tracing::warn!(
+            character = p.character.id,
+            "slow/closed connection; packet queue full"
+        );
     }
 }
 fn stat(out: &mut Writer, id: u8, v: i32) {
@@ -1196,7 +1197,7 @@ impl World {
         }
         bullets.retain(|b| self.now - b.born < b.spec.lifetime as u64 && b.hit.is_empty());
         self.bullets = bullets;
-        if self.tick % 2 == 0 {
+        if self.tick.is_multiple_of(2) {
             for id in ids {
                 if let Err(e) = self.updates(id, false) {
                     tracing::error!(player=id,error=%e,"visibility update failed");
