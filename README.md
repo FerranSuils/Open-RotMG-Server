@@ -1,4 +1,4 @@
-# OpenRotMG server
+# Open RotMG server
 
 Rust development backend for the recovered **123.5.1** client. One shared tutorial fixture: Wizard movement, staff/spell combat, potions, loot/equipment, permanent death and SQLite reconnect persistence.
 
