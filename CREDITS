@@ -13,3 +13,11 @@ Development tutorial map: trapped/rotmg_svr at
 593e490803fe0ad168ead408cacd5287d778acfe, wServer/realm/worlds/tutorial.wmap.
 https://github.com/trapped/rotmg_svr
 Historical authenticity is unverified; the Kitchen Portal exit is preserved, not repaired.
+Tutorial gun direction/timing and regeneration use older emulator candidates,
+not independently authenticated official server behavior.
+
+Runtime audio subset: moistosaurus/realm-src at
+1855c017eab870d13f0b61b1cf0b9e66a01922ff, common/resources/web/sfx.
+https://github.com/moistosaurus/realm-src
+These later-repository MP3s are not verified as target-exact audio.
+Original game-content rights and the source repository's notices remain applicable.

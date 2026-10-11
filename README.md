@@ -1,9 +1,11 @@
 # OpenRotMG server
 
-Rust backend for the recovered **123.5.1** client. Playable-loop implementation is in progress; not a running game yet.
+Rust development backend for the recovered **123.5.1** client. One shared tutorial fixture: Wizard movement, staff/spell combat, potions, loot/equipment, permanent death and SQLite reconnect persistence.
 
-Run `cargo test` (Rust stable). Keep the `client` repository beside this one to test the server's public-key patch against the preserved SWF. Local keys and databases must never be committed.
+Clone `server` and `client` beside each other. Install Rust stable/Cargo and Python 3, then run `../client/run.sh` from this directory (`../client/run.bat` on Windows). Open http://127.0.0.1:18923 . The launcher prepares pinned Ruffle and starts this backend; no separate proxy or database service.
 
-`src/wire.rs` implements the selected client's framed, continuously encrypted packet stream. `src/content.rs` loads client-matched definitions and the development map; `src/store.rs` provides transactional character/inventory persistence.
+Tests: `cargo test`. For scripted self-play, start with `../client/run.sh --dev-control`, then `python3 tools/play.py` in a fresh server world. Its authenticated `/dev/script` queues normal-rule actions; `/dev/observe` and `/dev/map` expose state. The token is in ignored `.local/control.token`, never logs. Control is disabled by default and the server binds loopback only.
 
-The recovered tutorial layout is **unverified**, including its Kitchen Portal exit. It is a development fixture, not an authenticated historical map. Source notes are in `CREDITS`. Original Rust code is AGPL-3.0; third-party notices remain applicable.
+The fixture layout, audio provenance and emulator-derived behavior are **not verified historical fidelity**. The four normal client entry routes explicitly select this development fixture; Nexus/realm/Kitchen destinations, leveling and fame awards are not implemented. Original SWF bytes stay unchanged; the server serves a generated public-key-patched copy. Never commit `.local/`, keys or databases.
+
+`src/wire.rs`: selected-client packets. `world.rs`: single-owner simulation. `content.rs`: runtime XML/map data. `store.rs`: transactional account/character records. Missing content/contracts: https://github.com/OpenRotMG/server/issues . Source notices: `CREDITS`. Original Rust code is AGPL-3.0; third-party rights remain applicable.

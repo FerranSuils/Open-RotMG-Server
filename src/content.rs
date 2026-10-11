@@ -29,6 +29,8 @@ pub struct Object {
     pub equipment: Vec<i32>,
     pub slots: Vec<i32>,
     pub slot_type: i32,
+    pub bonuses: Vec<(u8, i32)>,
+    pub unsupported_equipment: bool,
     pub projectile: Option<Projectile>,
     pub shots: i32,
     pub arc: f32,
@@ -126,6 +128,25 @@ impl Content {
                 equipment: list(n, "Equipment")?,
                 slots: list(n, "SlotTypes")?,
                 slot_type: number(n, "SlotType", 0.)? as i32,
+                bonuses: n
+                    .children()
+                    .filter(|x| {
+                        x.has_tag_name("ActivateOnEquip") && x.text() == Some("IncrementStat")
+                    })
+                    .map(|x| -> Result<(u8, i32)> {
+                        Ok((
+                            x.attribute("stat")
+                                .context("equipment stat missing")?
+                                .parse()?,
+                            x.attribute("amount")
+                                .context("equipment amount missing")?
+                                .parse()?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                unsupported_equipment: n.children().any(|x| {
+                    x.has_tag_name("ActivateOnEquip") && x.text() != Some("IncrementStat")
+                }),
                 projectile,
                 shots: number(n, "NumProjectiles", 1.)? as i32,
                 arc: number(n, "ArcGap", 11.25)?,
