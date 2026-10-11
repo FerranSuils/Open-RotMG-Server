@@ -1256,6 +1256,34 @@ mod tests {
         assert!(w.move_to(id, Pos { x: 12., y: 3. }, 100).is_err());
     }
     #[test]
+    fn queue_loss_is_observable() {
+        let mut w = world();
+        let id = w.enter(ch(&w), None).unwrap();
+        let (packets, mut rx) = mpsc::channel(1);
+        let (lost, watch) = watch::channel(false);
+        let p = w.players.get_mut(&id).unwrap();
+        p.tx = Some(Output { packets, lost });
+        send(p, 6, vec![1]);
+        assert!(!*watch.borrow());
+        send(p, 6, vec![2]);
+        assert!(*watch.borrow());
+        assert_eq!(rx.try_recv().unwrap().body, vec![1]);
+    }
+    #[test]
+    fn control_cannot_steal_browser_input() {
+        let mut w = world();
+        let (packets, _rx) = mpsc::channel(64);
+        let (lost, _watch) = watch::channel(false);
+        let id = w.enter(ch(&w), Some(Output { packets, lost })).unwrap();
+        assert!(
+            w.action(id, Action::Stop)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("script-owned")
+        );
+    }
+    #[test]
     fn selected_collision_box_is_inclusive() {
         let a = Pos { x: 0., y: 0. };
         assert!(inside_box(a, Pos { x: 0.5, y: 0.5 }));
