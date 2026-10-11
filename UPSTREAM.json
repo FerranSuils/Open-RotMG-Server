@@ -1,0 +1,16 @@
+{
+  "name": "NR-CORE",
+  "url": "https://github.com/cp-nilly/NR-CORE.git",
+  "commit": "070977917893a5fbb6fe9598e5d63ff8c62fa10c",
+  "commit_date": "2019-01-07T07:42:04+01:00",
+  "root_license_files": [
+    "LICENSE"
+  ],
+  "submodules": [
+    {
+      "path": "RotMG-Dungeon-Generator",
+      "url": "https://github.com/cp-nilly/RotMG-Dungeon-Generator.git",
+      "commit": "0c1f24e62d72075bc365e98b87d744ae730cb643"
+    }
+  ]
+}
