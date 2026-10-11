@@ -1,12 +1,9 @@
 # OpenRotMG server
 
-C# server scaffold for Realm of the Mad God **123.5.1**. Not playable yet.
+Rust backend for the recovered **123.5.1** client. Playable-loop implementation is in progress; not a running game yet.
 
-- `server/`: account and HTTP services.
-- `wServer/`: game protocol, world simulation and NPC behaviors.
-- `common/`: shared data and persistence.
-- `RotMG-Dungeon-Generator/`: dungeon-generation dependency.
+Run `cargo test` (Rust stable). Keep the `client` repository beside this one to test the server's public-key patch against the preserved SWF. Local keys and databases must never be committed.
 
-**Start here:** get `server.sln` building, then adapt `wServer/networking/` to 123.5.1. The inherited code targets .NET Framework 4.6 and a later game protocol; its build is not yet verified.
+`src/wire.rs` implements the selected client's framed, continuously encrypted packet stream. `src/content.rs` loads client-matched definitions and the development map; `src/store.rs` provides transactional character/inventory persistence.
 
-AGPL-3.0. Upstream attribution is in `CREDITS`. Removed private keys must be replaced with a new keypair before login can work.
+The recovered tutorial layout is **unverified**, including its Kitchen Portal exit. It is a development fixture, not an authenticated historical map. Source notes are in `CREDITS`. Original Rust code is AGPL-3.0; third-party notices remain applicable.

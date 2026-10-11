@@ -1,12 +1,8 @@
-/packages/
-/bin/
-**/obj/
-**/bin/
-*.user
-*.suo
+/target/
+/.local/
 *.pem
 *.key
-*.rdb
+*.db
+*.db-shm
+*.db-wal
 .env
-.vs/
-.idea/

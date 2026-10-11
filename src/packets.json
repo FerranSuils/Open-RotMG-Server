@@ -1,0 +1,57 @@
+[
+  {
+    "direction": "client_to_server",
+    "frames": [
+      {
+        "name": "hello_layout_only",
+        "plain": "000000331100073132332e352e31fffffffe000441413d3d00000000000000000000000000000000000000000005726f746d67",
+        "wire": "0000003311c210e4bf542b2bc63172d05d2deb08e02d41b037613665e1d6e1a73a0185aec55fd9c02e365c7c62ddbd0d2e5fb0"
+      },
+      {
+        "name": "create_wizard",
+        "plain": "0000000724030e",
+        "wire": "000000072460a9"
+      },
+      {
+        "name": "update_ack",
+        "plain": "000000050b",
+        "wire": "000000050b"
+      },
+      {
+        "name": "pong",
+        "plain": "0000000d1000000001000003e8",
+        "wire": "0000000d105c0b11e65b0e4320"
+      }
+    ]
+  },
+  {
+    "direction": "server_to_client",
+    "frames": [
+      {
+        "name": "mapinfo_no_overrides",
+        "plain": "000000253c00000019000000c900085475746f7269616c0000000100000000000100000000",
+        "wire": "000000253cb281e18f019b5faac4c4c5e73a6261b8c98f908f3a440092e4dfa6d4c153176a"
+      },
+      {
+        "name": "create_success",
+        "plain": "0000000d1f0000000100000001",
+        "wire": "0000000d1f25e19207b28742a4"
+      },
+      {
+        "name": "update_self_wizard",
+        "plain": "000000c71a0001000800c4ca0001030e000000014108000043448000002100000000640100000064020000006403000000640400000064050000003206000000000700000001140000000c1500000000160000000a1a0000000c1b0000000c1c0000000f1d000000001e000000001f0006506c61796572200000000021000000003e00003f000000000800000a970900000a2e0affffffff0bffffffff0c00000a220dffffffff0effffffff0fffffffff10ffffffff11ffffffff12ffffffff13ffffffff0000",
+        "wire": "000000c71a57e3f216b3492618ce78fe2b63a39273e1aa9d34287c7277e9fac07a39d8cfe282c14b1cf07f9b9ad6bf806a100bb33700be9a9885e4a258e138c44e1d4aadceebfdba51ea350d58f0efe74c0b6466d25f4e783d17366513fe5798b32cad9db375be082473f3a8d2575ece90b4aecc853c6be829b7f66eeae3d2c4ed1c9d38b4e446d6585137bd1d459e9fbe764b9eaf785700872538d4e3fb6ab39c8816662fe17dace0703ac76884f4648796d19df6686d818a97c2c01693c09d9f640ce4b0fd4d"
+      },
+      {
+        "name": "new_tick",
+        "plain": "0000001d3e000000010000006400010000000141080000434480000000",
+        "wire": "0000001d3ef79ec1d596cedb9f62ab73fd96b2f27549a25e82cc084297"
+      },
+      {
+        "name": "ping",
+        "plain": "000000090600000001",
+        "wire": "000000090619014679"
+      }
+    ]
+  }
+]
