@@ -1,4 +1,4 @@
-# Open RotMG server
+<h1><img src="readme-icon.png" width="44" height="44" align="absmiddle" alt=""> Open RotMG / Server</h1>
 
 Rust development backend for the recovered **123.5.1** client. One shared tutorial fixture: Wizard movement, staff/spell combat, potions, loot/equipment, permanent death and SQLite reconnect persistence.
 
