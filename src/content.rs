@@ -29,6 +29,7 @@ pub struct Projectile {
     pub max: i32,
     pub amplitude: f32,
     pub frequency: f32,
+    pub passes_cover: bool,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Object {
@@ -64,6 +65,9 @@ pub struct Object {
     pub quest: bool,
     pub xp_multiplier: f32,
     pub blocks: bool,
+    pub occupy_square: bool,
+    pub enemy_occupy_square: bool,
+    pub static_object: bool,
     pub destructible: bool,
 }
 #[derive(Clone)]
@@ -139,6 +143,7 @@ impl Content {
                     max: number(p, "MaxDamage", fixed as f32)? as i32,
                     amplitude: number(p, "Amplitude", 0.)?,
                     frequency: number(p, "Frequency", 1.)?,
+                    passes_cover: child(p, "PassesCover").is_some(),
                 };
                 ensure!(
                     projectiles.insert(index, projectile).is_none(),
@@ -201,6 +206,9 @@ impl Content {
                 quest: child(n, "Quest").is_some(),
                 xp_multiplier: number(n, "XpMult", 1.)?,
                 blocks: child(n, "OccupySquare").is_some() || child(n, "FullOccupy").is_some(),
+                occupy_square: child(n, "OccupySquare").is_some(),
+                enemy_occupy_square: child(n, "EnemyOccupySquare").is_some(),
+                static_object: child(n, "Static").is_some(),
                 destructible: child(n, "Enemy").is_some(),
             };
             ensure!(
@@ -451,6 +459,12 @@ mod tests {
         assert_eq!(w.equipment[1], 0xa2e);
         assert_eq!(w.hp, 100);
         assert!(c.grounds.contains_key(&0x61) && c.grounds.contains_key(&0x65));
+        assert!(c.objects[&0x120].static_object);
+        assert!(!c.objects[&0x683].static_object);
+        assert!(c.objects[&0x120].occupy_square && c.objects[&0x120].enemy_occupy_square);
+        assert!(c.objects[&0x100].occupy_square && !c.objects[&0x100].enemy_occupy_square);
+        assert!(!c.objects[&0x683].projectiles[&0].passes_cover);
+        assert!(c.objects[&0xa08].projectiles[&0].passes_cover);
     }
     #[test]
     fn projectile_identity_includes_both_selected_dreadstump_attacks() {

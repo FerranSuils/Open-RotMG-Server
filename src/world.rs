@@ -1246,9 +1246,11 @@ impl World {
             .get(&0)
             .cloned()
             .context("weapon has no projectile zero")?;
-        let cooldown = 1.
-            / ((0.0015 + (0.008 - 0.0015) * p.character.effective(&self.content)?[5] as f32 / 75.)
-                * item.rate);
+        // The selected client's integer attack period cannot fund a fractional charge indefinitely.
+        let cooldown = (1.
+            / ((0.0015 + (0.008 - 0.0015) * p.character.effective(&self.content)?[5] as f64 / 75.)
+                * f64::from(item.rate)))
+        .floor() as f32;
         let p = self.players.get_mut(&id).unwrap();
         ensure!(time >= 0, "negative shot time");
         if time != p.last_attack {
@@ -1260,7 +1262,10 @@ impl World {
                 (p.attack_credit + (self.now - p.last_attack_at) as f32).min(cooldown * 2.);
             ensure!(
                 credit >= cooldown - 50.,
-                "attack exceeds server time budget"
+                "attack exceeds server time budget: credit={credit} cooldown={cooldown} server_time={} last_server_time={} shot_time={time} last_shot_time={}",
+                self.now,
+                p.last_attack_at,
+                p.last_attack
             );
             p.attack_credit = credit - cooldown;
             p.last_attack_at = self.now;
@@ -2369,11 +2374,12 @@ impl World {
                         .map
                         .cell(b.pos.x, b.pos.y)
                         .is_none_or(|c| self.content.grounds[&c.ground] <= 0.)
-                    || b.friendly
-                        && self.entities_at(b.pos).any(|e| {
-                            let o = &self.content.objects[&e.kind];
-                            o.blocks && !o.destructible
-                        })
+                    || self.entities_at(b.pos).any(|e| {
+                        let o = &self.content.objects[&e.kind];
+                        o.static_object
+                            && (!o.enemy || !b.friendly)
+                            && (o.enemy_occupy_square || o.occupy_square && !b.spec.passes_cover)
+                    })
                 {
                     b.hit.insert(-1);
                     break;
@@ -3726,6 +3732,96 @@ mod tests {
         w.step();
         assert!(w.players[&player].death_pending);
         assert_eq!(w.players[&player].killer, w.content.objects[&kind].name);
+    }
+    #[test]
+    fn selected_cover_stops_hostile_projectiles_before_player_damage() {
+        for (kind, passes_cover, hp) in [
+            (0x120, false, 100),
+            (0x120, true, 100),
+            (0x100, false, 100),
+            (0x100, true, 92),
+        ] {
+            let mut w = world();
+            for id in w.entities.keys().copied().collect::<Vec<_>>() {
+                w.remove_entity(id);
+            }
+            for cell in &mut Arc::make_mut(&mut w.map).cells {
+                cell.ground = 0x61;
+            }
+            let player = w.enter(ch(&w), None).unwrap();
+            w.players.get_mut(&player).unwrap().pos = Pos { x: 12.5, y: 100.5 };
+            w.spawn_entity(kind, Pos { x: 11.5, y: 100.5 }, vec![])
+                .unwrap();
+            let start = Pos { x: 10.5, y: 100.5 };
+            let mut spec = w.content.objects[&0x683].projectiles[&0].clone();
+            spec.passes_cover = passes_cover;
+            w.bullets.push(Bullet {
+                owner: 500,
+                source_kind: 0x683,
+                id: 1,
+                friendly: false,
+                start,
+                pos: start,
+                angle: 0.,
+                born: 0,
+                damage: 8,
+                spec,
+                hit: BTreeSet::new(),
+            });
+            for _ in 0..5 {
+                w.step();
+            }
+            assert_eq!(
+                w.players[&player].character.hp, hp,
+                "{kind:#x}/{passes_cover}"
+            );
+            assert!(w.bullets.is_empty());
+        }
+    }
+    #[test]
+    fn native_integer_attack_period_keeps_the_bounded_server_credit() {
+        for dexterity in [15, 17, 18, 25, 75] {
+            let mut w = world();
+            let mut character = ch(&w);
+            character.base[5] = dexterity;
+            let player = w.enter(character, None).unwrap();
+            let period = (1. / (0.0015_f64 + (0.008 - 0.0015) * dexterity as f64 / 75.)) as i32;
+            let pos = w.players[&player].pos;
+            let start = Pos {
+                x: pos.x + 0.3,
+                y: pos.y,
+            };
+            for attack in 0..2000 {
+                let time = attack * period;
+                w.now = time as u64;
+                for _ in 0..2 {
+                    let bullet = w.players[&player].next_bullet;
+                    w.shoot(player, time, bullet, 0xa97, start, 0.).unwrap();
+                }
+                w.bullets.clear();
+            }
+            assert_eq!(w.players[&player].character.shots, 4000);
+            let bullet = w.players[&player].next_bullet;
+            assert!(
+                w.shoot(player, 2000 * period - 3, bullet, 0xa97, start, 0.)
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn candidate_tutorial_gun_still_reaches_its_open_lane() {
+        let mut w = world();
+        let player = w.enter(ch(&w), None).unwrap();
+        w.players.get_mut(&player).unwrap().pos = Pos { x: 12.2, y: 137.8 };
+        assert!((0..200).any(|_| {
+            w.step();
+            w.players[&player].character.hp < 100
+        }));
+        w.players.get_mut(&player).unwrap().pos = Pos { x: 12.2, y: 138.0 };
+        assert!((0..3000).any(|_| {
+            w.step();
+            w.players[&player].death_pending
+        }));
     }
     #[test]
     fn paired_staff_wave() {

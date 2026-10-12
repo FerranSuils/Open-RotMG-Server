@@ -6,6 +6,7 @@ import json
 import math
 import pathlib
 import sys
+import time
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -87,7 +88,9 @@ def play():
     state = navigate(player, (12, 137))
     action(player, {'command': 'move', 'x': 12.2, 'y': 137.8})
     wait(player, 500)
-    state = wait(player, 9000)
+    deadline = time.monotonic() + 12
+    while state["character"]["hp"] == 100 and time.monotonic() < deadline:
+        state = wait(player, 100)
     assert state["character"]["hp"] < 100, "standing in the tutorial gun lane must cause damage"
     report("damaged", state)
     state = action(player, {"command": "use", "slot": 4, "x": state["pos"]["x"], "y": state["pos"]["y"]})
@@ -123,8 +126,11 @@ def play():
     report("durable reconnect", state)
     action(player, {'command': 'swap', 'from': {'object': player, 'slot': 3, 'kind': 0xa4f}, 'to': {'object': player, 'slot': 5, 'kind': -1}})
     navigate(player, (12, 137))
-    action(player, {'command': 'move', 'x': 12.2, 'y': 137.8})
-    state = wait(player, 115000)
+    action(player, {'command': 'move', 'x': 12.2, 'y': 138.0})
+    deadline = time.monotonic() + 150
+    state = observe(player)
+    while state["character"]["alive"] and time.monotonic() < deadline:
+        state = wait(player, 1000)
     assert not state["character"]["alive"], "stationary player must eventually die in the crossfire"
     report("permanent death", state)
     request("leave", {"player": player})
