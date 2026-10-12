@@ -174,6 +174,7 @@ pub struct World {
     cells: Vec<BTreeSet<i32>>,
     rng: rand::rngs::StdRng,
     pub now: u64,
+    attack_epoch: Instant,
     pub tick: u64,
     ids: Arc<AtomicI32>,
     pub name: String,
@@ -779,6 +780,7 @@ impl World {
             cells,
             rng: rand::rngs::StdRng::from_entropy(),
             now: 0,
+            attack_epoch: Instant::now(),
             tick: 0,
             ids,
             name: "Development tutorial".into(),
@@ -948,7 +950,7 @@ impl World {
                 server_bullet: 128,
                 seed: 1,
                 last_attack: -1000,
-                last_attack_at: self.now,
+                last_attack_at: 0,
                 attack_credit: 1000.,
                 attack_count: 0,
                 last_move: 0,
@@ -1205,10 +1207,35 @@ impl World {
             })
         })
     }
+    pub fn native_shoot(
+        &mut self,
+        id: i32,
+        time: i32,
+        bullet: u8,
+        kind: u16,
+        start: Pos,
+        angle: f32,
+    ) -> Result<()> {
+        // Skipped actor ticks must not charge real client attacks against a slower simulation clock.
+        let received = self.attack_epoch.elapsed().as_millis() as u64;
+        self.shoot_timed(id, (time, received), bullet, kind, start, angle)
+    }
+    // Fixture tests drive fixed ticks without sleeping, so script shots use simulation time.
     pub fn shoot(
         &mut self,
         id: i32,
         time: i32,
+        bullet: u8,
+        kind: u16,
+        start: Pos,
+        angle: f32,
+    ) -> Result<()> {
+        self.shoot_timed(id, (time, self.now), bullet, kind, start, angle)
+    }
+    fn shoot_timed(
+        &mut self,
+        id: i32,
+        (time, received): (i32, u64),
         bullet: u8,
         kind: u16,
         start: Pos,
@@ -1258,17 +1285,19 @@ impl World {
                 i64::from(time) - i64::from(p.last_attack) >= cooldown as i64 - 2,
                 "attack too fast"
             );
-            let credit =
-                (p.attack_credit + (self.now - p.last_attack_at) as f32).min(cooldown * 2.);
+            let elapsed = received
+                .checked_sub(p.last_attack_at)
+                .context("attack receive clock regressed")?;
+            let credit = (p.attack_credit + elapsed as f32).min(cooldown * 2.);
             ensure!(
                 credit >= cooldown - 50.,
-                "attack exceeds server time budget: credit={credit} cooldown={cooldown} server_time={} last_server_time={} shot_time={time} last_shot_time={}",
+                "attack exceeds server time budget: credit={credit} cooldown={cooldown} received_time={received} simulation_time={} last_received_time={} shot_time={time} last_shot_time={}",
                 self.now,
                 p.last_attack_at,
                 p.last_attack
             );
             p.attack_credit = credit - cooldown;
-            p.last_attack_at = self.now;
+            p.last_attack_at = received;
             p.last_attack = time;
             p.attack_count = 0;
         }
@@ -3777,6 +3806,47 @@ mod tests {
             );
             assert!(w.bullets.is_empty());
         }
+    }
+    #[test]
+    fn native_attack_credit_uses_receive_time_not_skipped_simulation_ticks() {
+        let mut w = world();
+        let mut character = ch(&w);
+        character.base[5] = 26;
+        let player = w.enter(character, None).unwrap();
+        let pos = w.players[&player].pos;
+        let start = Pos {
+            x: pos.x + 0.3,
+            y: pos.y,
+        };
+        let p = w.players.get_mut(&player).unwrap();
+        p.last_attack = 1000;
+        p.last_attack_at = 1000;
+        p.attack_credit = 0.;
+        w.now = 1200;
+        assert!(
+            w.shoot_timed(player, (1298, 1200), 1, 0xa97, start, 0.)
+                .is_err()
+        );
+        w.attack_epoch = Instant::now() - std::time::Duration::from_millis(1298);
+        w.native_shoot(player, 1298, 1, 0xa97, start, 0.).unwrap();
+        w.native_shoot(player, 1298, 2, 0xa97, start, 0.).unwrap();
+        assert_eq!(w.players[&player].character.shots, 2);
+        w.now = 9000;
+        let p = w.players.get_mut(&player).unwrap();
+        p.last_attack_at = 1298;
+        p.attack_credit = 0.;
+        assert!(
+            w.shoot_timed(player, (1596, 1400), 3, 0xa97, start, 0.)
+                .unwrap_err()
+                .to_string()
+                .contains("attack exceeds server time budget")
+        );
+        assert!(
+            w.shoot_timed(player, (1596, 1200), 3, 0xa97, start, 0.)
+                .unwrap_err()
+                .to_string()
+                .contains("attack receive clock regressed")
+        );
     }
     #[test]
     fn native_integer_attack_period_keeps_the_bounded_server_credit() {

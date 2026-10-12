@@ -458,7 +458,7 @@ async fn handle(
             r.done()?;
             let id = player.context("shoot before character")?;
             a.world
-                .call(move |w| w.shoot(id, time, bullet, kind, pos, angle))
+                .call(move |w| w.native_shoot(id, time, bullet, kind, pos, angle))
                 .await?;
         }
         wire::PONG => {
