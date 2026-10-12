@@ -1,8 +1,8 @@
 # Gameplay bots: vision and research
 
-Planning only. No gameplay changes or deployment are authorized by this discussion.
+Research and the isolated offline decision experiment are approved. No game-bot integration or deployment is authorized.
 
-The north star is approved; architecture, prototype scope and population seeding remain proposals. The server is still too early for bot integration. This document records the vision and technical discussion; `research/sample-1.md` and `research/sample-2.md` record the observations and their limits.
+The north star is approved; architecture, in-game prototype scope and population seeding remain proposals. The server is still too early for bot integration. This document records the vision and technical discussion. The two video research reports record observations and limits; `research/decision-spike.md` records the completed offline experiment.
 
 ## Approved north star
 
@@ -64,15 +64,11 @@ The completed result is one second-pass report with the strongest examples and c
 
 Before a bot implementation plan, recheck normal shared-game support for the behaviors selected: observable player/projectile views, relevant classes/abilities, chat, progression, transfers, inventory/economy and durable death/rebuilding. Mark each dependency verified, in progress or missing against the then-current revision. The first bot slice should exercise existing rules, not implement private substitutes for unfinished game systems.
 
-## Proposed next spike: decisions and continuity
+## Completed offline spike: decisions and continuity
 
-Before game integration, test a small decision policy outside the server: observable situation + profile + remembered commitments -> intent + reason. Compare a fixed-priority baseline with a small goal scorer using eight to twelve manually annotated situations from the research. Do not build a second game engine, infer hidden state or treat an annotation as a working perception/chat parser.
+The user approved the proposed comparison outside the server. See `research/decision-spike.md` for its method, results, regression, tests and limits. The fixed baseline already produced profile variation; scoring added sensitivity to circumstances but needed a small switching margin. Shared memory and resource checks, not scoring, preserved continuity. Experiment code and synthetic traces remain private.
 
-Use contrasting motives, such as cautious survival, loot/progression and staying with companions. Include danger competing with loot, inventory assessment while a companion moves away, an invitation conflicting with existing contacts, a capacity-limited trade, death followed by legitimate replacement, and a conversation addressed to someone else. Use short event sequences, not only isolated snapshots, so goal oscillation and forgotten commitments can be detected. Do not hardcode choices by scenario ID.
-
-Check that choices are explainable, goals do not churn on immaterial changes, dead-character resources are not inherited, another player's private state is unavailable, and promises require actual resources. Repeat identical inputs deterministically, then compare motives and unseen variations. Trace each goal change and the evidence used; reject malformed inputs explicitly. Keep it small enough to discard if the approach fails.
-
-This would test policy coherence and the usefulness of the proposed boundary, not historical authenticity, movement/dodging, production performance or live social believability. No paid language service or server integration is required. Actual free-form chat understanding and native gameplay remain separate future tests. This spike is proposed, not implemented or selected.
+The next recommendation is a bounded partial-knowledge/time experiment, not another general footage collection or server integration. Test stale observations, absent companions, missing receipts and when commitments should be deferred or abandoned. This follow-up is not selected or authorized. The current experiment does not establish historical authenticity, movement/dodging, live social feel or perception/chat understanding.
 
 ## Verification
 
