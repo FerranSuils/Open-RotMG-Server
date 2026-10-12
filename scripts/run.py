@@ -79,8 +79,8 @@ def port_number(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download the client and start your local OpenRotMG game.")
-    parser.add_argument("port", nargs="?", type=port_number, help="Local server port (default: 18923)")
+    parser = argparse.ArgumentParser(prog="run.sh", description="Download the client and start your local OpenRotMG game.")
+    parser.add_argument("port", type=port_number, help="Local server port")
     parser.add_argument("--local-client", type=Path, metavar="DIR", help="Use your own client checkout instead of downloading the pinned client")
     parser.add_argument("--dev-control", action="store_true", help="Enable loopback-only QA control")
     args = parser.parse_args()
@@ -98,9 +98,7 @@ def main():
             if code:
                 raise RuntimeError(f"Client preparation exited with status {code}. See the error above and {LOG}.")
             print(f"Building and starting your local game. Logs: {LOG}", flush=True)
-            command = ["cargo", "run", "--locked", "--", "--client", str(client)]
-            if args.port is not None:
-                command.extend(["--port", str(args.port)])
+            command = ["cargo", "run", "--locked", "--", "--client", str(client), "--port", str(args.port)]
             if args.dev_control:
                 command.append("--dev-control")
             code = run(command, ROOT, log)

@@ -78,7 +78,7 @@ class LauncherTests(unittest.TestCase):
     def test_ports_and_custom_client_are_forwarded(self):
         (self.client / 'scripts').mkdir(parents=True)
         (self.client / 'scripts/run.py').touch()
-        cases = [([], []), (['8080'], ['--port', '8080']),
+        cases = [(['8080'], ['--port', '8080']),
                  (['1', '--dev-control'], ['--port', '1', '--dev-control']),
                  (['--local-client', str(self.client), '65535'], ['--port', '65535'])]
         for args, expected in cases:
@@ -92,6 +92,21 @@ class LauncherTests(unittest.TestCase):
                 if '--local-client' in args:
                     download.assert_not_called()
 
+    def test_missing_port_fails_before_setup(self):
+        for args in [[], ['--dev-control'], ['--local-client', str(self.client)]]:
+            with self.subTest(args=args), patch('sys.argv', ['run.py', *args]), \
+                    patch.object(launcher.shutil, 'which') as cargo, \
+                    patch.object(launcher, 'prepare_client') as prepare, \
+                    patch('sys.stderr', new_callable=io.StringIO) as stderr:
+                with self.assertRaises(SystemExit) as error:
+                    launcher.main()
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn('usage: run.sh', stderr.getvalue())
+                self.assertIn('required: port', stderr.getvalue())
+                cargo.assert_not_called()
+                prepare.assert_not_called()
+                self.assertFalse(launcher.LOG.exists())
+
     def test_invalid_ports_fail_before_download(self):
         for port in ['0', '-1', '65536', 'abc', '8080.5']:
             with self.subTest(port=port), patch('sys.argv', ['run.py', port]), \
@@ -103,7 +118,7 @@ class LauncherTests(unittest.TestCase):
                 prepare.assert_not_called()
 
     def test_failed_download_logs_url_and_cause(self):
-        with patch('sys.argv', ['run.py']), patch.object(launcher.shutil, 'which', return_value='/cargo'), \
+        with patch('sys.argv', ['run.py', '8080']), patch.object(launcher.shutil, 'which', return_value='/cargo'), \
                 patch.object(launcher, 'urlopen', side_effect=OSError('connection refused')):
             self.assertEqual(launcher.main(), 1)
         self.assertIn(launcher.URL, launcher.LOG.read_text())
@@ -112,7 +127,7 @@ class LauncherTests(unittest.TestCase):
     def test_failed_preparation_does_not_start_backend(self):
         (self.client / 'scripts').mkdir(parents=True)
         (self.client / 'scripts/run.py').touch()
-        with patch('sys.argv', ['run.py']), patch.object(launcher.shutil, 'which', return_value='/cargo'), \
+        with patch('sys.argv', ['run.py', '8080']), patch.object(launcher.shutil, 'which', return_value='/cargo'), \
                 patch.object(launcher, 'prepare_client', return_value=self.client), patch.object(launcher, 'run', return_value=37) as run:
             self.assertEqual(launcher.main(), 1)
             self.assertEqual(run.call_count, 1)
@@ -129,7 +144,7 @@ class LauncherTests(unittest.TestCase):
         backend.__enter__.return_value = backend
         backend.stdout = ['Error: cannot listen on 127.0.0.1:18923\n']
         backend.wait.return_value = 1
-        with patch('sys.argv', ['run.py']), patch.object(launcher.shutil, 'which', return_value='/cargo'), \
+        with patch('sys.argv', ['run.py', '8080']), patch.object(launcher.shutil, 'which', return_value='/cargo'), \
                 patch.object(launcher, 'prepare_client', return_value=self.client), \
                 patch.object(launcher.subprocess, 'Popen', side_effect=[prepare, backend]):
             self.assertEqual(launcher.main(), 1)
