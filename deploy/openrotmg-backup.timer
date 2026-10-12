@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily independent OpenRotMG state backup
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 UTC
+Persistent=true
+Unit=openrotmg-backup.service
+
+[Install]
+WantedBy=timers.target
