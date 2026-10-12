@@ -193,6 +193,21 @@ fn text_stat(out: &mut Writer, id: u8, v: &str) {
     out.u8(id).utf(v);
 }
 impl World {
+    pub fn health(&self, started: Instant) -> serde_json::Value {
+        let qa_actors = self.players.values().filter(|p| p.script_owned).count();
+        // Gameplay bots do not exist yet; script-owned QA actors are not that population.
+        serde_json::json!({
+            "status": "development",
+            "uptime_seconds": started.elapsed().as_secs(),
+            "players": self.players.len() - qa_actors,
+            "bots": 0,
+            "qa_actors": qa_actors,
+            "entities": self.entities.len(),
+            "projectiles": self.bullets.len(),
+            "tick": self.tick,
+            "max_tick_us": self.max_tick_us,
+        })
+    }
     pub fn new(content: Arc<Content>, map: Arc<Map>) -> Result<Self> {
         let mut entities = BTreeMap::new();
         let mut cells = vec![None; map.cells.len()];
@@ -1252,6 +1267,35 @@ mod tests {
             quests: 0,
             tiles: 0,
         }
+    }
+    #[test]
+    fn health_excludes_qa_actors_from_population() {
+        let mut w = world();
+        w.enter(ch(&w), None).unwrap();
+        let mut native = ch(&w);
+        native.id = 2;
+        native.account = 2;
+        let (packets, _rx) = mpsc::channel(64);
+        let (lost, _watch) = watch::channel(false);
+        w.enter(native, Some(Output { packets, lost })).unwrap();
+        let health = w.health(Instant::now());
+        assert_eq!(health["players"], 1);
+        assert_eq!(health["bots"], 0);
+        assert_eq!(health["qa_actors"], 1);
+        assert_eq!(health["entities"], w.entities.len());
+        assert_eq!(health["projectiles"], w.bullets.len());
+        assert_eq!(health["tick"], w.tick);
+        assert_eq!(health["max_tick_us"], w.max_tick_us);
+    }
+    #[test]
+    fn health_uptime_uses_elapsed_process_time_not_world_ticks() {
+        let w = world();
+        let started = Instant::now();
+        let before = w.health(started)["uptime_seconds"].as_u64().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let after = w.health(started)["uptime_seconds"].as_u64().unwrap();
+        assert!(after > before);
+        assert_eq!(w.tick, 0);
     }
     #[test]
     fn one_owner_and_no_teleport() {

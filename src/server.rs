@@ -50,6 +50,7 @@ impl App {
 use tokio::sync::mpsc;
 #[derive(Clone)]
 pub struct App {
+    pub started: std::time::Instant,
     pub store: Store,
     pub world: Handle,
     pub keys: Arc<Keys>,
@@ -169,7 +170,11 @@ async fn swf(State(a): State<App>) -> Response {
         .into_response()
 }
 async fn health(State(a): State<App>) -> Response {
-    match a.world.call(|w|Ok(serde_json::json!({"status":"development","players":w.players.len(),"entities":w.entities.len(),"projectiles":w.bullets.len(),"tick":w.tick,"max_tick_us":w.max_tick_us}))).await{Ok(v)=>Json(v).into_response(),Err(e)=>error(e)}
+    let started = a.started;
+    match a.world.call(move |w| Ok(w.health(started))).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, error(e)).into_response(),
+    }
 }
 async fn websocket(
     State(a): State<App>,

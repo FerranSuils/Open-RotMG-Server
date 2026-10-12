@@ -10,6 +10,7 @@ use rand::RngCore;
 use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<()> {
+    let started = std::time::Instant::now();
     let filter = match std::env::var("RUST_LOG") {
         Ok(v) => tracing_subscriber::EnvFilter::try_new(v)?,
         Err(std::env::VarError::NotPresent) => tracing_subscriber::EnvFilter::new("openrotmg=info"),
@@ -66,6 +67,7 @@ async fn main() -> Result<()> {
         None
     };
     let app = server::App {
+        started,
         store,
         world,
         keys,
