@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
     for file in ["index.html", "vendor/ruffle.js"] {
         ensure!(
             client.join(file).is_file(),
-            "missing client asset {file}; run python3 ../client/run.py --prepare-only"
+            "missing client asset {file}; run ../client/run.sh --prepare-only"
         );
     }
     let content = Arc::new(content::Content::load(&config.data)?);

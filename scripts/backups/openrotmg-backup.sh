@@ -9,6 +9,7 @@ export GIT_CONFIG_VALUE_1=/opt/openrotmg-backup/openrotmg-backup-credential.py
 export GIT_CONFIG_KEY_2=credential.useHttpPath
 export GIT_CONFIG_VALUE_2=true
 cd /var/lib/openrotmg-backup/repo
+git pull --rebase origin main
 /usr/bin/python3 /opt/openrotmg-backup/backup.py export --game /var/lib/openrotmg/game.db --discord /var/lib/openrotmg-discord-bot/levels.sqlite --output state.json.gz --server-revision /opt/openrotmg/server/REVISION --bot-revision /opt/openrotmg-discord-bot/REVISION
 git add state.json.gz
 git commit -m "Daily persisted-state backup $(date -u +%Y-%m-%dT%H:%M:%SZ)"
