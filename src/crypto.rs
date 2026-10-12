@@ -129,6 +129,23 @@ fn patch_abc(abc: &[u8], replacement: &[String; 4]) -> Result<(Vec<u8>, usize)> 
     out.extend(&abc[p..]);
     Ok((out, changed))
 }
+const LOADING_METHOD: &[u8] = b"\x05\x03\x09\x0a\x76\x27\x26\xd5\x10\x06\x00\x00\x1c\x77\x1d\x87\x26\xa6\xd6\xd0\x30\xd1\x2a\x11\x03\x00\x00\x29\xd0\x76\x12\x3b\x00\x00\xd0\x66\xaa\x30\x10\x06\x00\x00\x85\x96\xb0\xad\xc0\xc7\xd2\x11\x37\x00\x00\x76\xd2\x2a\x12\x0d\x00\x00\x10\x06\x00\x00\x30\x73\x87\x82\xd7\x1d\x29\xd2\x76\x11\x1f\x00\x00\x2a\x12\x1a\x00\x00\xd2\x11\x15\x00\x00\x29\xd1\x12\x18\x00\x00\xd0\x66\xaf\x0f\x66\xaf\x4e\x60\xfc\x29\x60\x8b\x1f\xa3\xb0\x12\x0a\x00\x00\xd1\x12\x05\x00\x00\xd0\x4f\xc6\x3c\x00\x47\x00\x00";
+fn patch_loading(data: &mut [u8]) -> Result<usize> {
+    let positions: Vec<_> = data
+        .windows(LOADING_METHOD.len())
+        .enumerate()
+        .filter_map(|(i, bytes)| (bytes == LOADING_METHOD).then_some(i))
+        .collect();
+    ensure!(positions.len() <= 1, "ambiguous loading-readiness method");
+    if let Some(&offset) = positions.first() {
+        // Socket initialization can precede the embedded loading movie's COMPLETE event.
+        let guard = &mut data[offset + 5 + 43..offset + 5 + 88];
+        guard.fill(0x02);
+        guard[..16]
+            .copy_from_slice(b"\x12\x46\x00\x00\xd0\x66\xaf\x0f\x12\x3e\x00\x00\x10\x1d\x00\x00");
+    }
+    Ok(positions.len())
+}
 fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
     ensure!(source.len() >= 9, "truncated reference SWF");
     let mut body = Vec::new();
@@ -145,6 +162,7 @@ fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
     let mut out = body[..start].to_vec();
     let mut p = start;
     let mut changed = 0;
+    let mut loading = 0;
     while p < body.len() {
         let h = u16::from_le_bytes(
             body.get(p..p + 2)
@@ -172,8 +190,9 @@ fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
                 .iter()
                 .position(|b| *b == 0)
                 .context("unterminated DoABC name")?;
-            let (abc, c) = patch_abc(&data[offset..], replacement)?;
+            let (mut abc, c) = patch_abc(&data[offset..], replacement)?;
             changed += c;
+            loading += patch_loading(&mut abc)?;
             let mut d = data[..offset].to_vec();
             d.extend(abc);
             d
@@ -192,6 +211,10 @@ fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
         changed == 4,
         "expected four public-key string fragments, found {changed}"
     );
+    ensure!(
+        loading == 1,
+        "expected one exact loading-readiness method, found {loading}"
+    );
     let mut result = source[..8].to_vec();
     result[4..8].copy_from_slice(&((out.len() + 8) as u32).to_le_bytes());
     if &source[..3] == b"CWS" {
@@ -206,6 +229,29 @@ fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn loading_guard_requires_exact_unique_method_and_preserves_layout() {
+        let mut method = LOADING_METHOD.to_vec();
+        let before = method.clone();
+        assert_eq!(patch_loading(&mut method).unwrap(), 1);
+        assert_eq!(method.len(), before.len());
+        assert_eq!(&method[..48], &before[..48]);
+        assert_eq!(&method[93..], &before[93..]);
+        assert_eq!(
+            &method[48..64],
+            b"\x12\x46\x00\x00\xd0\x66\xaf\x0f\x12\x3e\x00\x00\x10\x1d\x00\x00"
+        );
+        assert!(method[64..93].iter().all(|byte| *byte == 0x02));
+        assert_eq!(patch_loading(&mut method).unwrap(), 0);
+        let mut duplicate = before.repeat(2);
+        assert!(patch_loading(&mut duplicate).is_err());
+        assert_eq!(duplicate, before.repeat(2));
+        for i in 0..before.len() {
+            let mut corrupt = before.clone();
+            corrupt[i] ^= 1;
+            assert_eq!(patch_loading(&mut corrupt).unwrap(), 0);
+        }
+    }
     #[test]
     fn public_key_patch_preserves_reference() {
         let dir = std::env::temp_dir().join(format!("openrotmg-key-test-{}", std::process::id()));

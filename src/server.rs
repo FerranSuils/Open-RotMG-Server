@@ -179,7 +179,10 @@ async fn fame(State(a): State<App>, Form(form): Form<HashMap<String, String>>) -
 }
 async fn swf(State(a): State<App>) -> Response {
     (
-        [("content-type", "application/x-shockwave-flash")],
+        [
+            ("content-type", "application/x-shockwave-flash"),
+            ("cache-control", "no-store"),
+        ],
         a.swf.as_ref().clone(),
     )
         .into_response()
