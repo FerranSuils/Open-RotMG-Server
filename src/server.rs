@@ -57,7 +57,6 @@ pub struct App {
     pub content: Arc<Content>,
     pub swf: Arc<Vec<u8>>,
     pub origin: String,
-    pub hosted_client: bool,
     pub sfx: PathBuf,
     pub max_players: usize,
     pub behind_proxy: bool,
@@ -78,22 +77,13 @@ fn error(e: anyhow::Error) -> Response {
     )
         .into_response()
 }
-const HOSTED_ORIGIN: &str = "https://openrotmg.org";
-fn allowed_origin(origin: &str, configured: &str, hosted: bool) -> bool {
-    origin == configured || (hosted && origin == HOSTED_ORIGIN)
-}
 fn admit(a: &App, headers: &HeaderMap, peer: SocketAddr) -> Result<bool> {
     if let Some(origin) = headers.get("origin") {
         ensure!(
-            allowed_origin(origin.to_str()?, &a.origin, a.hosted_client),
-            "unapproved request origin: {}; expected {}{}",
+            origin.to_str()? == a.origin,
+            "unapproved request origin: {}; expected {}",
             origin.to_str()?,
-            a.origin,
-            if a.hosted_client {
-                " or https://openrotmg.org"
-            } else {
-                ""
-            }
+            a.origin
         );
     }
     let ip = if a.behind_proxy {
@@ -201,8 +191,8 @@ async fn websocket(
     ws: WebSocketUpgrade,
 ) -> Response {
     let origin = headers.get("origin").and_then(|v| v.to_str().ok());
-    if !origin.is_some_and(|v| allowed_origin(v, &a.origin, a.hosted_client)) {
-        tracing::warn!(?origin, expected=%a.origin, hosted_client=a.hosted_client, "unapproved WebSocket origin");
+    if origin != Some(a.origin.as_str()) {
+        tracing::warn!(?origin, expected=%a.origin, "unapproved WebSocket origin");
         return (
             StatusCode::FORBIDDEN,
             "unapproved WebSocket origin; inspect the server log for received and expected origins",
@@ -681,16 +671,6 @@ async fn bot_leave(
         Err(e) => error(e),
     }
 }
-async fn local_client(State(a): State<App>) -> Response {
-    if !a.hosted_client {
-        return (
-            StatusCode::NOT_FOUND,
-            "Hosted development client is disabled. Start the server with ./run.sh.",
-        )
-            .into_response();
-    }
-    Json(serde_json::json!({"protocol": 1, "mode": "local-development"})).into_response()
-}
 pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
     let deaths = a.clone();
     tokio::spawn(async move {
@@ -720,23 +700,13 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| {
         format!("cannot listen on {bind}; another server may already use this port. Stop it and rerun ./run.sh")
     })?;
-    let mut origins = vec![a.origin.parse::<axum::http::HeaderValue>()?];
-    if a.hosted_client {
-        origins.push(HOSTED_ORIGIN.parse()?);
-    }
-    let cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(origins)
-        .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
-        .allow_headers([axum::http::header::CONTENT_TYPE]);
     let app = Router::new()
         .route("/legacy-api/char/list", post(chars))
         .route("/legacy-api/char/fame", post(fame))
         .nest_service("/sfx", tower_http::services::ServeDir::new(a.sfx.clone()))
         .route("/client.swf", get(swf))
         .route("/game", get(websocket))
-        .route("/health", get(health))
-        .route("/local-client", get(local_client))
-        .layer(cors);
+        .route("/health", get(health));
     let app = app
         .route("/dev/join", post(bot_create))
         .route("/dev/action", post(bot_action))
@@ -758,13 +728,8 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
         )
         .layer(DefaultBodyLimit::max(1_048_576))
         .with_state(a.clone());
-    tracing::info!(address=%bind,origin=%a.origin,max_players=a.max_players,behind_proxy=a.behind_proxy,hosted_client=a.hosted_client,"game frontdoor listening");
-    if a.hosted_client {
-        eprintln!(
-            "\nLocal server ready. Open: {HOSTED_ORIGIN}/local/#port={}\nAllow local-network access if your browser asks.\nLogs: the terminal and .local/server.log\nIf the hosted client does not work, stop this server, clone https://github.com/OpenRotMG/Open-RotMG-Client beside this repo as client, then run ./run.sh --local-client ../client.\n",
-            bind.port()
-        );
-    } else if !a.behind_proxy {
+    tracing::info!(address=%bind,origin=%a.origin,max_players=a.max_players,behind_proxy=a.behind_proxy,"game frontdoor listening");
+    if !a.behind_proxy {
         eprintln!(
             "\nLocal server ready. Open: http://{bind}/\nLogs: the terminal and .local/server.log\n"
         );
@@ -837,21 +802,6 @@ async fn shutdown_signal() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn hosted_origin_is_explicit_and_exact() {
-        let local = "http://127.0.0.1:18923";
-        assert!(allowed_origin(local, local, false));
-        assert!(!allowed_origin(HOSTED_ORIGIN, local, false));
-        assert!(allowed_origin(HOSTED_ORIGIN, local, true));
-        for origin in [
-            "https://evil.example",
-            "https://openrotmg.org.evil.example",
-            "http://openrotmg.org",
-            "null",
-        ] {
-            assert!(!allowed_origin(origin, local, true));
-        }
-    }
     #[test]
     fn guest_rate_is_bounded_and_expires() {
         let mut requests = HashMap::new();

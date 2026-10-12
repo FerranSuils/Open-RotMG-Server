@@ -4,7 +4,7 @@ Rust backend for the Open RotMG recreation of Realm of the Mad God.
 
 ## Run locally
 
-Install Rust/Cargo and Python 3, then run:
+Install Rust/Cargo and Python 3, then run. The client downloads automatically:
 
 ```sh
 ./run.sh

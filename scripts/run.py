@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
+import io
 from pathlib import Path
 import shutil
 import signal
 import subprocess
 import sys
 from urllib.request import urlopen
+from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
 REVISION = "b4fb2a94a06077dab6d01abce3cddd5f64e5416a"
-URL = f"https://raw.githubusercontent.com/OpenRotMG/Open-RotMG-Client/{REVISION}/client.swf"
-SHA256 = "07ae4fc3ca021a5bf08bbf94f057f7620be18b85e01abd763b3a198382e8fa48"
+URL = f"https://codeload.github.com/OpenRotMG/Open-RotMG-Client/zip/{REVISION}"
+SHA256 = "a4fd1e97be639dfaf23d8d3e1b82c20eab5668e0c6b64e1d018f5f5cf30c2925"
 LOG = ROOT / ".local/server.log"
 
 
 def prepare_client():
-    path = ROOT / ".local/hosted-client/client.swf"
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.exists():
-        data = path.read_bytes()
+    cache = ROOT / f".local/client-{REVISION}.zip"
+    cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if cache.exists():
+        data = cache.read_bytes()
     else:
-        print(f"Downloading pinned reference client: {URL}", flush=True)
+        print(f"Downloading local client: {URL}", flush=True)
         try:
             with urlopen(URL, timeout=60) as response:
                 data = response.read()
@@ -29,13 +31,27 @@ def prepare_client():
             raise RuntimeError(f"Download {URL} failed: {type(error).__name__}: {error}") from error
     actual = hashlib.sha256(data).hexdigest()
     if actual != SHA256:
-        raise RuntimeError(
-            f"Client checksum mismatch: expected {SHA256}, got {actual}. "
-            f"Refusing to run. If the cached file is damaged, remove {path} and rerun."
-        )
-    if not path.exists():
-        path.write_bytes(data)
-    print(f"Verified reference client: {SHA256}", flush=True)
+        raise RuntimeError(f"Client archive checksum mismatch: expected {SHA256}, got {actual}. Remove {cache} and rerun.")
+    prefix = f"Open-RotMG-Client-{REVISION}"
+    client = cache.parent / prefix
+    with ZipFile(io.BytesIO(data)) as archive:
+        for item in archive.infolist():
+            path = Path(item.filename)
+            if path.is_absolute() or ".." in path.parts or path.parts[0] != prefix or (item.external_attr >> 16) & 0o170000 not in (0, 0o100000, 0o040000):
+                raise RuntimeError(f"Unsafe client archive entry: {item.filename}")
+        if not client.exists():
+            stage = cache.parent / f"client-extract-{REVISION}"
+            stage.mkdir(mode=0o700)
+            archive.extractall(stage)
+            (stage / prefix).rename(client)
+            stage.rmdir()
+        for name in ["client.swf", "index.html", "scripts/run.py"]:
+            path = client / name
+            if not path.is_file() or path.read_bytes() != archive.read(f"{prefix}/{name}"):
+                raise RuntimeError(f"Cached client asset is missing or modified: {path}. Remove {client} and rerun.")
+    if not cache.exists():
+        cache.write_bytes(data)
+    return client
 
 
 def run(command, cwd, log):
@@ -63,9 +79,9 @@ def port_number(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Start the local server with the client hosted at openrotmg.org.")
+    parser = argparse.ArgumentParser(description="Download the client and start your local OpenRotMG game.")
     parser.add_argument("port", nargs="?", type=port_number, help="Local server port (default: 18923)")
-    parser.add_argument("--local-client", type=Path, metavar="DIR", help="Explicitly use a local client checkout instead of the hosted page")
+    parser.add_argument("--local-client", type=Path, metavar="DIR", help="Use your own client checkout instead of downloading the pinned client")
     parser.add_argument("--dev-control", action="store_true", help="Enable loopback-only QA control")
     args = parser.parse_args()
     if shutil.which("cargo") is None:
@@ -73,20 +89,16 @@ def main():
     ROOT.joinpath(".local").mkdir(mode=0o700, exist_ok=True)
     with LOG.open("a") as log:
         try:
-            if args.local_client is not None:
-                client = args.local_client.resolve()
-                prepare = client / "scripts/run.py"
-                if not prepare.is_file():
-                    raise RuntimeError(f"Missing client launcher: {prepare}. Clone https://github.com/OpenRotMG/Open-RotMG-Client into {client}.")
-                print(f"Preparing your local client at {client}. Logs: {LOG}", flush=True)
-                if run([sys.executable, str(prepare), "--prepare-only"], client, log):
-                    raise RuntimeError(f"Local client preparation failed. See the error above and {LOG}.")
-                client_args = ["--client", str(client)]
-            else:
-                prepare_client()
-                client_args = ["--hosted-client"]
-            print(f"Building and starting your local server. Logs: {LOG}", flush=True)
-            command = ["cargo", "run", "--locked", "--", *client_args]
+            client = args.local_client.resolve() if args.local_client is not None else prepare_client()
+            prepare = client / "scripts/run.py"
+            if not prepare.is_file():
+                raise RuntimeError(f"Missing client launcher: {prepare}. Use a complete Open-RotMG-Client checkout.")
+            print(f"Preparing local client. Logs: {LOG}", flush=True)
+            code = run([sys.executable, str(prepare), "--prepare-only"], client, log)
+            if code:
+                raise RuntimeError(f"Client preparation exited with status {code}. See the error above and {LOG}.")
+            print(f"Building and starting your local game. Logs: {LOG}", flush=True)
+            command = ["cargo", "run", "--locked", "--", "--client", str(client)]
             if args.port is not None:
                 command.extend(["--port", str(args.port)])
             if args.dev_control:

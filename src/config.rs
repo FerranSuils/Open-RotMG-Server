@@ -12,15 +12,12 @@ pub struct Config {
     pub state: PathBuf,
     pub max_players: usize,
     pub behind_proxy: bool,
-    #[serde(skip)]
-    pub hosted_client: bool,
 }
 impl Config {
     pub fn load(args: &[String]) -> Result<(Self, bool)> {
         let mut file = None;
         let mut port = None;
         let mut control = false;
-        let mut hosted_client = false;
         let mut client_dir = None;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -46,12 +43,8 @@ impl Config {
                         args.next().context("--client requires a directory")?,
                     ));
                 }
-                "--hosted-client" => {
-                    ensure!(!hosted_client, "duplicate --hosted-client");
-                    hosted_client = true;
-                }
                 _ => anyhow::bail!(
-                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--hosted-client | --client DIR]"
+                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--client DIR]"
                 ),
             }
         }
@@ -72,19 +65,10 @@ impl Config {
                 state: root.join(".local"),
                 max_players: 85,
                 behind_proxy: false,
-                hosted_client: false,
             }
         };
-        ensure!(
-            !hosted_client || client_dir.is_none(),
-            "--client and --hosted-client cannot be combined"
-        );
         if let Some(client) = client_dir {
             config.client = client;
-        }
-        config.hosted_client = hosted_client;
-        if hosted_client && file.is_none() {
-            config.client = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local/hosted-client");
         }
         if let Some(port) = port {
             config.bind.set_port(port);
@@ -120,10 +104,6 @@ impl Config {
         ensure!(
             !control || (local && !self.behind_proxy),
             "development control cannot be enabled behind a public proxy"
-        );
-        ensure!(
-            !self.hosted_client || (local && !self.behind_proxy),
-            "hosted development client requires a local origin without a public proxy"
         );
         ensure!(
             (1..=85).contains(&self.max_players),
@@ -167,8 +147,7 @@ mod tests {
         assert_eq!(default.bind.to_string(), "127.0.0.1:18923");
         assert_eq!(default.origin, "http://127.0.0.1:18923");
         for port in ["1", "8080", "65535"] {
-            let (custom, _) =
-                Config::load(&["--hosted-client".into(), "--port".into(), port.into()]).unwrap();
+            let (custom, _) = Config::load(&["--port".into(), port.into()]).unwrap();
             assert_eq!(custom.bind.to_string(), format!("127.0.0.1:{port}"));
             assert_eq!(custom.origin, format!("http://127.0.0.1:{port}"));
         }
@@ -189,9 +168,7 @@ mod tests {
     #[test]
     fn local_launcher_remains_explicit() {
         Config::load(&[]).unwrap();
-        let (hosted, _) = Config::load(&["--hosted-client".into()]).unwrap();
-        assert!(hosted.hosted_client);
-        assert!(hosted.client.ends_with(".local/hosted-client"));
+        assert!(Config::load(&["--hosted-client".into()]).is_err());
         assert!(Config::load(&["--client".into()]).is_err());
         assert!(Config::load(&["--client".into(), "relative".into()]).is_err());
         assert!(
@@ -203,12 +180,7 @@ mod tests {
             .is_err()
         );
         let (local, _) = Config::load(&["--client".into(), "/tmp/client".into()]).unwrap();
-        assert!(!local.hosted_client);
         assert_eq!(local.client, PathBuf::from("/tmp/client"));
-        assert!(Config::load(&["--hosted-client".into(), "--hosted-client".into()]).is_err());
-        let mut public = config();
-        public.hosted_client = true;
-        assert!(public.validate(false).is_err());
         Config::load(&["--dev-control".into()]).unwrap();
         assert!(Config::load(&["--dev-control".into(), "--dev-control".into()]).is_err());
     }
