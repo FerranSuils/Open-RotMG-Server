@@ -30,12 +30,19 @@ async fn main() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
     }
-    for file in ["index.html", "vendor/ruffle.js"] {
-        ensure!(
-            client.join(file).is_file(),
-            "missing client asset {file}; run ../client/run.sh --prepare-only"
-        );
+    if !config.hosted_client {
+        for file in ["index.html", "vendor/ruffle.js"] {
+            ensure!(
+                client.join(file).is_file(),
+                "missing client asset {file}; run ../client/run.sh --prepare-only, or ./run.sh for the hosted client"
+            );
+        }
     }
+    ensure!(
+        client.join("client.swf").is_file(),
+        "missing reference client {}; run ./run.sh to download the pinned client",
+        client.join("client.swf").display()
+    );
     let content = Arc::new(content::Content::load(&config.data)?);
     let map = Arc::new(content::Map::load(
         &config.data.join("tutorial.wmap"),
@@ -74,6 +81,7 @@ async fn main() -> Result<()> {
         content,
         swf,
         origin: config.origin,
+        hosted_client: config.hosted_client,
         sfx: config.data.join("sfx"),
         max_players: config.max_players,
         behind_proxy: config.behind_proxy,

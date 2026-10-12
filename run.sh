@@ -1,8 +1,7 @@
 #!/bin/sh
 set -eu
-client="$(dirname "$0")/../client/run.sh"
-if [ ! -f "$client" ]; then
-    echo "Missing sibling client. Clone https://github.com/OpenRotMG/Open-RotMG-Client beside this repository as client." >&2
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Python 3 not found. Install Python 3 and Rust/Cargo, then rerun ./run.sh." >&2
     exit 1
 fi
-exec sh "$client" "$@"
+exec python3 "$(dirname "$0")/scripts/run.py" "$@"

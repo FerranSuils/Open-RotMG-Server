@@ -4,13 +4,17 @@ Rust backend for the Open RotMG recreation of Realm of the Mad God.
 
 ## Run locally
 
-Install Rust/Cargo and Python 3. Clone https://github.com/OpenRotMG/Open-RotMG-Client beside this repository as `client`.
+Install Rust/Cargo and Python 3, then run:
 
 ```sh
 ./run.sh
 ```
 
-Open http://127.0.0.1:18923/ to play the development game.
+Open the https://openrotmg.org/local/#port=18923 URL printed when the server is ready. Allow local-network access if asked. No client clone needed; the launcher downloads a verified reference client on first run.
+
+Errors appear in the terminal and `.local/server.log`; the browser page shows connection errors and its own log.
+
+Prefer a local client? Stop the server, clone https://github.com/OpenRotMG/Open-RotMG-Client beside this repository as `client`, then run `./run.sh --local-client ../client` and open http://127.0.0.1:18923/.
 
 ---
 
