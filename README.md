@@ -10,6 +10,12 @@ Install Rust/Cargo and Python 3, then run:
 ./run.sh
 ```
 
+Optionally pass a port (default: `18923`):
+
+```sh
+./run.sh 8080
+```
+
 Open the URL printed when the server is ready.
 
 ---
