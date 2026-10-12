@@ -45,10 +45,12 @@ def prepare_client():
             archive.extractall(stage)
             (stage / prefix).rename(client)
             stage.rmdir()
-        for name in ["client.swf", "index.html", "scripts/run.py"]:
+        for name in ["client.swf", "index.html", "scripts/run.py", "run.sh"]:
             path = client / name
-            if not path.is_file() or path.read_bytes() != archive.read(f"{prefix}/{name}"):
+            if path.is_symlink() or not path.is_file() or path.read_bytes() != archive.read(f"{prefix}/{name}"):
                 raise RuntimeError(f"Cached client asset is missing or modified: {path}. Remove {client} and rerun.")
+        # ZipFile drops Unix permissions; restore the verified launcher on fresh and cached installs.
+        (client / "run.sh").chmod((archive.getinfo(f"{prefix}/run.sh").external_attr >> 16) & 0o777)
     if not cache.exists():
         cache.write_bytes(data)
     return client

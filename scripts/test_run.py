@@ -18,7 +18,7 @@ class LauncherTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.prefix = f"Open-RotMG-Client-{launcher.REVISION}"
         self.client = self.root / '.local' / self.prefix
-        self.data = self.archive({"client.swf": b"reference", "index.html": b"page", "scripts/run.py": b"prepare"})
+        self.data = self.archive({"client.swf": b"reference", "index.html": b"page", "scripts/run.py": b"prepare", "run.sh": b"#!/bin/sh\n"})
         self.patch = patch.multiple(launcher, ROOT=self.root, LOG=self.root / ".local/server.log",
                                     SHA256=hashlib.sha256(self.data).hexdigest())
         self.patch.start()
@@ -27,7 +27,9 @@ class LauncherTests(unittest.TestCase):
         stream = io.BytesIO()
         with ZipFile(stream, 'w') as archive:
             for name, content in files.items():
-                archive.writestr(f'{self.prefix}/{name}', content)
+                info = ZipInfo(f'{self.prefix}/{name}')
+                info.external_attr = (0o100755 if name == 'run.sh' else 0o100644) << 16
+                archive.writestr(info, content)
         return stream.getvalue()
 
     def tearDown(self):
@@ -38,9 +40,12 @@ class LauncherTests(unittest.TestCase):
         with patch.object(launcher, "urlopen", return_value=io.BytesIO(self.data)) as download:
             self.assertEqual(launcher.prepare_client(), self.client)
             download.assert_called_once_with(launcher.URL, timeout=60)
+        self.assertEqual((self.client / 'run.sh').stat().st_mode & 0o777, 0o755)
+        (self.client / 'run.sh').chmod(0o644)
         with patch.object(launcher, "urlopen", side_effect=AssertionError("no silent redownload")):
             self.assertEqual(launcher.prepare_client(), self.client)
         self.assertEqual((self.client / 'index.html').read_bytes(), b'page')
+        self.assertEqual((self.client / 'run.sh').stat().st_mode & 0o777, 0o755)
 
     def test_corrupt_download_and_archive_cache_fail(self):
         cache = self.root / f'.local/client-{launcher.REVISION}.zip'
