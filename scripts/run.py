@@ -52,8 +52,19 @@ def run(command, cwd, log):
             raise
 
 
+def port_number(value):
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("port must be an integer between 1 and 65535") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
 def main():
     parser = argparse.ArgumentParser(description="Start the local server with the client hosted at openrotmg.org.")
+    parser.add_argument("port", nargs="?", type=port_number, help="Local server port (default: 18923)")
     parser.add_argument("--local-client", type=Path, metavar="DIR", help="Explicitly use a local client checkout instead of the hosted page")
     parser.add_argument("--dev-control", action="store_true", help="Enable loopback-only QA control")
     args = parser.parse_args()
@@ -76,6 +87,8 @@ def main():
                 client_args = ["--hosted-client"]
             print(f"Building and starting your local server. Logs: {LOG}", flush=True)
             command = ["cargo", "run", "--locked", "--", *client_args]
+            if args.port is not None:
+                command.extend(["--port", str(args.port)])
             if args.dev_control:
                 command.append("--dev-control")
             code = run(command, ROOT, log)

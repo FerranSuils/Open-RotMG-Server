@@ -18,6 +18,7 @@ pub struct Config {
 impl Config {
     pub fn load(args: &[String]) -> Result<(Self, bool)> {
         let mut file = None;
+        let mut port = None;
         let mut control = false;
         let mut hosted_client = false;
         let mut client_dir = None;
@@ -27,6 +28,13 @@ impl Config {
                 "--config" => {
                     ensure!(file.is_none(), "duplicate --config");
                     file = Some(args.next().context("--config requires a JSON file")?);
+                }
+                "--port" => {
+                    ensure!(port.is_none(), "duplicate --port");
+                    let value = args.next().context("--port requires a port number")?;
+                    let value: u16 = value.parse().context("port must be between 1 and 65535")?;
+                    ensure!(value != 0, "port must be between 1 and 65535");
+                    port = Some(value);
                 }
                 "--dev-control" => {
                     ensure!(!control, "duplicate --dev-control");
@@ -43,7 +51,7 @@ impl Config {
                     hosted_client = true;
                 }
                 _ => anyhow::bail!(
-                    "usage: openrotmg [--config FILE] [--dev-control] [--hosted-client | --client DIR]"
+                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--hosted-client | --client DIR]"
                 ),
             }
         }
@@ -77,6 +85,12 @@ impl Config {
         config.hosted_client = hosted_client;
         if hosted_client && file.is_none() {
             config.client = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".local/hosted-client");
+        }
+        if let Some(port) = port {
+            config.bind.set_port(port);
+            if file.is_none() {
+                config.origin = format!("http://{}", config.bind);
+            }
         }
         config.validate(control)?;
         Ok((config, control))
@@ -146,6 +160,31 @@ mod tests {
         c = config();
         c.state = "relative".into();
         assert!(c.validate(false).is_err());
+    }
+    #[test]
+    fn optional_local_port() {
+        let (default, _) = Config::load(&[]).unwrap();
+        assert_eq!(default.bind.to_string(), "127.0.0.1:18923");
+        assert_eq!(default.origin, "http://127.0.0.1:18923");
+        for port in ["1", "8080", "65535"] {
+            let (custom, _) =
+                Config::load(&["--hosted-client".into(), "--port".into(), port.into()]).unwrap();
+            assert_eq!(custom.bind.to_string(), format!("127.0.0.1:{port}"));
+            assert_eq!(custom.origin, format!("http://127.0.0.1:{port}"));
+        }
+        assert!(Config::load(&["--port".into()]).is_err());
+        for port in ["0", "-1", "65536", "abc", "8080.5"] {
+            assert!(Config::load(&["--port".into(), port.into()]).is_err());
+        }
+        assert!(
+            Config::load(&[
+                "--port".into(),
+                "8080".into(),
+                "--port".into(),
+                "8081".into()
+            ])
+            .is_err()
+        );
     }
     #[test]
     fn local_launcher_remains_explicit() {
