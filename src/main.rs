@@ -1,6 +1,8 @@
 mod config;
 mod content;
 mod crypto;
+mod encounter;
+mod loot;
 mod server;
 mod store;
 mod wire;
@@ -42,16 +44,11 @@ async fn main() -> Result<()> {
         client.join("client.swf").display()
     );
     let content = Arc::new(content::Content::load(&config.data)?);
-    let map = Arc::new(content::Map::load(
-        &config.data.join("tutorial.wmap"),
-        &content,
-    )?);
     let keys = Arc::new(crypto::Keys::load(&state)?);
     let swf = Arc::new(keys.client(&client.join("client.swf"))?);
-    let store = store::Store::open(&state.join("game.db"))?;
-    let mut world = world::World::new(content.clone(), map)?;
-    world.max_players = config.max_players;
-    let world = world::Handle::spawn(world);
+    let store = store::Store::open(&state.join("game.db"), &content)?;
+    let directory = world::Directory::load(&config.data, content.clone(), config.max_players)?;
+    let world = world::Handle::spawn(directory);
     let control = if dev_control {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);

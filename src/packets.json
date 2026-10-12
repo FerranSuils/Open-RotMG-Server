@@ -53,5 +53,65 @@
         "wire": "000000090619014679"
       }
     ]
+  },
+  {
+    "direction": "client_to_server",
+    "frames": [
+      {
+        "name": "REQUESTTRADE",
+        "plain": "0000000d150006477565737432",
+        "wire": "0000000d15c21192f802766ada"
+      },
+      {
+        "name": "CHANGETRADE",
+        "plain": "0000001325000c000000000100000000000000",
+        "wire": "000000132500812fa2d3eb0da16c7c8d376136"
+      },
+      {
+        "name": "ACCEPTTRADE",
+        "plain": "0000002139000c000000000100000000000000000c000000000100000000000000",
+        "wire": "000000213965edd6e1a73a0085aec55fd9c02e36507c62d8cf635a32d763a75c0b"
+      },
+      {
+        "name": "CANCELTRADE",
+        "plain": "0000000501",
+        "wire": "0000000501"
+      },
+      {
+        "name": "INVDROP",
+        "plain": "0000000c23000186a0040a22",
+        "wire": "0000000c2311e6ddae44c242"
+      }
+    ]
+  },
+  {
+    "direction": "server_to_client",
+    "frames": [
+      {
+        "name": "TRADEREQUESTED",
+        "plain": "0000000d3d0006477565737431",
+        "wire": "0000000d3db287a6e364e82b52"
+      },
+      {
+        "name": "TRADESTART",
+        "plain": "0000010143000c00000a9700000011000000000a2e0000000b0000ffffffff0000000e0000ffffffff00000009000000000a22000000000100ffffffff000000000000ffffffff000000000000ffffffff000000000000ffffffff000000000000ffffffff000000000000ffffffff000000000000ffffffff0000000000000006477565737432000c00000a9700000011000000000a2e0000000b0000ffffffff0000000e0000ffffffff00000009000000000a22000000000100ffffffff000000000000ffffffff000000000000ffffffff000000000000ffffffff000000000000ffffffff000000000000ffffffff000000000000ffffffff000000000000",
+        "wire": "0000010143c4c09192449a13d1a8f2908f3a450abce4dfa6dec153e895da1e9206b28942a5a81d0de1b38dec11cf7bf02b69819332e9aa9c7793038d88c8fac07a39bc311d7d3e2f1ef07f9bfe2a407f95740fb33700da60677a1b905ee138c44ee5b55231eae9ba51ea39e7a70f10e75a0b6466d8bab187c21b2d6513fe5b84b56bd8f7dd018c08286df3a2455741ce87e4c2adfc5337c829b7fd6ecb1c2d3b12229d3885e44629a7a6c8bd17d29e9fbe7c659e7287a8ff8cdbc7d4e30895b396aa1b99d0e17d5de08fc538677b0b648779d16209977c7e7597c22d166c3f628c9bf3e4b002b2f79ec1d496ce24049d5573fd96b3b37db65de2394c0842971901"
+      },
+      {
+        "name": "TRADECHANGED",
+        "plain": "0000001317000c000000000100000000000000",
+        "wire": "00000013174674ec3cf8ce4b68a7d344c45d89"
+      },
+      {
+        "name": "TRADEACCEPTED",
+        "plain": "0000002112000c000000000100000000000000000c000000000100000000000000",
+        "wire": "0000002112e4d6dd2dc367f4100f4de76ae7dd7a7c17586d31ac7a46b96bff63be"
+      },
+      {
+        "name": "TRADEDONE",
+        "plain": "0000001c0c0000000000115472616465207375636365737366756c2e",
+        "wire": "0000001c0c1827d5e31a99cbeba562c3d7f096401561e7f0437c1e1b"
+      }
+    ]
   }
 ]

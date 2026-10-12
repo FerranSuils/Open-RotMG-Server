@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Play the development fixture through the authenticated normal-rule controller."""
+import argparse
 import collections
 import json
 import math
@@ -7,11 +8,10 @@ import pathlib
 import sys
 import urllib.error
 import urllib.request
+import urllib.parse
 import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-HEADERS = {"Authorization": "Bearer " + (ROOT / ".local/control.token").read_text(), "Content-Type": "application/json"}
-BASE = "http://127.0.0.1:18923"
 LIVE = set()
 
 
@@ -79,9 +79,9 @@ def wait(player, milliseconds):
 
 def play():
     identity = "self-play-" + uuid.uuid4().hex
-    player = request("join", {"guid": identity})["player"]
+    player = request("join", {"guid": identity, "world": -1})["player"]
     report("joined", observe(player))
-    companion = request("join", {"guid": "companion-" + uuid.uuid4().hex})["player"]
+    companion = request("join", {"guid": "companion-" + uuid.uuid4().hex, "world": -1})["player"]
     assert any(p["id"] == companion for p in observe(player)["players"])
     request("leave", {"player": companion})
     state = navigate(player, (12, 137))
@@ -117,7 +117,7 @@ def play():
     report("ring equipped", state)
     character = state["character"]["id"]
     request("leave", {"player": player})
-    player = request("join", {"guid": identity})["player"]
+    player = request("join", {"guid": identity, "world": -1})["player"]
     state = observe(player)
     assert state["character"]["id"] == character and state["character"]["items"][3] == 0xa4f
     report("durable reconnect", state)
@@ -128,7 +128,7 @@ def play():
     assert not state["character"]["alive"], "stationary player must eventually die in the crossfire"
     report("permanent death", state)
     request("leave", {"player": player})
-    player = request("join", {"guid": identity})["player"]
+    player = request("join", {"guid": identity, "world": -1})["player"]
     state = observe(player)
     assert state["character"]["id"] != character and state["character"]["items"][3] == -1
     report("replacement character", state)
@@ -137,6 +137,15 @@ def play():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", default="http://127.0.0.1:18923")
+    parser.add_argument("--state", type=pathlib.Path, default=ROOT / ".local")
+    args = parser.parse_args()
+    origin = urllib.parse.urlsplit(args.url)
+    if origin.scheme not in {"http", "https"} or origin.hostname not in {"127.0.0.1", "localhost", "::1"} or origin.path not in {"", "/"} or origin.query or origin.fragment or origin.username is not None:
+        parser.error("controller URL must be a loopback origin")
+    BASE = args.url.rstrip("/")
+    HEADERS = {"Authorization": "Bearer " + (args.state / "control.token").read_text().strip(), "Content-Type": "application/json"}
     try:
         play()
     finally:
