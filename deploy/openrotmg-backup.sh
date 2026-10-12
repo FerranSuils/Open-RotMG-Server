@@ -1,11 +1,13 @@
 #!/bin/sh
 set -eu
 export GIT_TERMINAL_PROMPT=0
-export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_COUNT=3
 export GIT_CONFIG_KEY_0=credential.helper
-export GIT_CONFIG_VALUE_0=/opt/openrotmg-backup/credential.py
-export GIT_CONFIG_KEY_1=credential.useHttpPath
-export GIT_CONFIG_VALUE_1=true
+export GIT_CONFIG_VALUE_0=
+export GIT_CONFIG_KEY_1=credential.helper
+export GIT_CONFIG_VALUE_1=/opt/openrotmg-backup/openrotmg-backup-credential.py
+export GIT_CONFIG_KEY_2=credential.useHttpPath
+export GIT_CONFIG_VALUE_2=true
 cd /var/lib/openrotmg-backup/repo
 /usr/bin/python3 /opt/openrotmg-backup/backup.py export --game /var/lib/openrotmg/game.db --discord /var/lib/openrotmg-discord-bot/levels.sqlite --output state.json.gz --server-revision /opt/openrotmg/server/REVISION --bot-revision /opt/openrotmg-discord-bot/REVISION
 git add state.json.gz
