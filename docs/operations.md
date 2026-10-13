@@ -1,7 +1,5 @@
 # Server development and hosting
 
-The development fixture supports Wizard movement, staff/spell combat, potions, loot/equipment, permanent death and SQLite reconnect persistence. It is not the complete 2012 game.
-
 The launcher needs Git, Rust/Cargo and Python 3. Keep development separate from other worktrees and saves:
 
 ```sh
