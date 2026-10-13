@@ -3,9 +3,21 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import {input, point, socket, transfer, attachment} from './record-demo.mjs';
+import {input, point, socket, transfer, attachment, visible} from './record-demo.mjs';
 
 const rect={x:8,y:114.25,width:800,height:600,pixels:[1200,900]};
+test('visibility observes asynchronous restoration and refuses minimized or hidden pages',async()=>{
+  let clock=0, polls=0;
+  const c={call:async(method,p)=>{assert.equal(method,'Browser.getWindowForTarget');assert.equal(p.targetId,'owned');polls++;return {bounds:{windowState:polls===1?'minimized':'normal'}};},eval:async()=>polls<3};
+  const options={now:()=>clock,wait:async ms=>{clock+=ms;}};
+  assert.deepEqual(await visible(c,'owned',options),{windowState:'normal',hidden:false});
+  assert.equal(polls,3);
+  for (const state of [{windowState:'minimized',hidden:false},{windowState:'normal',hidden:true}]) {
+    clock=0;const blocked={call:async()=>({bounds:{windowState:state.windowState}}),eval:async()=>state.hidden};
+    await assert.rejects(visible(blocked,'owned',options),/visibility deadline/);
+    assert.equal(clock,5000);
+  }
+});
 test('normalized native input uses CSS geometry, not device pixels or guessed offsets',()=>{
   assert.deepEqual(point(rect,[.5,.5]),{x:408,y:414.25});
   assert.throws(()=>point(rect,[1,.5]),/normalized/);
