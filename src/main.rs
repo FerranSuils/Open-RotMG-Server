@@ -3,6 +3,7 @@ mod config;
 mod content;
 mod crypto;
 mod encounter;
+mod endgame;
 mod loot;
 #[cfg(test)]
 #[path = "../examples/testing/prepared-state.rs"]

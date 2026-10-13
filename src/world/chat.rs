@@ -9,7 +9,7 @@ pub(crate) fn chat_error(reason: &str) -> Packet {
     text_packet("*Error*", -1, 0, reason)
 }
 
-fn text_packet(name: &str, object: i32, bubble: u8, text: &str) -> Packet {
+pub(super) fn text_packet(name: &str, object: i32, bubble: u8, text: &str) -> Packet {
     let mut out = Writer::new();
     out.utf(name)
         .i32(object)

@@ -773,6 +773,7 @@ async fn connection(socket: WebSocket, mut a: App) {
     let mut reconnect_sent = false;
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut serial = 0;
+    let mut transfers = tokio::time::interval(std::time::Duration::from_millis(250));
     let mut packet_window = std::time::Instant::now();
     let mut packet_count = 0usize;
     'connection: loop {
@@ -810,6 +811,27 @@ async fn connection(socket: WebSocket, mut a: App) {
                 Some(Ok(_))=>{tracing::warn!("non-binary game message rejected");break},
                 Some(Err(e))=>{tracing::warn!(error=%e,"WebSocket failed");break},
             },
+            _=transfers.tick(),if session.player.is_some() && !session.reconnecting=>{
+                let player = session.player.expect("guarded loaded player");
+                match automatic_transfer(&a, player).await {
+                    Ok(Some(transfer)) => {
+                        session.player = None;
+                        session.reconnecting = true;
+                        session.account.take();
+                        let packet = transfer.packet();
+                        if wsout.send(Message::Binary(codec.frame(packet.id,packet.body).into())).await.is_err(){break;}
+                        reconnect_sent=true;
+                        deadline.as_mut().reset(tokio::time::Instant::now()+std::time::Duration::from_secs(10));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(player,%error,"automatic durable transfer failed");
+                        let f=fail(&error.to_string());
+                        let _=wsout.send(Message::Binary(codec.frame(f.id,f.body).into())).await;
+                        break;
+                    }
+                }
+            },
             _=shutdown.changed()=>break,
             _=lost_rx.changed()=>{tracing::warn!(player=session.player,"closing slow game connection before its state diverges");break;},
             _=&mut deadline,if session.player.is_none() && (!session.reconnecting || reconnect_sent)=>{tracing::warn!(reconnecting=session.reconnecting,reconnect_sent,"game selection or reconnect-close deadline exceeded");break;},
@@ -836,6 +858,16 @@ async fn connection(socket: WebSocket, mut a: App) {
         }
     }
 }
+pub(crate) async fn automatic_transfer(
+    a: &App,
+    id: i32,
+) -> Result<Option<crate::world::ForcedTransfer>> {
+    let transfer = a.world.directory(move |d| d.forced_transfer(id)).await?;
+    if transfer.is_some() {
+        depart(a, id).await?;
+    }
+    Ok(transfer)
+}
 pub(crate) async fn depart(a: &App, id: i32) -> Result<()> {
     loop {
         if let Some(ch) = a
@@ -844,8 +876,15 @@ pub(crate) async fn depart(a: &App, id: i32) -> Result<()> {
             .call(move |w| w.begin_departure(id))
             .await?
         {
-            if ch.alive {
-                a.store.progress(ch).await?;
+            if ch.alive
+                && let Err(error) = a.store.progress(ch).await
+            {
+                let reason = format!("departure persistence failed: {error:#}");
+                a.world
+                    .for_player(id)
+                    .call(move |w| w.poison(id, reason))
+                    .await?;
+                return Err(error);
             }
             return a
                 .world

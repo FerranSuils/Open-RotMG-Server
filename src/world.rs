@@ -16,7 +16,9 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 mod chat;
+mod endgame;
 pub(crate) use chat::chat_error;
+pub use endgame::ForcedTransfer;
 #[cfg(test)]
 mod bot_tests;
 mod cooperative;
@@ -201,6 +203,8 @@ pub struct World {
     encounter: bool,
     population: Vec<Spawn>,
     portal_requests: Vec<Pos>,
+    critical_deaths: Vec<i32>,
+    admission_open: bool,
     bag_expiry: BTreeMap<i32, u64>,
     cleared: bool,
     clear_exit: Option<i32>,
@@ -245,6 +249,7 @@ pub struct Directory {
     grants: BTreeMap<Vec<u8>, Grant>,
     portals: BTreeMap<i32, Portal>,
     chat_budgets: BTreeMap<i32, chat::ChatBudget>,
+    endgame: endgame::RealmDirectory,
     teleports: BTreeMap<i32, Instant>,
     idle: BTreeMap<i32, u64>,
     next_world: i32,
@@ -286,7 +291,16 @@ impl Directory {
         seed: u64,
     ) -> Result<Self> {
         let mut templates = BTreeMap::new();
-        for name in ["tutorial", "nexus", "nexus-limbo", "vault", "pirate-cave"] {
+        for name in [
+            "tutorial",
+            "nexus",
+            "nexus-limbo",
+            "vault",
+            "pirate-cave",
+            crate::endgame::CASTLE,
+            crate::endgame::CHAMBER,
+            crate::endgame::CELLAR,
+        ] {
             templates.insert(
                 name.to_string(),
                 Arc::new(Map::load(&path.join(format!("{name}.wmap")), &content)?),
@@ -304,6 +318,7 @@ impl Directory {
             grants: BTreeMap::new(),
             portals: BTreeMap::new(),
             chat_budgets: BTreeMap::new(),
+            endgame: endgame::RealmDirectory::default(),
             teleports: BTreeMap::new(),
             idle: BTreeMap::new(),
             next_world: 1,
@@ -391,7 +406,7 @@ impl Directory {
         let destination = match game {
             0 | -2 => -2,
             -1 => -1,
-            -3 => -3,
+            -3 => self.endgame.active,
             -4 => -4,
             _ => bail!("world entry {game} requires a transfer grant"),
         };
@@ -399,6 +414,7 @@ impl Directory {
             self.worlds.contains_key(&destination),
             "entry world missing"
         );
+        ensure!(self.worlds[&destination].admission_open, "Realm is closed");
         Ok(destination)
     }
     pub fn instance(&mut self, template: &str, account: Option<i32>) -> Result<i32> {
@@ -453,7 +469,7 @@ impl Directory {
         };
         let destination = match kind {
             0x703 | 0x70d | 0x712 | 0x71d => -2,
-            0x704 | 0x70e | 0x71c => -3,
+            0x704 | 0x70e | 0x71c => self.initial(-3)?,
             0x720 => self.instance("vault", Some(account))?,
             0x717 => {
                 let binding = self
@@ -486,6 +502,7 @@ impl Directory {
             world.owner.is_none_or(|owner| owner == account),
             "private destination belongs to another account"
         );
+        ensure!(world.admission_open, "Realm is closed");
         let name = world.name.clone();
         let mut key = vec![0; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
@@ -535,6 +552,7 @@ impl Directory {
             self.worlds.contains_key(&destination),
             "transfer destination expired"
         );
+        ensure!(self.worlds[&destination].admission_open, "Realm is closed");
         let character = grant.character;
         self.grants.remove(&key);
         if destination > 0 {
@@ -545,7 +563,7 @@ impl Directory {
     }
     fn drop_portal(&mut self, origin: i32, pos: Pos) -> Result<i32> {
         ensure!(
-            origin == -3 && self.worlds[&origin].walkable(pos),
+            self.worlds[&origin].name == "Realm" && self.worlds[&origin].walkable(pos),
             "dungeon portal must be earned on the walkable Realm shore"
         );
         let destination = self.instance("pirate-cave", None)?;
@@ -575,7 +593,7 @@ impl Directory {
         self.grants.retain(|_, grant| grant.expires > self.tick);
         for (id, world) in &mut self.worlds {
             world.step();
-            if *id > 0 {
+            if *id > 0 && *id != self.endgame.active {
                 if world.players.is_empty() {
                     self.idle.entry(*id).or_insert(self.tick);
                 } else {
@@ -583,6 +601,7 @@ impl Directory {
                 }
             }
         }
+        self.endgame_step();
         let requests: Vec<_> = self
             .worlds
             .iter_mut()
@@ -822,6 +841,8 @@ impl World {
             encounter: false,
             population: vec![],
             portal_requests: vec![],
+            critical_deaths: vec![],
+            admission_open: true,
             bag_expiry: BTreeMap::new(),
             cleared: false,
             clear_exit: None,
@@ -935,6 +956,7 @@ impl World {
         o.0
     }
     pub fn enter(&mut self, ch: Character, tx: Option<Output>) -> Result<i32> {
+        ensure!(self.admission_open, "Realm is closed");
         ensure!(ch.alive && ch.hp > 0, "dead character");
         ch.effective(&self.content)?;
         ensure!(
@@ -2060,6 +2082,9 @@ impl World {
         Ok(id)
     }
     fn drop_loot(&mut self, defeated: &Entity) -> Result<()> {
+        if crate::endgame::HEROES.contains(&defeated.kind) {
+            self.critical_deaths.push(defeated.id);
+        }
         if defeated.kind == 0x927 && self.name == "Pirate Cave" {
             ensure!(!self.cleared, "dungeon clear already recorded");
             self.cleared = true;
