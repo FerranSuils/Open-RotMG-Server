@@ -127,6 +127,27 @@ CREATE TABLE deaths(character INTEGER PRIMARY KEY REFERENCES characters(id),snap
         self.assertNotIn(b'GUEST_LOGIN_MUST_NEVER_BE_UPLOADED', raw)
         self.assertNotIn(b'"guid"', raw)
 
+    def test_registered_credentials_are_never_selected_exported_or_restored(self):
+        self.add_latest_state()
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.execute('CREATE TABLE credentials(account INTEGER PRIMARY KEY REFERENCES accounts(id),email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL)')
+            db.execute("INSERT INTO credentials VALUES(1,'PRIVATE_EMAIL@example.org','PRIVATE_PASSWORD_VERIFIER')")
+        bundle = self.export()
+        raw = gzip.decompress(self.output.read_bytes())
+        for secret in [b'PRIVATE_EMAIL', b'PRIVATE_PASSWORD_VERIFIER', b'password_hash', b'GUEST_LOGIN_MUST_NEVER_BE_UPLOADED']:
+            self.assertNotIn(secret, raw)
+        self.assertEqual(bundle['schema'], 2)
+        self.assertNotIn('credentials', bundle['game'])
+        restored = self.root / 'registered-restore'
+        backup.restore(self.output, restored)
+        with closing(sqlite3.connect(restored / 'game.db')) as db:
+            self.assertEqual(db.execute('SELECT guid FROM accounts').fetchall(), [(None,)])
+        self.assertEqual(backup.snapshot(restored / 'game.db', backup.GAME), bundle['game'])
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.execute('ALTER TABLE credentials ADD COLUMN recovery_token TEXT')
+        with self.assertRaisesRegex(ValueError, 'columns'):
+            self.export()
+
     def test_latest_nested_credentials_and_invalid_stats_fail_closed(self):
         self.add_latest_state()
         with closing(sqlite3.connect(self.game)) as db, db:

@@ -141,15 +141,117 @@ async fn chars(
     let result: Result<String> = async {
         let guid = form.get("guid").context("guid is required")?.clone();
         ensure!(
-            form.get("password").is_none_or(|s| s.is_empty()),
-            "registered account login not implemented in this development build"
+            form.get("secret").is_none_or(|s| s.is_empty()),
+            "external platform authentication is not implemented"
         );
-        let account = a.store.list(guid).await?;
+        let password = form.get("password").context("password required")?.clone();
+        let account = a.store.characters(guid, password).await?;
         Ok(account.xml())
     }
     .await;
     match result {
         Ok(xml) => ([("content-type", "application/xml")], xml).into_response(),
+        Err(e) => error(e),
+    }
+}
+async fn account_request(
+    State(a): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Path(operation): axum::extract::Path<String>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    match admit(&a, &headers, peer) {
+        Ok(true) => {}
+        Ok(false) => return limited(),
+        Err(e) => return error(e),
+    }
+    let result: Result<String> = async {
+        let guid = form.get("guid").context("guid required")?.clone();
+        let id = match operation.as_str() {
+            "register" => {
+                a.store
+                    .register(
+                        guid,
+                        form.get("newGUID").context("newGUID required")?.clone(),
+                        form.get("newPassword")
+                            .context("newPassword required")?
+                            .clone(),
+                    )
+                    .await?
+            }
+            "verify" => {
+                let password = form.get("password").context("password required")?.clone();
+                ensure!(!password.is_empty(), "email and password required");
+                a.store.authenticate(guid, password).await?
+            }
+            "setName" => {
+                let id = a
+                    .store
+                    .authenticate(
+                        guid,
+                        form.get("password").context("password required")?.clone(),
+                    )
+                    .await?;
+                let _claim = a.claim(id)?;
+                a.store
+                    .choose_name(id, form.get("name").context("name required")?.clone())
+                    .await?;
+                id
+            }
+            _ => bail!("account operation not implemented"),
+        };
+        tracing::info!(account = id, operation, "account request completed");
+        Ok("<Success/>".into())
+    }
+    .await;
+    let xml = match result {
+        Ok(xml) => xml,
+        Err(e) => {
+            tracing::warn!(error=%e, operation, "account request rejected");
+            format!("<Error>{}</Error>", xml_escape(&e.to_string()))
+        }
+    };
+    // The original account service carries semantic failures in XML, not HTTP error pages.
+    (
+        [
+            ("content-type", "application/xml"),
+            ("cache-control", "no-store"),
+        ],
+        xml,
+    )
+        .into_response()
+}
+async fn legends(
+    State(a): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    match admit(&a, &headers, peer) {
+        Ok(true) => {}
+        Ok(false) => return limited(),
+        Err(e) => return error(e),
+    }
+    let result: Result<String> = async {
+        let span = form.get("timespan").context("timespan required")?.clone();
+        let account = form
+            .get("accountId")
+            .context("accountId required")?
+            .parse()?;
+        let character = form.get("charId").context("charId required")?.parse()?;
+        a.store.legends(span, account, character).await
+    }
+    .await;
+    match result {
+        Ok(xml) => (
+            [
+                ("content-type", "application/xml"),
+                ("cache-control", "no-store"),
+            ],
+            xml,
+        )
+            .into_response(),
         Err(e) => error(e),
     }
 }
@@ -344,8 +446,8 @@ async fn handle(
             let password = a.keys.decrypt(&r.utf()?)?;
             let secret = a.keys.decrypt(&r.utf()?)?;
             ensure!(
-                password.is_empty() && secret.is_empty(),
-                "only local guest accounts are enabled"
+                secret.is_empty(),
+                "external platform authentication is not implemented"
             );
             let keytime = r.i32()?;
             let n = usize::try_from(r.i16()?)?;
@@ -356,7 +458,7 @@ async fn handle(
                 r.utf()?;
             }
             r.done()?;
-            let id = a.store.authenticate(guid).await?;
+            let id = a.store.authenticate(guid, password).await?;
             *account = Some(a.claim(id)?);
             let (destination, character) = a
                 .world
@@ -576,7 +678,13 @@ async fn handle(
             let name = r.utf()?;
             r.done()?;
             let account = account.as_ref().context("name before HELLO")?.id;
-            a.store.rename(account, name.clone()).await?;
+            if let Err(e) = a.store.choose_name(account, name.clone()).await {
+                tracing::warn!(account, error=%e, "name choice rejected");
+                let mut o = Writer::new();
+                o.u8(0).utf(&e.to_string());
+                tx.send(Packet { id: 20, body: o.0 }).await?;
+                return Ok(());
+            }
             if let Some(id) = player {
                 let id = *id;
                 a.world
@@ -641,6 +749,7 @@ async fn connection(socket: WebSocket, mut a: App) {
     tokio::pin!(deadline);
     let mut codec = Codec::server();
     let mut session = Session::default();
+    let mut reconnect_sent = false;
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut serial = 0;
     let mut packet_window = std::time::Instant::now();
@@ -682,12 +791,13 @@ async fn connection(socket: WebSocket, mut a: App) {
             },
             _=shutdown.changed()=>break,
             _=lost_rx.changed()=>{tracing::warn!(player=session.player,"closing slow game connection before its state diverges");break;},
-            _=&mut deadline,if session.player.is_none() && !session.reconnecting=>{tracing::warn!("game selection deadline exceeded");break;},
+            _=&mut deadline,if session.player.is_none() && (!session.reconnecting || reconnect_sent)=>{tracing::warn!(reconnecting=session.reconnecting,reconnect_sent,"game selection or reconnect-close deadline exceeded");break;},
             outgoing=rx.recv()=>{
                 let Some(packet)=outgoing else {break};
                 let reconnect=packet.id==39;
                 if wsout.send(Message::Binary(codec.frame(packet.id,packet.body).into())).await.is_err(){break;}
-                if reconnect {break;}
+                // Ruffle can discard unread TCP bytes when the proxy closes before its next frame.
+                if reconnect {reconnect_sent=true;deadline.as_mut().reset(tokio::time::Instant::now()+std::time::Duration::from_secs(10));}
             },
             _=ping.tick()=>{if session.account.is_some(){serial+=1;let mut o=Writer::new();o.i32(serial);
                 if wsout.send(Message::Binary(codec.frame(wire::PING,o.0).into())).await.is_err(){break;}}}
@@ -1039,6 +1149,8 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
     let app = Router::new()
         .route("/legacy-api/char/list", post(chars))
         .route("/legacy-api/char/fame", post(fame))
+        .route("/legacy-api/account/{operation}", post(account_request))
+        .route("/legacy-api/fame/list", post(legends))
         .nest_service("/sfx", tower_http::services::ServeDir::new(a.sfx.clone()))
         .route("/client.swf", get(swf))
         .route("/game", get(websocket))

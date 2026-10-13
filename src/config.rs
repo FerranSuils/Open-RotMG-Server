@@ -14,6 +14,7 @@ pub struct Config {
     pub behind_proxy: bool,
     #[serde(default)]
     pub shore_bots: bool,
+    pub realm_seed: u64,
 }
 impl Config {
     pub fn load(args: &[String]) -> Result<(Self, bool)> {
@@ -80,6 +81,7 @@ impl Config {
                 max_players: 85,
                 behind_proxy: false,
                 shore_bots: false,
+                realm_seed: rand::random(),
             }
         };
         if let Some(client) = client_dir {
@@ -146,7 +148,7 @@ impl Config {
 mod tests {
     use super::*;
     fn config() -> Config {
-        serde_json::from_str(r#"{"bind":"127.0.0.1:18923","origin":"https://openrotmg.org","data":"/opt/openrotmg/data","client":"/opt/openrotmg/client","state":"/var/lib/openrotmg","max_players":16,"behind_proxy":true}"#).unwrap()
+        serde_json::from_str(r#"{"bind":"127.0.0.1:18923","origin":"https://openrotmg.org","data":"/opt/openrotmg/data","client":"/opt/openrotmg/client","state":"/var/lib/openrotmg","max_players":16,"behind_proxy":true,"realm_seed":12351}"#).unwrap()
     }
     #[test]
     fn explicit_production_config() {

@@ -17,6 +17,8 @@ LEGACY_GAME = {
 GAME = {**LEGACY_GAME, 'vaults': ('account', 'items', 'revision')}
 SHORE_GAME = {**GAME, 'shore_bots': ('name', 'account')}
 GAME_SCHEMAS = {1: LEGACY_GAME, 2: GAME, 3: SHORE_GAME}
+AUTH_GAME = {**GAME, 'credentials': ('account', 'email', 'password_hash')}
+AUTH_SHORE_GAME = {**SHORE_GAME, 'credentials': AUTH_GAME['credentials']}
 DISCORD = {'levels': ('guild_id', 'user_id', 'username', 'xp', 'last_xp_at', 'last_message_id')}
 CHARACTER = {'id', 'account', 'name', 'level', 'exp', 'fame', 'hp', 'mp', 'items', 'revision',
              'alive', 'created_at', 'shots', 'hits', 'kills', 'quests', 'tiles'}
@@ -59,6 +61,8 @@ def snapshot(path, schema):
         for table, columns in schema.items():
             if tuple(r[1] for r in db.execute('PRAGMA table_info(' + table + ')')) != columns:
                 raise ValueError('Unsupported database columns: ' + table)
+            if table == 'credentials':
+                continue
             selected = tuple(c for c in columns if c != 'guid')
             rows = db.execute('SELECT ' + ','.join(selected) + ' FROM ' + table + ' ORDER BY ' + ','.join(selected[:2])).fetchall()
             result[table] = [dict(zip(selected, row)) for row in rows]
@@ -103,7 +107,7 @@ def validate(bundle):
 
 
 def export(game, discord, output, server_revision, bot_revision):
-    game_data = snapshot(game, list(GAME_SCHEMAS.values()))
+    game_data = snapshot(game, [*GAME_SCHEMAS.values(), AUTH_GAME, AUTH_SHORE_GAME])
     version = next(version for version, schema in GAME_SCHEMAS.items() if set(schema) == set(game_data))
     bundle = validate({
         'schema': version, 'created_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),

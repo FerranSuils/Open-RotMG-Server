@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::mpsc};
 use tokio::sync::oneshot;
 
+mod accounts;
+mod legends;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Character {
     pub schema: u8,
@@ -58,6 +61,7 @@ impl Character {
             .exp
             .checked_add(amount)
             .context("experience overflow")?;
+        next.fame = next.exp / 1000;
         let class = &content.classes[&next.class];
         let previous = next.level;
         while next.level < 20 && next.exp >= level_start(next.level + 1)? {
@@ -146,6 +150,8 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 pub struct Store {
     tx: mpsc::Sender<Job>,
     legacy_base: [i32; 8],
+    hashes: std::sync::Arc<tokio::sync::Semaphore>,
+    dummy_hash: String,
 }
 fn decode_character(raw: &str, legacy_base: [i32; 8]) -> Result<Character> {
     let mut value: serde_json::Value = serde_json::from_str(raw)?;
@@ -182,7 +188,9 @@ CREATE TABLE IF NOT EXISTS shore_bots(name TEXT PRIMARY KEY,account INTEGER NOT 
 CREATE TABLE IF NOT EXISTS characters(id INTEGER PRIMARY KEY,account INTEGER NOT NULL REFERENCES accounts(id),stats TEXT NOT NULL,items TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0,alive INTEGER NOT NULL DEFAULT 1);
 CREATE UNIQUE INDEX IF NOT EXISTS one_living_character ON characters(account) WHERE alive=1;
 CREATE TABLE IF NOT EXISTS deaths(character INTEGER PRIMARY KEY REFERENCES characters(id),snapshot TEXT NOT NULL,killed_by TEXT NOT NULL,died_at INTEGER NOT NULL DEFAULT(unixepoch()));
-CREATE TABLE IF NOT EXISTS vaults(account INTEGER PRIMARY KEY REFERENCES accounts(id),items TEXT NOT NULL CHECK(json_array_length(items)=8),revision INTEGER NOT NULL DEFAULT 0);")?;
+CREATE TABLE IF NOT EXISTS vaults(account INTEGER PRIMARY KEY REFERENCES accounts(id),items TEXT NOT NULL CHECK(json_array_length(items)=8),revision INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS credentials(account INTEGER PRIMARY KEY REFERENCES accounts(id),email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         let migration = c.transaction()?;
         let records = {
             let mut q = migration.prepare("SELECT id,stats FROM characters ORDER BY id")?;
@@ -235,7 +243,12 @@ CREATE TABLE IF NOT EXISTS vaults(account INTEGER PRIMARY KEY REFERENCES account
                     job(&mut c);
                 }
             })?;
-        Ok(Self { tx, legacy_base })
+        Ok(Self {
+            tx,
+            legacy_base,
+            hashes: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+            dummy_hash: accounts::hash("unknown-account")?,
+        })
     }
     async fn call<T: Send + 'static>(
         &self,
@@ -250,17 +263,20 @@ CREATE TABLE IF NOT EXISTS vaults(account INTEGER PRIMARY KEY REFERENCES account
         rx.await.context("account worker failed")?
     }
     pub async fn list(&self, guid: String) -> Result<Account> {
-        ensure!(
-            !guid.is_empty()
-                && guid.len() <= 128
-                && guid
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_.@".contains(c)),
-            "invalid guest identity"
-        );
-        let account = self.call(move|c|{let tx=c.transaction()?;let created=tx.execute("INSERT OR IGNORE INTO accounts(guid,name) VALUES(?1,'Guest')",[&guid])?;
-            let (id,mut name):(i32,String)=tx.query_row("SELECT id,name FROM accounts WHERE guid=?1",[&guid],|r|Ok((r.get(0)?,r.get(1)?)))?;
-            if created==1{name=format!("Guest{id}");tx.execute("UPDATE accounts SET name=?2 WHERE id=?1",params![id,name])?;}
+        let id = self.guest(guid, true).await?;
+        self.list_id(id).await
+    }
+    pub async fn characters(&self, guid: String, password: String) -> Result<Account> {
+        let id = if password.is_empty() {
+            self.guest(guid, true).await?
+        } else {
+            self.authenticate(guid, password).await?
+        };
+        self.list_id(id).await
+    }
+    async fn list_id(&self, id: i32) -> Result<Account> {
+        let account = self.call(move|c|{let tx=c.transaction()?;
+            let name:String=tx.query_row("SELECT name FROM accounts WHERE id=?1",[id],|r|r.get(0))?;
             let mut characters=Vec::new();{let mut q=tx.prepare("SELECT id,stats,items,revision,alive FROM characters WHERE account=?1 AND alive=1 ORDER BY id")?;let rows=q.query_map([id],|r|Ok((r.get::<_,i32>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i32>(3)?,r.get::<_,bool>(4)?)))?;
             for row in rows{let(cid,stats,items,rev,alive)=row?;let mut ch:Character=serde_json::from_str(&stats)?;ch.id=cid;ch.account=id;ch.name=name.clone();ch.items=serde_json::from_str(&items)?;ch.revision=rev;ch.alive=alive;characters.push(ch);}}
             let next_id:i32=tx.query_row("SELECT coalesce(max(id),0)+1 FROM characters WHERE account=?1",[id],|r|r.get(0))?;let best_levels = { let mut q = tx.prepare("SELECT json_extract(stats,'$.class'),max(json_extract(stats,'$.level')) FROM characters WHERE account=?1 GROUP BY json_extract(stats,'$.class')")?; q.query_map([id], |r| Ok((r.get::<_,u16>(0)?, r.get::<_,i32>(1)?)))?.collect::<rusqlite::Result<std::collections::BTreeMap<_,_>>>()? };tx.commit()?;Ok(Account{id,name,next_id,best_levels,characters})}).await?;
@@ -300,15 +316,6 @@ CREATE TABLE IF NOT EXISTS vaults(account INTEGER PRIMARY KEY REFERENCES account
         } else {
             Ok(account.characters.pop())
         }
-    }
-    pub async fn authenticate(&self, guid: String) -> Result<i32> {
-        self.call(move |c| {
-            c.query_row("SELECT id FROM accounts WHERE guid=?1", [guid], |r| {
-                r.get(0)
-            })
-            .context("unknown account; load character list first")
-        })
-        .await
     }
     pub async fn create(&self, account: i32, wizard: &Object) -> Result<Character> {
         ensure!(
@@ -374,7 +381,7 @@ CREATE TABLE IF NOT EXISTS vaults(account INTEGER PRIMARY KEY REFERENCES account
         .await
     }
     pub async fn load(&self, account: i32, id: i32) -> Result<Character> {
-        self.call(move|c|{let(stats,items,revision):(String,String,i32)=c.query_row("SELECT stats,items,revision FROM characters WHERE id=?1 AND account=?2 AND alive=1",params![id,account],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("character does not belong to this account or is dead")?;let mut ch:Character=serde_json::from_str(&stats)?;ch.id=id;ch.account=account;ch.items=serde_json::from_str(&items)?;ch.revision=revision;ch.alive=true;Ok(ch)}).await
+        self.call(move|c|{let(stats,items,revision,name):(String,String,i32,String)=c.query_row("SELECT c.stats,c.items,c.revision,a.name FROM characters c JOIN accounts a ON a.id=c.account WHERE c.id=?1 AND c.account=?2 AND c.alive=1",params![id,account],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).context("character does not belong to this account or is dead")?;let mut ch:Character=serde_json::from_str(&stats)?;ch.id=id;ch.account=account;ch.name=name;ch.items=serde_json::from_str(&items)?;ch.revision=revision;ch.alive=true;Ok(ch)}).await
     }
     pub async fn vault(&self, account: i32) -> Result<Vault> {
         self.call(move |c| {
@@ -479,6 +486,7 @@ CREATE TABLE IF NOT EXISTS vaults(account INTEGER PRIMARY KEY REFERENCES account
         let legacy_base = self.legacy_base;
         self.call(move|db|{let (snapshot,killer):(String,String)=db.query_row("SELECT snapshot,killed_by FROM deaths JOIN characters ON characters.id=deaths.character WHERE characters.account=?1 AND deaths.character=?2",params![account,id],|r|Ok((r.get(0)?,r.get(1)?)))?;let c = decode_character(&snapshot, legacy_base)?;ensure!(c.created_at>0,"creation time was not recorded by the early development binary for this character");Ok(format!("<Fame><Char id=\"{}\"><Account><Name>{}</Name></Account><ObjectType>{}</ObjectType><Level>{}</Level><Tex1>0</Tex1><Tex2>0</Tex2></Char><CreatedOn>{}</CreatedOn><KilledBy>{}</KilledBy><TotalFame>{}</TotalFame><Shots>{}</Shots><ShotsThatDamage>{}</ShotsThatDamage><TilesUncovered>{}</TilesUncovered><MonsterKills>{}</MonsterKills><GodKills>0</GodKills><OryxKills>0</OryxKills><QuestsCompleted>{}</QuestsCompleted><PirateCavesCompleted>{}</PirateCavesCompleted><UndeadLairsCompleted>0</UndeadLairsCompleted><AbyssOfDemonsCompleted>0</AbyssOfDemonsCompleted><SnakePitsCompleted>0</SnakePitsCompleted><SpiderDensCompleted>0</SpiderDensCompleted><SpriteWorldsCompleted>0</SpriteWorldsCompleted><TombsCompleted>0</TombsCompleted><LevelUpAssists>0</LevelUpAssists><BaseFame>{}</BaseFame></Fame>",c.id,xml_escape(&c.name),c.class,c.level,c.created_at,xml_escape(&killer),c.fame,c.shots,c.hits,c.tiles,c.kills,c.quests,c.pirate_caves,c.fame))}).await
     }
+    #[cfg(test)]
     pub async fn rename(&self, account: i32, name: String) -> Result<()> {
         ensure!(
             (3..=10).contains(&name.len()) && name.bytes().all(|c| c.is_ascii_alphabetic()),
@@ -494,6 +502,9 @@ CREATE TABLE IF NOT EXISTS vaults(account INTEGER PRIMARY KEY REFERENCES account
         })
         .await
     }
+}
+pub fn name_chosen(account: i32, name: &str) -> bool {
+    name != format!("Guest{account}")
 }
 pub fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -530,9 +541,14 @@ impl Account {
                 c.base[7]
             );
         }
+        let chosen = if name_chosen(self.id, &self.name) {
+            "<NameChosen/>"
+        } else {
+            ""
+        };
         let records: String = self.best_levels.iter().map(|(class, level)| format!("<ClassStats objectType=\"{class}\"><BestLevel>{level}</BestLevel><BestFame>0</BestFame></ClassStats>")).collect();
         format!(
-            "<Chars nextCharId=\"{}\" maxNumChars=\"1\">{chars}<Account><AccountId>{}</AccountId><Name>{}</Name><NameChosen/><Stats><Fame>0</Fame><TotalFame>0</TotalFame>{records}</Stats><Credits>0</Credits><NextCharSlotPrice>600</NextCharSlotPrice></Account><Servers><Server><Name>Local development</Name><DNS>127.0.0.1</DNS><Lat>0</Lat><Long>0</Long><Usage>0</Usage></Server></Servers><News/></Chars>",
+            "<Chars nextCharId=\"{}\" maxNumChars=\"1\">{chars}<Account><AccountId>{}</AccountId><Name>{}</Name>{chosen}<Stats><Fame>0</Fame><TotalFame>0</TotalFame>{records}</Stats><Credits>0</Credits><NextCharSlotPrice>600</NextCharSlotPrice></Account><Servers><Server><Name>Local development</Name><DNS>127.0.0.1</DNS><Lat>0</Lat><Long>0</Long><Usage>0</Usage></Server></Servers><News/></Chars>",
             self.next_id,
             self.id,
             xml_escape(&self.name)
@@ -612,6 +628,7 @@ mod tests {
         let amount = 18050 - ch.exp;
         assert!(ch.gain_experience(&content, amount, &mut rng).unwrap());
         assert_eq!(ch.level, 20);
+        assert_eq!(ch.fame, 18);
         assert!(
             ch.base
                 .iter()
