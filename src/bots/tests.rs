@@ -262,6 +262,8 @@ fn fresh_crewmate_rejoins_through_scoped_expiring_public_chat() {
     };
     let mut follower = Brain::new(PROFILES[2], &v);
     assert_eq!(follower.decide(&v, &content).unwrap().chat, Some("tp?"));
+    assert_eq!(follower.next_call, v.time_ms + 30000);
+    assert_eq!(follower.requested_until, v.time_ms + 5000);
     v.tick += 5;
     assert!(follower.decide(&v, &content).unwrap().chat.is_none());
     for (name, actor, recipient) in [("Reed", 9, ""), ("Mossy", -1, ""), ("Mossy", 2, "Human")] {
@@ -303,7 +305,7 @@ fn fresh_crewmate_rejoins_through_scoped_expiring_public_chat() {
         .unwrap();
     assert!(unsolicited.regroup_call.is_none());
     let mut occupied = Brain::new(PROFILES[2], &v);
-    occupied.next_call = v.time_ms + 10000;
+    occupied.requested_until = v.time_ms + 5000;
     occupied.companion = Some(9);
     occupied
         .receive(packet("Mossy", 2, "", "tp here"), &v)
@@ -316,14 +318,14 @@ fn fresh_crewmate_rejoins_through_scoped_expiring_public_chat() {
         .unwrap();
     assert!(occupied.regroup_call.is_none());
     let mut expired = Brain::new(PROFILES[2], &v);
-    expired.next_call = v.time_ms + 10000;
+    expired.requested_until = v.time_ms + 5000;
     expired
         .receive(packet("Mossy", 2, "", "tp here"), &v)
         .unwrap();
     v.time_ms += 5001;
     assert!(expired.decide(&v, &content).unwrap().journey.is_none());
     let mut injured = Brain::new(PROFILES[2], &v);
-    injured.next_call = v.time_ms + 10000;
+    injured.requested_until = v.time_ms + 5000;
     injured
         .receive(packet("Mossy", 2, "", "tp here"), &v)
         .unwrap();

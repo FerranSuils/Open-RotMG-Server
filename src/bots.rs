@@ -126,6 +126,7 @@ struct Brain {
     next_teleport: u64,
     regroup_call: Option<(i32, u64)>,
     next_call: u64,
+    requested_until: u64,
     portal: Option<(i32, u64)>,
     leader_seen: Option<(i32, Pos, u64)>,
     contacts: BTreeMap<i32, (Pos, u64)>,
@@ -162,6 +163,7 @@ impl Brain {
             next_teleport: 0,
             regroup_call: None,
             next_call: 0,
+            requested_until: 0,
             portal: None,
             leader_seen: None,
             contacts: BTreeMap::new(),
@@ -188,7 +190,7 @@ impl Brain {
             if (!leader
                 && name == self.profile.leader
                 && text == "tp here"
-                && self.next_call > view.time_ms
+                && self.requested_until > view.time_ms
                 && self.companion.is_none()
                 && self
                     .leader_seen
@@ -450,7 +452,8 @@ impl Brain {
                 && v.time_ms >= self.next_call
             {
                 decision.chat = Some("tp?");
-                self.next_call = v.time_ms + 10000;
+                self.requested_until = v.time_ms + 5000;
+                self.next_call = v.time_ms + 30000;
             }
         }
         let mut choices = Vec::new();
