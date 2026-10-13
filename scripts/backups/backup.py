@@ -15,6 +15,8 @@ LEGACY_GAME = {
     'deaths': ('character', 'snapshot', 'killed_by', 'died_at'),
 }
 GAME = {**LEGACY_GAME, 'vaults': ('account', 'items', 'revision')}
+SHORE_GAME = {**GAME, 'shore_bots': ('name', 'account')}
+GAME_SCHEMAS = {1: LEGACY_GAME, 2: GAME, 3: SHORE_GAME}
 DISCORD = {'levels': ('guild_id', 'user_id', 'username', 'xp', 'last_xp_at', 'last_message_id')}
 CHARACTER = {'id', 'account', 'name', 'level', 'exp', 'fame', 'hp', 'mp', 'items', 'revision',
              'alive', 'created_at', 'shots', 'hits', 'kills', 'quests', 'tiles'}
@@ -64,12 +66,12 @@ def snapshot(path, schema):
 
 
 def validate(bundle):
-    if set(bundle) != {'schema', 'created_at', 'revisions', 'game', 'discord'} or type(bundle['schema']) is not int or bundle['schema'] not in (1, 2):
+    if set(bundle) != {'schema', 'created_at', 'revisions', 'game', 'discord'} or type(bundle['schema']) is not int or bundle['schema'] not in GAME_SCHEMAS:
         raise ValueError('Unsupported backup envelope')
     datetime.datetime.strptime(bundle['created_at'], '%Y-%m-%dT%H:%M:%SZ')
     if set(bundle['revisions']) != {'server', 'discord_bot'} or any(not re.fullmatch('[0-9a-f]{40}', v) for v in bundle['revisions'].values()):
         raise ValueError('Invalid source revisions')
-    for name, schema in [('game', LEGACY_GAME if bundle['schema'] == 1 else GAME), ('discord', DISCORD)]:
+    for name, schema in [('game', GAME_SCHEMAS[bundle['schema']]), ('discord', DISCORD)]:
         data = bundle[name]
         if set(data) != set(schema):
             raise ValueError('Unsupported backup tables: ' + name)
@@ -90,13 +92,21 @@ def validate(bundle):
             raise ValueError('Invalid vault account/revision')
         if not isinstance(items, list) or len(items) != 8 or any(type(i) is not int or not -1 <= i <= 65535 for i in items):
             raise ValueError('Invalid eight-slot vault inventory')
+    bots = bundle['game'].get('shore_bots', [])
+    accounts = {row['id'] for row in bundle['game']['accounts']}
+    for row in bots:
+        if not isinstance(row['name'], str) or not row['name'] or type(row['account']) is not int or row['account'] <= 0 or row['account'] not in accounts:
+            raise ValueError('Invalid shore bot name/account')
+    if len({row['name'] for row in bots}) != len(bots) or len({row['account'] for row in bots}) != len(bots):
+        raise ValueError('Duplicate shore bot name/account')
     return bundle
 
 
 def export(game, discord, output, server_revision, bot_revision):
-    game_data = snapshot(game, [LEGACY_GAME, GAME])
+    game_data = snapshot(game, list(GAME_SCHEMAS.values()))
+    version = next(version for version, schema in GAME_SCHEMAS.items() if set(schema) == set(game_data))
     bundle = validate({
-        'schema': 2 if 'vaults' in game_data else 1, 'created_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'schema': version, 'created_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         'revisions': {'server': Path(server_revision).read_text().strip(), 'discord_bot': Path(bot_revision).read_text().strip()},
         'game': game_data, 'discord': snapshot(discord, DISCORD),
     })
@@ -121,14 +131,16 @@ CREATE UNIQUE INDEX one_living_character ON characters(account) WHERE alive=1;
 CREATE TABLE deaths(character INTEGER PRIMARY KEY REFERENCES characters(id),snapshot TEXT NOT NULL,killed_by TEXT NOT NULL,died_at INTEGER NOT NULL);""",
         'discord': """CREATE TABLE levels(guild_id TEXT NOT NULL,user_id TEXT NOT NULL,username TEXT NOT NULL,xp INTEGER NOT NULL CHECK(xp>=0 AND xp<=9007199254740991),last_xp_at INTEGER NOT NULL,last_message_id TEXT NOT NULL,PRIMARY KEY(guild_id,user_id)) STRICT;""",
     }
-    if bundle['schema'] == 2:
+    if bundle['schema'] >= 2:
         definitions['game'] += '\nCREATE TABLE vaults(account INTEGER PRIMARY KEY REFERENCES accounts(id),items TEXT NOT NULL CHECK(json_array_length(items)=8),revision INTEGER NOT NULL DEFAULT 0);'
+    if bundle['schema'] == 3:
+        definitions['game'] += '\nCREATE TABLE shore_bots(name TEXT PRIMARY KEY,account INTEGER NOT NULL UNIQUE REFERENCES accounts(id));'
     for name, filename in [('game', 'game.db'), ('discord', 'levels.sqlite')]:
         with closing(sqlite3.connect(':memory:')) as db, db:
             db.execute('PRAGMA foreign_keys=ON')
             db.executescript(definitions[name])
             for table, rows in bundle[name].items():
-                columns = tuple(c for c in (GAME if name == 'game' else DISCORD)[table] if c != 'guid')
+                columns = tuple(c for c in (GAME_SCHEMAS[bundle['schema']] if name == 'game' else DISCORD)[table] if c != 'guid')
                 db.executemany('INSERT INTO ' + table + '(' + ','.join(columns) + ') VALUES(' + ','.join('?' for _ in columns) + ')', [tuple(row[c] for c in columns) for row in rows])
             db.commit()
             if db.execute('PRAGMA foreign_key_check').fetchall() or db.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':

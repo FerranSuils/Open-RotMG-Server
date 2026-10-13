@@ -1,4 +1,5 @@
 from contextlib import closing
+from copy import deepcopy
 import gzip
 import json
 from pathlib import Path
@@ -156,6 +157,111 @@ CREATE TABLE deaths(character INTEGER PRIMARY KEY REFERENCES characters(id),snap
         bundle['schema'] = 1
         with self.assertRaisesRegex(ValueError, 'tables'):
             backup.validate(bundle)
+
+    def add_shore_state(self):
+        self.add_latest_state()
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.execute('CREATE TABLE shore_bots(name TEXT PRIMARY KEY,account INTEGER NOT NULL UNIQUE REFERENCES accounts(id))')
+            for account, name in enumerate(['Cautious', 'Confident', 'Greedy'], 2):
+                db.execute('INSERT INTO accounts VALUES(?,?,?)', (account, f'BOT_LOGIN_MUST_NEVER_BE_UPLOADED_{account}', name))
+                db.execute('INSERT INTO shore_bots VALUES(?,?)', (name, account))
+                stats = dict(self.stats, id=account, account=account, name=name, alive=account != 2,
+                             schema=1, **{'class': 782}, base=[100, 100, 12, 0, 10, 15, 12, 12], pirate_caves=0)
+                db.execute('INSERT INTO characters VALUES(?,?,?,?,1,?)',
+                           (account, account, json.dumps(stats), json.dumps(stats['items']), int(stats['alive'])))
+                if not stats['alive']:
+                    db.execute('INSERT INTO deaths VALUES(?,?,?,456)', (account, json.dumps(stats), 'Shore enemy'))
+
+    def test_shore_export_restore_preserves_registry_and_dead_characters_without_credentials(self):
+        self.add_shore_state()
+        originals = {path: path.read_bytes() for path in [self.game, self.discord]}
+        before = self.export()
+        self.assertEqual(before['schema'], 3)
+        self.assertEqual(before['game']['shore_bots'], [{'name': name, 'account': account}
+                         for name, account in [('Cautious', 2), ('Confident', 3), ('Greedy', 4)]])
+        raw = gzip.decompress(self.output.read_bytes())
+        for credential in [b'GUEST_LOGIN_MUST_NEVER_BE_UPLOADED', b'BOT_LOGIN_MUST_NEVER_BE_UPLOADED', b'"guid"']:
+            self.assertNotIn(credential, raw)
+        self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+        restored = self.root / 'shore-restored'
+        backup.restore(self.output, restored)
+        self.assertEqual(backup.snapshot(restored / 'game.db', backup.SHORE_GAME), before['game'])
+        self.assertEqual(backup.snapshot(restored / 'levels.sqlite', backup.DISCORD), before['discord'])
+        with closing(sqlite3.connect(restored / 'game.db')) as db:
+            self.assertEqual(db.execute('SELECT guid FROM accounts ORDER BY id').fetchall(), [(None,)] * 4)
+            self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
+            self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+            db.execute('PRAGMA foreign_keys=ON')
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("INSERT INTO shore_bots VALUES('Unknown',999)")
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("INSERT INTO shore_bots VALUES('DuplicateAccount',2)")
+
+    def test_empty_disabled_shore_registry_still_exports_schema_three(self):
+        self.add_latest_state()
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.execute('CREATE TABLE shore_bots(name TEXT PRIMARY KEY,account INTEGER NOT NULL UNIQUE REFERENCES accounts(id))')
+        before = self.export()
+        self.assertEqual(before['schema'], 3)
+        self.assertEqual(before['game']['shore_bots'], [])
+        restored = self.root / 'disabled-restored'
+        backup.restore(self.output, restored)
+        self.assertEqual(backup.snapshot(restored / 'game.db', backup.SHORE_GAME), before['game'])
+
+    def test_shore_schema_version_must_match_exact_tables(self):
+        self.add_shore_state()
+        before = self.export()
+        for version in [1, 2]:
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, 'tables'):
+                backup.validate(dict(before, schema=version))
+        for table in ['shore_bots', 'vaults']:
+            malformed = deepcopy(before)
+            del malformed['game'][table]
+            with self.subTest(missing=table), self.assertRaisesRegex(ValueError, 'tables'):
+                backup.validate(malformed)
+        for version in [4, True, '3']:
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, 'envelope'):
+                backup.validate(dict(before, schema=version))
+
+    def test_shore_credential_column_and_unknown_table_fail_before_export(self):
+        self.add_shore_state()
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.execute('ALTER TABLE shore_bots ADD COLUMN token TEXT')
+            db.commit()
+            with self.assertRaisesRegex(ValueError, 'columns'):
+                self.export()
+            self.assertFalse(self.output.exists())
+            db.execute('ALTER TABLE shore_bots DROP COLUMN token')
+            db.execute('CREATE TABLE bot_memory(password_hash TEXT)')
+            db.commit()
+            with self.assertRaisesRegex(ValueError, 'tables'):
+                self.export()
+            self.assertFalse(self.output.exists())
+
+    def test_shore_downloaded_credentials_are_rejected_before_restore(self):
+        self.add_shore_state()
+        before = self.export()
+        for field in ['guid', 'token', 'password_hash', 'memory']:
+            malformed = deepcopy(before)
+            malformed['game']['shore_bots'][0][field] = 'MUST_NEVER_BE_EXPORTED'
+            self.output.write_bytes(gzip.compress(json.dumps(malformed).encode()))
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'fields'):
+                backup.restore(self.output, self.root / 'bad-shore-restore')
+            self.assertFalse((self.root / 'bad-shore-restore').exists())
+
+    def test_shore_invalid_identity_and_duplicate_bindings_are_rejected(self):
+        self.add_shore_state()
+        before = self.export()
+        for change in [{'name': ''}, {'name': 1}, {'account': True}, {'account': '2'}, {'account': 0}, {'account': 999}]:
+            malformed = deepcopy(before)
+            malformed['game']['shore_bots'][0].update(change)
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'shore bot'):
+                backup.validate(malformed)
+        for field in ['name', 'account']:
+            malformed = deepcopy(before)
+            malformed['game']['shore_bots'][1][field] = malformed['game']['shore_bots'][0][field]
+            with self.subTest(duplicate=field), self.assertRaisesRegex(ValueError, 'Duplicate shore bot'):
+                backup.validate(malformed)
 
 
 if __name__ == '__main__':
