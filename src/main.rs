@@ -3,8 +3,12 @@ mod content;
 mod crypto;
 mod encounter;
 mod loot;
+#[cfg(test)]
+#[path = "../examples/testing/prepared-state.rs"]
+mod prepared_state_example;
 mod server;
 mod store;
+mod terrain;
 mod wire;
 mod world;
 use anyhow::{Result, ensure};
@@ -26,6 +30,7 @@ async fn main() -> Result<()> {
     let (config, dev_control) = config::Config::load(&args)?;
     let client = config.client;
     let state = config.state;
+    tracing::info!(address=%config.bind, state=%state.display(), client=%client.display(), data=%config.data.display(), "local environment selected");
     std::fs::create_dir_all(&state)?;
     #[cfg(unix)]
     {
@@ -47,7 +52,12 @@ async fn main() -> Result<()> {
     let keys = Arc::new(crypto::Keys::load(&state)?);
     let swf = Arc::new(keys.client(&client.join("client.swf"))?);
     let store = store::Store::open(&state.join("game.db"), &content)?;
-    let directory = world::Directory::load(&config.data, content.clone(), config.max_players)?;
+    let directory = world::Directory::with_seed(
+        &config.data,
+        content.clone(),
+        config.max_players,
+        config.realm_seed,
+    )?;
     let world = world::Handle::spawn(directory);
     let control = if dev_control {
         let mut bytes = [0u8; 32];

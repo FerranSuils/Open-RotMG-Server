@@ -262,21 +262,27 @@ impl Directory {
             "tick": self.tick, "max_tick_us": self.max_tick_us,
         })
     }
+    #[cfg(test)]
     pub fn load(path: &std::path::Path, content: Arc<Content>, max_players: usize) -> Result<Self> {
+        Self::with_seed(path, content, max_players, 0)
+    }
+    pub fn with_seed(
+        path: &std::path::Path,
+        content: Arc<Content>,
+        max_players: usize,
+        seed: u64,
+    ) -> Result<Self> {
         let mut templates = BTreeMap::new();
-        for name in [
-            "tutorial",
-            "nexus",
-            "nexus-limbo",
-            "realm-shore",
-            "vault",
-            "pirate-cave",
-        ] {
+        for name in ["tutorial", "nexus", "nexus-limbo", "vault", "pirate-cave"] {
             templates.insert(
                 name.to_string(),
                 Arc::new(Map::load(&path.join(format!("{name}.wmap")), &content)?),
             );
         }
+        templates.insert(
+            "realm-shore".into(),
+            Arc::new(crate::terrain::generate(&content, seed, 512)?),
+        );
         let mut d = Self {
             worlds: BTreeMap::new(),
             templates,
@@ -980,6 +986,7 @@ impl World {
         tracing::info!(
             player = id,
             character = char_id,
+            world = %self.name,
             "player entered development world"
         );
         Ok(id)
@@ -1000,7 +1007,7 @@ impl World {
         let mut o = Writer::new();
         if let Some(p) = self.players.get(&id) {
             let values = p.character.effective(&self.content)?;
-            o.i32(id).f32(p.pos.x).f32(p.pos.y).i16(34);
+            o.i32(id).f32(p.pos.x).f32(p.pos.y).i16(37);
             for (k, v) in [
                 (0, values[0]),
                 (1, p.character.hp),
@@ -1035,6 +1042,23 @@ impl World {
             stat(&mut o, 32, 0);
             stat(&mut o, 33, 0);
             stat(&mut o, 38, p.character.account);
+            stat(
+                &mut o,
+                53,
+                i32::from(crate::store::name_chosen(
+                    p.character.account,
+                    &p.character.name,
+                )),
+            );
+            stat(&mut o, 57, p.character.fame);
+            stat(
+                &mut o,
+                58,
+                [20, 150, 400, 800, 2000]
+                    .into_iter()
+                    .find(|n| *n > p.character.fame)
+                    .unwrap_or(0),
+            );
             text_stat(&mut o, 62, "");
             stat(&mut o, 63, 0);
         } else {
@@ -1150,7 +1174,11 @@ impl World {
         } else {
             (i64::from(time) - i64::from(p.last_move)) as f32
         };
-        ensure!(elapsed >= 0., "movement time reversed");
+        ensure!(
+            elapsed >= 0.,
+            "movement time reversed: client_time={time} previous_client_time={}",
+            p.last_move
+        );
         let cell = self
             .map
             .cell(p.pos.x, p.pos.y)
@@ -1158,16 +1186,25 @@ impl World {
         let speed = (0.004
             + (0.0096 - 0.004) * p.character.effective(&self.content)?[4] as f32 / 75.)
             * self.content.grounds[&cell.ground];
-        ensure!(
-            p.pos.distance(pos) <= speed * elapsed + 0.3,
-            "movement exceeds speed"
-        );
-        let credit = (p.movement_credit + speed * (self.now - p.last_move_at) as f32)
-            .min(speed * 350. + 0.3);
         let distance = p.pos.distance(pos);
         ensure!(
+            distance <= speed * elapsed + 0.3,
+            "movement exceeds speed: from=({}, {}) to=({}, {}) distance={distance} allowed={} speed={speed} client_elapsed_ms={elapsed}",
+            p.pos.x,
+            p.pos.y,
+            pos.x,
+            pos.y,
+            speed * elapsed + 0.3
+        );
+        let server_elapsed = self
+            .now
+            .checked_sub(p.last_move_at)
+            .context("movement server clock regressed")?;
+        let credit = (p.movement_credit + speed * server_elapsed as f32).min(speed * 350. + 0.3);
+        ensure!(
             distance <= credit + 0.001,
-            "movement exceeds server time budget"
+            "movement exceeds server time budget: distance={distance} credit={credit} server_elapsed_ms={server_elapsed} client_elapsed_ms={elapsed} previous_credit={}",
+            p.movement_credit
         );
         let samples = (distance / 0.1).ceil().max(1.) as usize;
         ensure!(
@@ -1284,7 +1321,7 @@ impl World {
         };
         if p.pos.distance(center) > 0.001 {
             self.validate_move(id, center, time)
-                .with_context(|| format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} move_age_ms={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now - p.last_move_at))?;
+                .with_context(|| format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at))?;
         }
         let item = self.content.get(kind)?;
         let spec = item
@@ -1805,6 +1842,7 @@ impl World {
         let cleared_cave = snapshot.pirate_caves > p.character.pirate_caves;
         let leveled = snapshot.level > p.character.level;
         p.character.exp = snapshot.exp;
+        p.character.fame = snapshot.fame;
         p.character.level = snapshot.level;
         p.character.base = snapshot.base;
         p.character.pirate_caves = snapshot.pirate_caves;
@@ -2049,6 +2087,8 @@ impl World {
         Ok(())
     }
     fn populate_shore(&mut self) -> Result<()> {
+        let &(x, y) = self.map.spawns.first().context("shore has no spawn")?;
+        let spawn = Pos { x, y };
         let mut candidates: Vec<_> = self
             .map
             .cells
@@ -2059,10 +2099,13 @@ impl World {
                     x: (i % self.map.width as usize) as f32 + 0.5,
                     y: (i / self.map.width as usize) as f32 + 0.5,
                 };
-                (matches!(c.terrain, 11 | 12) && self.walkable(pos)).then_some(pos)
+                (matches!(c.terrain, 11 | 12) && self.walkable(pos) && pos.distance(spawn) >= 12.)
+                    .then_some(pos)
             })
             .collect();
         candidates.shuffle(&mut self.rng);
+        // Keep the bounded starter population playable on a Realm-sized coastline.
+        candidates.sort_by(|a, b| a.distance(spawn).total_cmp(&b.distance(spawn)));
         for pos in candidates {
             if self.population.iter().any(|s| s.pos.distance(pos) < 6.) {
                 continue;
@@ -2625,11 +2668,18 @@ fn inside_box(a: Pos, b: Pos) -> bool {
     (a.x - b.x).abs() <= 0.5 && (a.y - b.y).abs() <= 0.5
 }
 #[cfg(test)]
+#[path = "../examples/testing/cover.rs"]
+mod cover_example;
+#[cfg(test)]
+#[path = "../examples/testing/timing.rs"]
+mod timing_example;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::content::WIZARD;
     use std::path::Path;
-    fn world() -> World {
+    pub(super) fn world() -> World {
         let c = Arc::new(Content::load(Path::new("data")).unwrap());
         let m = Arc::new(Map::load(Path::new("data/tutorial.wmap"), &c).unwrap());
         World::new(c, m).unwrap()
@@ -2798,6 +2848,24 @@ mod tests {
         assert_eq!(death.len(), 1);
         assert_eq!(death[0].1.level, 2);
         assert_eq!(death[0].1.hp, 0);
+    }
+    #[test]
+    fn committed_fame_survives_departure_and_permanent_death() {
+        let mut w = world();
+        let id = w.enter(ch(&w), None).unwrap();
+        w.players.get_mut(&id).unwrap().experience_queued = 1000;
+        let plans = w.pending_progress().unwrap();
+        assert_eq!(plans[0].1.fame, 1);
+        assert_eq!(w.players[&id].character.fame, 0);
+        w.finish_progress(id, plans[0].1.clone()).unwrap();
+        let saved = w.begin_departure(id).unwrap().unwrap();
+        assert_eq!(saved.fame, 1);
+        w.finish_departure(id).unwrap();
+        let id = w.enter(saved, None).unwrap();
+        let p = w.players.get_mut(&id).unwrap();
+        p.character.hp = 0;
+        p.death_pending = true;
+        assert_eq!(w.pending_deaths()[0].1.fame, 1);
     }
     #[test]
     fn departure_waits_for_earned_progress() {
@@ -3684,7 +3752,10 @@ mod tests {
         let mut d = Directory::load(Path::new("data"), world().content, 16).unwrap();
         let w = d.worlds.get_mut(&-3).unwrap();
         assert_eq!(w.population.len(), 24);
+        let (x, y) = w.map.spawns[0];
+        let arrival = Pos { x, y };
         for spawn in &w.population {
+            assert!((12.0..60.0).contains(&spawn.pos.distance(arrival)));
             let cell =
                 &w.map.cells[spawn.pos.y as usize * w.map.width as usize + spawn.pos.x as usize];
             assert!(matches!(cell.terrain, 11 | 12));

@@ -15,6 +15,7 @@ LEGACY_GAME = {
     'deaths': ('character', 'snapshot', 'killed_by', 'died_at'),
 }
 GAME = {**LEGACY_GAME, 'vaults': ('account', 'items', 'revision')}
+AUTH_GAME = {**GAME, 'credentials': ('account', 'email', 'password_hash')}
 DISCORD = {'levels': ('guild_id', 'user_id', 'username', 'xp', 'last_xp_at', 'last_message_id')}
 CHARACTER = {'id', 'account', 'name', 'level', 'exp', 'fame', 'hp', 'mp', 'items', 'revision',
              'alive', 'created_at', 'shots', 'hits', 'kills', 'quests', 'tiles'}
@@ -57,6 +58,8 @@ def snapshot(path, schema):
         for table, columns in schema.items():
             if tuple(r[1] for r in db.execute('PRAGMA table_info(' + table + ')')) != columns:
                 raise ValueError('Unsupported database columns: ' + table)
+            if table == 'credentials':
+                continue
             selected = tuple(c for c in columns if c != 'guid')
             rows = db.execute('SELECT ' + ','.join(selected) + ' FROM ' + table + ' ORDER BY ' + ','.join(selected[:2])).fetchall()
             result[table] = [dict(zip(selected, row)) for row in rows]
@@ -94,7 +97,7 @@ def validate(bundle):
 
 
 def export(game, discord, output, server_revision, bot_revision):
-    game_data = snapshot(game, [LEGACY_GAME, GAME])
+    game_data = snapshot(game, [LEGACY_GAME, GAME, AUTH_GAME])
     bundle = validate({
         'schema': 2 if 'vaults' in game_data else 1, 'created_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         'revisions': {'server': Path(server_revision).read_text().strip(), 'discord_bot': Path(bot_revision).read_text().strip()},

@@ -12,6 +12,7 @@ pub struct Config {
     pub state: PathBuf,
     pub max_players: usize,
     pub behind_proxy: bool,
+    pub realm_seed: u64,
 }
 impl Config {
     pub fn load(args: &[String]) -> Result<(Self, bool)> {
@@ -19,6 +20,7 @@ impl Config {
         let mut port = None;
         let mut control = false;
         let mut client_dir = None;
+        let mut state_dir = None;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -43,8 +45,14 @@ impl Config {
                         args.next().context("--client requires a directory")?,
                     ));
                 }
+                "--state" => {
+                    ensure!(state_dir.is_none(), "duplicate --state");
+                    state_dir = Some(PathBuf::from(
+                        args.next().context("--state requires a directory")?,
+                    ));
+                }
                 _ => anyhow::bail!(
-                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--client DIR]"
+                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--client DIR] [--state DIR]"
                 ),
             }
         }
@@ -65,10 +73,14 @@ impl Config {
                 state: root.join(".local"),
                 max_players: 85,
                 behind_proxy: false,
+                realm_seed: rand::random(),
             }
         };
         if let Some(client) = client_dir {
             config.client = client;
+        }
+        if let Some(state) = state_dir {
+            config.state = state;
         }
         if let Some(port) = port {
             config.bind.set_port(port);
@@ -123,7 +135,7 @@ impl Config {
 mod tests {
     use super::*;
     fn config() -> Config {
-        serde_json::from_str(r#"{"bind":"127.0.0.1:18923","origin":"https://openrotmg.org","data":"/opt/openrotmg/data","client":"/opt/openrotmg/client","state":"/var/lib/openrotmg","max_players":16,"behind_proxy":true}"#).unwrap()
+        serde_json::from_str(r#"{"bind":"127.0.0.1:18923","origin":"https://openrotmg.org","data":"/opt/openrotmg/data","client":"/opt/openrotmg/client","state":"/var/lib/openrotmg","max_players":16,"behind_proxy":true,"realm_seed":12351}"#).unwrap()
     }
     #[test]
     fn explicit_production_config() {
@@ -164,6 +176,29 @@ mod tests {
             ])
             .is_err()
         );
+    }
+    #[test]
+    fn explicit_state_does_not_change_client_or_origin() {
+        let (original, _) = Config::load(&[]).unwrap();
+        let (isolated, _) = Config::load(&["--state".into(), "/tmp/qa-state".into()]).unwrap();
+        assert_eq!(
+            (isolated.state, isolated.client, isolated.origin),
+            (
+                PathBuf::from("/tmp/qa-state"),
+                original.client,
+                original.origin
+            )
+        );
+    }
+    #[test]
+    fn malformed_state_arguments_are_rejected() {
+        for args in [
+            vec!["--state"],
+            vec!["--state", "relative"],
+            vec!["--state", "/tmp/a", "--state", "/tmp/b"],
+        ] {
+            assert!(Config::load(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
+        }
     }
     #[test]
     fn local_launcher_remains_explicit() {

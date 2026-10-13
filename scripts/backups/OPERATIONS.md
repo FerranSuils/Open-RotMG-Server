@@ -14,6 +14,6 @@ Clone/download the **private** backup repository and the server tools using a se
 ./scripts/backups/run.sh restore --archive /path/to/state.json.gz --directory /path/to/new-private-directory
 ```
 
-The destination must not exist. This creates `game.db` and `levels.sqlite`, validates SQLite integrity/foreign keys and preserves IDs/ownership relationships. It never overwrites production databases. **Guest identities are NULL/disabled**, not regenerated or reassigned: passwords/login secrets were deliberately excluded. Verified guest ownership recovery remains a separate unresolved requirement. Do not claim that this restores automatic player login. Replace credentials/keys separately, and perform an operator-reviewed restore before starting services.
+The destination must not exist. This creates `game.db` and `levels.sqlite`, validates SQLite integrity/foreign keys and preserves IDs/ownership relationships. It never overwrites production databases. **Guest identities are NULL/disabled and registered credentials are absent**, not regenerated or reassigned: login secrets were deliberately excluded. Verified ownership recovery remains a separate unresolved requirement. Do not claim that this restores automatic player login. Replace credentials/keys separately, and perform an operator-reviewed restore before starting services.
 
 Tests: `python3 -m unittest discover -s scripts/backups -p 'test_*.py' -v`.
