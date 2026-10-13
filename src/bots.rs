@@ -131,7 +131,6 @@ struct Brain {
     portal: Option<(i32, u64)>,
     leader_seen: Option<(i32, Pos, u64)>,
     contacts: BTreeMap<i32, (Pos, u64)>,
-    initial_caves: u64,
     hunting: Option<Pos>,
     last_encounter: u64,
 }
@@ -173,7 +172,6 @@ impl Brain {
             portal: None,
             leader_seen: None,
             contacts: BTreeMap::new(),
-            initial_caves: view.character.pirate_caves,
             hunting: None,
             last_encounter: view.time_ms,
         }
@@ -508,7 +506,8 @@ impl Brain {
         let peaceful = nearest.is_none_or(|e| e.position.distance(v.position) > 5.);
         for portal in v.objects.iter().filter(|p| match v.map.name.as_str() {
             "Nexus" => matches!(p.kind, 0x704 | 0x70e | 0x71c),
-            "Pirate Cave" => v.character.pirate_caves > self.initial_caves && p.kind == 0x71d,
+            // The committed exit is public even when a straggler missed personal clear credit.
+            "Pirate Cave" => p.kind == 0x71d,
             "Realm" => {
                 p.kind == 0x717
                     && v.character.level >= 2

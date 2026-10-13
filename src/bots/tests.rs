@@ -680,7 +680,7 @@ fn regroup_requests_only_a_visible_healthy_peer_and_is_paced() {
 }
 
 #[test]
-fn earned_portal_call_and_committed_cave_clear_drive_normal_transfers() {
+fn earned_portal_call_and_observed_cave_exit_drive_normal_transfers() {
     let content = content();
     let mut v = view(&content);
     v.character.level = 2;
@@ -724,12 +724,13 @@ fn earned_portal_call_and_committed_cave_clear_drive_normal_transfers() {
         Some(Journey::Portal(4))
     ));
     v.map.name = "Pirate Cave".into();
-    v.objects[0].kind = 0x71d;
+    v.objects.clear();
     let mut cave = Brain::new(PROFILES[2], &v);
     assert!(cave.decide(&v, &content).unwrap().journey.is_none());
     v.tick += 5;
     v.time_ms += 250;
-    v.character.pirate_caves += 1;
+    v.objects.push(object(4, 0x71d, 12.5, 11.5));
+    assert_eq!(v.character.pirate_caves, 0);
     assert!(matches!(
         cave.decide(&v, &content).unwrap().journey,
         Some(Journey::Portal(4))
