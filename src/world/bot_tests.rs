@@ -95,4 +95,66 @@ fn autonomous_actions_use_normal_inventory_death_and_quarantine_guards() {
             .is_err()
     );
     assert_eq!(w.players[&bot].character.items, items);
+    let p = &w.players[&bot];
+    let before = (
+        p.pos.x,
+        p.pos.y,
+        p.last_move,
+        p.character.hp,
+        p.character.mp,
+    );
+    w.step();
+    let p = &w.players[&bot];
+    assert_eq!(
+        before,
+        (
+            p.pos.x,
+            p.pos.y,
+            p.last_move,
+            p.character.hp,
+            p.character.mp
+        )
+    );
+}
+
+#[test]
+fn autonomous_motor_obeys_observed_ground_and_shared_conditions() {
+    let mut w = world();
+    let (packets, _rx) = mpsc::channel(64);
+    let (lost, _) = watch::channel(false);
+    let id = w
+        .enter_autonomous(ch(&w), Output { packets, lost })
+        .unwrap();
+    let initial = w.players[&id].pos;
+    let (&ground, &multiplier) = w
+        .content
+        .grounds
+        .iter()
+        .find(|(_, speed)| **speed > 0. && **speed < 1.)
+        .unwrap();
+    let index = initial.y as usize * w.map.width as usize + initial.x as usize;
+    Arc::make_mut(&mut w.map).cells[index].ground = ground;
+    w.autonomous_action(
+        id,
+        Action::Move {
+            x: initial.x + 2.,
+            y: initial.y,
+        },
+    )
+    .unwrap();
+    let speed = 0.004
+        + (0.0096 - 0.004) * w.players[&id].character.effective(&w.content).unwrap()[4] as f32
+            / 75.;
+    w.step();
+    assert!((w.players[&id].pos.distance(initial) - speed * multiplier * 50.).abs() < 0.0001);
+    w.apply_condition(id, crate::condition::SLOWED, 1000)
+        .unwrap();
+    let pos = w.players[&id].pos;
+    w.step();
+    assert!((w.players[&id].pos.distance(pos) - 0.004 * multiplier * 50.).abs() < 0.0001);
+    w.apply_condition(id, crate::condition::PARALYZED, 1000)
+        .unwrap();
+    let pos = w.players[&id].pos;
+    w.step();
+    assert_eq!((w.players[&id].pos.x, w.players[&id].pos.y), (pos.x, pos.y));
 }

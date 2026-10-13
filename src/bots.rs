@@ -567,6 +567,29 @@ impl Grid {
 #[cfg(test)]
 mod tests;
 
+async fn enter(
+    app: &App,
+    profile: Profile,
+    character: crate::store::Character,
+    destination: i32,
+) -> Result<(i32, mpsc::Receiver<Packet>, mpsc::Sender<Packet>, Brain)> {
+    let world = if destination == -3 {
+        app.world.directory(|d| d.initial(-3)).await?
+    } else {
+        destination
+    };
+    let (packets, output) = mpsc::channel(64);
+    let sender = packets.clone();
+    let (lost, _) = watch::channel(false);
+    let id = app
+        .world
+        .in_world(world)
+        .call(move |w| w.enter_autonomous(character, Output { packets, lost }))
+        .await?;
+    let view = app.world.directory(move |d| d.player_view(id)).await?;
+    Ok((id, output, sender, Brain::new(profile, &view)))
+}
+
 pub async fn start(app: &App) -> Result<()> {
     for profile in PROFILES {
         let Some(ch) = app
@@ -580,22 +603,29 @@ pub async fn start(app: &App) -> Result<()> {
             );
             continue;
         };
-        let owner = app.claim(ch.account)?;
-        let (packets, mut output) = mpsc::channel(64);
-        let (lost, _) = watch::channel(false);
-        let id = app
-            .world
-            .in_world(-3)
-            .call(move |w| w.enter_autonomous(ch, Output { packets, lost }))
-            .await?;
-        let view = app.world.directory(move |d| d.player_view(id)).await?;
-        let mut brain = Brain::new(profile, &view);
+        let account = ch.account;
+        let owner = app.claim(account)?;
+        let (mut id, mut output, mut sender, mut brain) = enter(app, profile, ch, -3).await?;
         let app = app.clone();
         tokio::spawn(async move {
             let mut shutdown = app.shutdown.subscribe();
             let result:Result<()> = async {
                 loop {
                     tokio::select! { _=tokio::time::sleep(Duration::from_millis(50))=>{},_=shutdown.changed()=>break }
+                    if let Some(transfer) = server::automatic_transfer(&app, id).await? {
+                        ensure!(transfer.player == id && transfer.output.packets.same_channel(&sender),
+                            "collective transfer does not belong to autonomous output");
+                        while output.try_recv().is_ok() {}
+                        let destination = transfer.destination;
+                        let character = app.world.directory(move |d|
+                            d.consume(account, destination, transfer.key_time, transfer.key)).await?;
+                        ensure!(character == brain.session.2, "collective transfer character binding changed");
+                        let saved = app.store.load(account, character).await?;
+                        (id, output, sender, brain) = enter(&app, profile, saved, destination).await?;
+                        tracing::info!(player=id,account,character,destination,
+                            "autonomous collective transfer completed");
+                        continue;
+                    }
                     let view=app.world.directory(move |d|d.player_view(id)).await?;
                     if view.lifecycle.death_pending || !view.lifecycle.alive {
                         if !view.lifecycle.alive && !view.lifecycle.death_pending { break; }

@@ -2826,7 +2826,11 @@ impl World {
         let ids: Vec<_> = self.players.keys().copied().collect();
         for id in &ids {
             let p = &self.players[id];
-            if !p.character.alive || p.death_pending || p.departing {
+            if !p.character.alive
+                || p.death_pending
+                || p.departing
+                || p.persistence_failure.is_some()
+            {
                 continue;
             }
             let p = self.players.get_mut(id).unwrap();
@@ -2870,13 +2874,18 @@ impl World {
             if let Some(goal) = goal {
                 let d = p.pos.distance(goal);
                 if d > 0.02 {
+                    let ground = self
+                        .map
+                        .cell(p.pos.x, p.pos.y)
+                        .expect("live player is on map")
+                        .ground;
                     let step = if flags & crate::condition::bit(crate::condition::PARALYZED) != 0 {
                         0.
                     } else if flags & crate::condition::bit(crate::condition::SLOWED) != 0 {
                         0.004 * 50.
                     } else {
                         (0.004 + (0.0096 - 0.004) * values[4] as f32 / 75.) * 50.
-                    };
+                    } * self.content.grounds[&ground];
                     let n = d.min(step);
                     let pos = Pos {
                         x: p.pos.x + (goal.x - p.pos.x) / d * n,
