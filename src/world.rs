@@ -175,6 +175,7 @@ pub struct InventoryPlan {
     pub stat_growth: Option<(Character, Slot, usize, i32)>,
     pub vault: Option<Vault>,
     pub dropped: Option<i32>,
+    pub unlock: Option<(i32, i32)>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -454,6 +455,7 @@ impl Directory {
                 || (account.is_none()
                     && crate::dungeon::DUNGEONS
                         .iter()
+                        .chain(crate::endgame::DUNGEONS)
                         .any(|(_, name, _, _)| *name == template)),
             "invalid private/dungeon instance policy"
         );
@@ -470,6 +472,7 @@ impl Directory {
             } else {
                 crate::dungeon::DUNGEONS
                     .iter()
+                    .chain(crate::endgame::DUNGEONS)
                     .find(|(_, name, _, _)| *name == template)
                     .context("dungeon registration missing")?
                     .2
@@ -509,6 +512,7 @@ impl Directory {
             0x720 => self.instance("vault", Some(account))?,
             kind if crate::dungeon::DUNGEONS
                 .iter()
+                .chain(crate::endgame::DUNGEONS)
                 .any(|(portal, _, _, _)| *portal == kind) =>
             {
                 let binding = self
@@ -667,7 +671,14 @@ impl Directory {
         let expired_portals: Vec<_> = self
             .portals
             .iter()
-            .filter(|(_, binding)| binding.expires <= self.tick)
+            .filter(|(id, binding)| {
+                binding.expires <= self.tick
+                    && self
+                        .worlds
+                        .get(&binding.origin)
+                        .and_then(|w| w.entities.get(id))
+                        .is_none_or(|e| !e.reserved)
+            })
             .map(|(id, binding)| (*id, binding.origin))
             .collect();
         for (id, origin) in expired_portals {
@@ -1642,7 +1653,8 @@ impl World {
             }
             "IncrementStat" => {
                 ensure!(
-                    matches!(item.kind, 0xa21 | 0xa4c | 0xa35) && item.activations == 1,
+                    matches!(item.kind, 0xa1f | 0xa20 | 0xa21 | 0xa34 | 0xa35 | 0xa4c)
+                        && item.activations == 1,
                     "unsupported permanent stat consumable"
                 );
                 let (stat, amount) = item
@@ -1666,6 +1678,7 @@ impl World {
                 self.players.get_mut(&id).unwrap().pending = true;
                 Ok(Some(plan))
             }
+            "UnlockPortal" => self.begin_unlock(id, slot, &item).map(Some),
             "HealNova" => {
                 self.heal_nova(id, slot, &item)?;
                 Ok(None)
@@ -1757,6 +1770,7 @@ impl World {
             stat_growth: None,
             vault: None,
             dropped: None,
+            unlock: None,
         }
     }
     pub fn drop_item(&mut self, id: i32, slot: Slot) -> Result<InventoryPlan> {
@@ -1921,6 +1935,10 @@ impl World {
         Ok(())
     }
     pub fn finish_inventory(&mut self, plan: InventoryPlan, result: Result<i32>) -> Result<()> {
+        ensure!(
+            plan.unlock.is_none(),
+            "portal unlock requires its directory commit"
+        );
         if let Err(error) = result {
             self.poison(plan.player, error.to_string())?;
             return Err(error);
@@ -2301,6 +2319,7 @@ impl World {
             4 => 0x509,
             _ => bail!("unsupported loot bag appearance"),
         };
+        ensure!(items.len() <= 8, "loot bag capacity exceeded");
         items.resize(8, -1);
         let id = self.spawn_entity(kind, pos, items)?;
         let bag = self.entities.get_mut(&id).unwrap();
@@ -2311,6 +2330,12 @@ impl World {
         self.bag_expiry.insert(id, self.now + 60_000);
         tracing::info!(entity = id, owner, kind, "loot bag allocated");
         Ok(id)
+    }
+    fn loot_bags(&mut self, pos: Pos, owner: Option<i32>, items: &[i32]) -> Result<()> {
+        for chunk in items.chunks(8) {
+            self.loot_bag(pos, owner, chunk.to_vec())?;
+        }
+        Ok(())
     }
     fn drop_loot(&mut self, defeated: &Entity) -> Result<()> {
         if crate::endgame::HEROES.contains(&defeated.kind) {
@@ -2388,7 +2413,7 @@ impl World {
             }
         }
         for (owner, items) in drops {
-            self.loot_bag(defeated.pos, (owner >= 0).then_some(owner), items)?;
+            self.loot_bags(defeated.pos, (owner >= 0).then_some(owner), &items)?;
         }
         Ok(())
     }

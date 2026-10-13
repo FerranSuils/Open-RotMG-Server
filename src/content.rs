@@ -104,6 +104,7 @@ pub struct Object {
     pub activate: String,
     pub heal: i32,
     pub stat_increase: Option<(u8, i32)>,
+    pub unlock_portal: Option<(String, String)>,
     pub heal_range: f32,
     pub activations: usize,
     pub cooldown_ms: u64,
@@ -286,6 +287,20 @@ impl Content {
                             p.attribute("amount")
                                 .context("potion amount missing")?
                                 .parse()?,
+                        ))
+                    })
+                    .transpose()?,
+                unlock_portal: n
+                    .children()
+                    .find(|p| p.has_tag_name("Activate") && p.text() == Some("UnlockPortal"))
+                    .map(|p| -> Result<(String, String)> {
+                        Ok((
+                            p.attribute("dungeonName")
+                                .context("unlock dungeonName missing")?
+                                .to_owned(),
+                            p.attribute("lockedName")
+                                .context("unlock lockedName missing")?
+                                .to_owned(),
                         ))
                     })
                     .transpose()?,

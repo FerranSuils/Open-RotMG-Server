@@ -333,6 +333,7 @@ fn slot(r: &mut Reader<'_>) -> Result<Slot> {
     })
 }
 pub(crate) async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
+    let plan = a.world.directory(move |d| d.stage_unlock(plan)).await?;
     let result = if let Some((snapshot, slot, index, amount)) = &plan.stat_growth {
         a.store
             .consume_stat(snapshot.clone(), slot.slot, *index, *amount)
@@ -356,8 +357,7 @@ pub(crate) async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
             })
     };
     a.world
-        .for_player(plan.player)
-        .call(move |w| w.finish_inventory(plan, result))
+        .directory(move |d| d.finish_inventory(plan, result))
         .await
 }
 async fn persist_trade(a: &App, plan: TradePlan) -> Result<()> {
@@ -824,6 +824,8 @@ async fn connection(socket: WebSocket, mut a: App) {
                         session.reconnecting = true;
                         session.account.take();
                         let packet = transfer.packet();
+                        // Retired-world frames must not follow RECONNECT into a replacement scene.
+                        while rx.try_recv().is_ok() {}
                         if wsout.send(Message::Binary(codec.frame(packet.id,packet.body).into())).await.is_err(){break;}
                         reconnect_sent=true;
                         deadline.as_mut().reset(tokio::time::Instant::now()+std::time::Duration::from_secs(10));

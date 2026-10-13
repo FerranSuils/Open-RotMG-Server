@@ -14,6 +14,10 @@ pub const ORYX2: u16 = 0x932;
 pub const LOCKED_CELLAR: u16 = 0x721;
 pub const INCANTATION: u16 = 0x722;
 pub const HEROES: [u16; 2] = [0x668, 0x67d];
+pub const DUNGEONS: &[(u16, &str, &str, u16)] = &[
+    (0xd7b, CHAMBER, "Oryx's Chamber", ORYX),
+    (0x700, CELLAR, "Wine Cellar", ORYX2),
+];
 pub const ROSTER: &[u16] = &[
     0x668, 0x669, 0x66a, 0x66b, 0x67d, 0x67e, 0x67f, 0x680, 0x681, 0x682, 0xd70, 0xd71, 0xd78,
     0xd79, 0xd7a, 0xd7c, 0xd7d, 0xd7e, 0xd7f, 0xd80, 0xd81, 0xd82, 0xd83, 0xd84, 0xd87, 0x1740,
@@ -642,6 +646,70 @@ pub fn summons(kind: u16) -> &'static [Wave] {
         _ => panic!("summons requested for unselected endgame object {kind:#x}"),
     }
 }
+pub(crate) fn loot(kind: u16) -> &'static [(f64, crate::loot::Pick)] {
+    use crate::loot::{
+        ABILITIES, ARMOR,
+        Pick::{Item, Tier},
+        RINGS, WEAPONS,
+    };
+    match kind {
+        0x668 => &[
+            (0.02, Item(0xa02)),
+            (0.02, Item(0xa2a)),
+            (0.02, Item(0xa6a)),
+            (0.01, Item(0xa21)),
+            (0.01, Item(0xa1f)),
+        ],
+        0xd78 => &[(1., Item(0xa20))],
+        0xd79 => &[(1., Item(0xa20)), (0.003, Item(0xc05))],
+        ORYX => &[
+            (0.3, Item(0xa1f)),
+            (0.3, Item(0xa20)),
+            (0.07, Tier(10, WEAPONS)),
+            (0.06, Tier(11, WEAPONS)),
+            (0.07, Tier(5, ABILITIES)),
+            (0.07, Tier(11, ARMOR)),
+            (0.06, Tier(5, RINGS)),
+        ],
+        ORYX2 => &[
+            (1., Item(0xa34)),
+            (0.3, Item(0xa1f)),
+            (0.3, Item(0xa20)),
+            (0.3, Item(0xa35)),
+            (0.07, Tier(10, WEAPONS)),
+            (0.06, Tier(11, WEAPONS)),
+            (0.05, Tier(12, WEAPONS)),
+            (0.07, Tier(5, ABILITIES)),
+            (0.05, Tier(6, ABILITIES)),
+            (0.07, Tier(11, ARMOR)),
+            (0.06, Tier(12, ARMOR)),
+            (0.05, Tier(13, ARMOR)),
+            (0.06, Tier(5, RINGS)),
+        ],
+        0x1749 => &[(0.2, Tier(7, WEAPONS)), (0.03, Item(0xa22))],
+        0x669..=0x66b
+        | 0x67e..=0x682
+        | 0xd7c
+        | 0xd7e
+        | 0xd7f
+        | 0xd80..=0xd84
+        | 0x944
+        | 0xde0
+        | 0xdf2 => &[(0.03, Item(0xa22)), (0.02, Item(0xa23))],
+        0x67d
+        | 0xd70
+        | 0xd71
+        | 0xd7a
+        | 0xd7d
+        | 0xd87
+        | 0x1748
+        | 0x174a
+        | 0x174b
+        | 0xde1..=0xde4
+        | 0xdf1 => &[],
+        _ => panic!("unselected endgame loot {kind:#x}"),
+    }
+}
 pub fn validate(content: &Content) -> Result<()> {
     for kind in HEROES {
         ensure!(
@@ -650,6 +718,7 @@ pub fn validate(content: &Content) -> Result<()> {
         );
     }
     for kind in ROSTER {
+        crate::loot::validate(content, *kind)?;
         let object = content.get(*kind)?;
         for wave in summons(*kind) {
             ensure!(

@@ -483,8 +483,11 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         amount: i32,
     ) -> Result<i32> {
         let kind = match index {
+            2 => 0xa1f,
+            3 => 0xa20,
             4 => 0xa21,
             5 => 0xa4c,
+            6 => 0xa34,
             7 => 0xa35,
             _ => anyhow::bail!("unsupported permanent potion stat"),
         };
@@ -639,7 +642,14 @@ mod tests {
             .create(account.id, content.get(WIZARD).unwrap())
             .await
             .unwrap();
-        for (slot, index, kind) in [(4, 4, 0xa21), (5, 5, 0xa4c), (6, 7, 0xa35)] {
+        for (slot, index, kind) in [
+            (4, 2, 0xa1f),
+            (5, 3, 0xa20),
+            (6, 4, 0xa21),
+            (7, 5, 0xa4c),
+            (8, 6, 0xa34),
+            (9, 7, 0xa35),
+        ] {
             ch.items[slot] = kind;
             ch.revision = s
                 .exchange(
