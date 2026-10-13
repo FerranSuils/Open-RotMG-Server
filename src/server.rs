@@ -184,6 +184,20 @@ async fn account_request(
                 ensure!(!password.is_empty(), "email and password required");
                 a.store.authenticate(guid, password).await?
             }
+            "setName" => {
+                let id = a
+                    .store
+                    .authenticate(
+                        guid,
+                        form.get("password").context("password required")?.clone(),
+                    )
+                    .await?;
+                let _claim = a.claim(id)?;
+                a.store
+                    .choose_name(id, form.get("name").context("name required")?.clone())
+                    .await?;
+                id
+            }
             _ => bail!("account operation not implemented"),
         };
         tracing::info!(account = id, operation, "account request completed");
@@ -663,7 +677,13 @@ async fn handle(
             let name = r.utf()?;
             r.done()?;
             let account = account.as_ref().context("name before HELLO")?.id;
-            a.store.rename(account, name.clone()).await?;
+            if let Err(e) = a.store.choose_name(account, name.clone()).await {
+                tracing::warn!(account, error=%e, "name choice rejected");
+                let mut o = Writer::new();
+                o.u8(0).utf(&e.to_string());
+                tx.send(Packet { id: 20, body: o.0 }).await?;
+                return Ok(());
+            }
             if let Some(id) = player {
                 let id = *id;
                 a.world

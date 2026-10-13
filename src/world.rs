@@ -996,7 +996,7 @@ impl World {
         let mut o = Writer::new();
         if let Some(p) = self.players.get(&id) {
             let values = p.character.effective(&self.content)?;
-            o.i32(id).f32(p.pos.x).f32(p.pos.y).i16(36);
+            o.i32(id).f32(p.pos.x).f32(p.pos.y).i16(37);
             for (k, v) in [
                 (0, values[0]),
                 (1, p.character.hp),
@@ -1031,6 +1031,14 @@ impl World {
             stat(&mut o, 32, 0);
             stat(&mut o, 33, 0);
             stat(&mut o, 38, p.character.account);
+            stat(
+                &mut o,
+                53,
+                i32::from(crate::store::name_chosen(
+                    p.character.account,
+                    &p.character.name,
+                )),
+            );
             stat(&mut o, 57, p.character.fame);
             stat(
                 &mut o,
@@ -1788,6 +1796,7 @@ impl World {
         let cleared_cave = snapshot.pirate_caves > p.character.pirate_caves;
         let leveled = snapshot.level > p.character.level;
         p.character.exp = snapshot.exp;
+        p.character.fame = snapshot.fame;
         p.character.level = snapshot.level;
         p.character.base = snapshot.base;
         p.character.pirate_caves = snapshot.pirate_caves;
@@ -2767,6 +2776,24 @@ mod tests {
         assert_eq!(death.len(), 1);
         assert_eq!(death[0].1.level, 2);
         assert_eq!(death[0].1.hp, 0);
+    }
+    #[test]
+    fn committed_fame_survives_departure_and_permanent_death() {
+        let mut w = world();
+        let id = w.enter(ch(&w), None).unwrap();
+        w.players.get_mut(&id).unwrap().experience_queued = 1000;
+        let plans = w.pending_progress().unwrap();
+        assert_eq!(plans[0].1.fame, 1);
+        assert_eq!(w.players[&id].character.fame, 0);
+        w.finish_progress(id, plans[0].1.clone()).unwrap();
+        let saved = w.begin_departure(id).unwrap().unwrap();
+        assert_eq!(saved.fame, 1);
+        w.finish_departure(id).unwrap();
+        let id = w.enter(saved, None).unwrap();
+        let p = w.players.get_mut(&id).unwrap();
+        p.character.hp = 0;
+        p.death_pending = true;
+        assert_eq!(w.pending_deaths()[0].1.fame, 1);
     }
     #[test]
     fn departure_waits_for_earned_progress() {

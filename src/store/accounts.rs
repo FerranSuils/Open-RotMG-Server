@@ -75,6 +75,26 @@ fn guest(db: &Connection, guid: &str, create: bool) -> Result<i32> {
     Ok(id)
 }
 impl Store {
+    pub async fn choose_name(&self, account: i32, name: String) -> Result<()> {
+        ensure!(
+            (3..=10).contains(&name.len()) && name.bytes().all(|c| c.is_ascii_alphabetic()),
+            "names must be 3–10 letters"
+        );
+        self.call(move |db| {
+            let tx = db.transaction()?;
+            let (current, registered): (String, bool) = tx.query_row(
+                "SELECT name,EXISTS(SELECT 1 FROM credentials WHERE account=accounts.id) FROM accounts WHERE id=?1",
+                [account], |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            ensure!(registered, "register before choosing a name");
+            ensure!(!name_chosen(account, &current), "paid name changes are not implemented");
+            let taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM accounts WHERE name=?1 COLLATE NOCASE)", [&name], |r| r.get(0))?;
+            ensure!(!taken, "name already taken");
+            tx.execute("UPDATE accounts SET name=?2 WHERE id=?1", params![account,name])?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
     pub(super) async fn guest(&self, guid: String, create: bool) -> Result<i32> {
         self.call(move |db| {
             let tx = db.transaction()?;
@@ -256,6 +276,45 @@ mod tests {
             .unwrap();
         assert!(verifier.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
         assert!(!verifier.contains("native-password"));
+    }
+    #[tokio::test]
+    async fn native_name_choice_is_registered_unique_and_one_time() {
+        let (s, _, _) = store("name-choice");
+        let guest = s.list("name-guest".into()).await.unwrap();
+        assert!(!guest.xml().contains("<NameChosen/>"));
+        let content = Content::load(Path::new("data")).unwrap();
+        let ch = s
+            .create(guest.id, content.get(WIZARD).unwrap())
+            .await
+            .unwrap();
+        assert!(s.choose_name(guest.id, "Pilot".into()).await.is_err());
+        s.register(
+            "name-guest".into(),
+            "pilot@example.org".into(),
+            "password".into(),
+        )
+        .await
+        .unwrap();
+        s.choose_name(guest.id, "Pilot".into()).await.unwrap();
+        let a = s
+            .characters("pilot@example.org".into(), "password".into())
+            .await
+            .unwrap();
+        assert_eq!(a.name, "Pilot");
+        assert_eq!(s.load(guest.id, ch.id).await.unwrap().name, "Pilot");
+        assert!(a.xml().contains("<NameChosen/>"));
+        assert!(s.choose_name(guest.id, "Renamed".into()).await.is_err());
+        let second = s
+            .register(
+                "other-namer".into(),
+                "second@example.org".into(),
+                "password".into(),
+            )
+            .await
+            .unwrap();
+        assert!(s.choose_name(second, "pILot".into()).await.is_err());
+        assert!(s.choose_name(second, "Bad123".into()).await.is_err());
+        s.choose_name(second, "Keeper".into()).await.unwrap();
     }
     #[tokio::test]
     async fn corrupt_verifier_is_not_reported_as_a_wrong_password() {

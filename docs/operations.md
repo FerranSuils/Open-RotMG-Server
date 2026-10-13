@@ -8,6 +8,6 @@ For hosting, build with `cargo build --release --locked` and run `openrotmg --co
 
 `GET /health` reports monotonic process `uptime_seconds`, native human `players`, and separate `qa_actors`. `bots` is explicitly zero: gameplay bots are not implemented; future populations need their own identity, not the QA control flag.
 
-Native registration converts a guest without changing account ownership; subsequent login uses email/password rather than the guest GUID. SQLite stores Argon2id verifiers. Email verification and password recovery are not implemented.
+Native registration converts a guest without changing account ownership; subsequent login uses email/password rather than the guest GUID. SQLite stores Argon2id verifiers. Registered accounts can choose one free, unique 3–10-letter name through the original client; name changes after that, email verification and password recovery are not implemented.
 
 Independent credential-free backup and offline restore instructions are in `scripts/backups/OPERATIONS.md`.
