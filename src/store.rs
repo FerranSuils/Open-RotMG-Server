@@ -276,7 +276,8 @@ CREATE TABLE IF NOT EXISTS vaults(account INTEGER PRIMARY KEY REFERENCES account
             let tx = db.transaction()?;
             let existing: Option<String> = tx.query_row(
                 "SELECT guid FROM accounts JOIN shore_bots ON accounts.id=shore_bots.account WHERE shore_bots.name=?1",
-                [&name], |r| r.get(0)).optional()?;
+                [&name], |r| r.get(0)).optional()
+                .context("read shore bot identity; credential-free restores require operator recovery")?;
             let guid = match existing {
                 Some(guid) => guid,
                 None => {

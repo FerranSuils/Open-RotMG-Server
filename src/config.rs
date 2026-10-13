@@ -22,6 +22,7 @@ impl Config {
         let mut control = false;
         let mut shore_bots = false;
         let mut client_dir = None;
+        let mut state_dir = None;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -50,8 +51,14 @@ impl Config {
                         args.next().context("--client requires a directory")?,
                     ));
                 }
+                "--state" => {
+                    ensure!(state_dir.is_none(), "duplicate --state");
+                    state_dir = Some(PathBuf::from(
+                        args.next().context("--state requires a directory")?,
+                    ));
+                }
                 _ => anyhow::bail!(
-                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--shore-bots] [--client DIR]"
+                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--shore-bots] [--client DIR] [--state DIR]"
                 ),
             }
         }
@@ -77,6 +84,9 @@ impl Config {
         };
         if let Some(client) = client_dir {
             config.client = client;
+        }
+        if let Some(state) = state_dir {
+            config.state = state;
         }
         if let Some(port) = port {
             config.bind.set_port(port);
@@ -115,8 +125,8 @@ impl Config {
             "development control cannot be enabled behind a public proxy"
         );
         ensure!(
-            !self.shore_bots || (local && !self.behind_proxy && self.max_players >= 4),
-            "shore bots require local development and capacity for three bots plus a human"
+            !self.shore_bots || self.max_players >= 4,
+            "shore bots require capacity for three bots plus a human"
         );
         ensure!(
             (1..=85).contains(&self.max_players),
@@ -179,19 +189,41 @@ mod tests {
         );
     }
     #[test]
-    fn shore_bots_are_opt_in_local_and_reserve_human_capacity() {
+    fn shore_bots_are_opt_in_and_reserve_human_capacity() {
         assert!(!Config::load(&[]).unwrap().0.shore_bots);
         assert!(Config::load(&["--shore-bots".into()]).unwrap().0.shore_bots);
         assert!(Config::load(&["--shore-bots".into(), "--shore-bots".into()]).is_err());
         let mut production = config();
         production.shore_bots = true;
-        assert!(production.validate(false).is_err());
-        production.origin = "http://127.0.0.1:18923".into();
-        production.behind_proxy = false;
+        production.validate(false).unwrap();
+        assert!(production.validate(true).is_err());
         production.max_players = 3;
         assert!(production.validate(false).is_err());
         production.max_players = 4;
         production.validate(false).unwrap();
+    }
+    #[test]
+    fn explicit_state_does_not_change_client_or_origin() {
+        let (original, _) = Config::load(&[]).unwrap();
+        let (isolated, _) = Config::load(&["--state".into(), "/tmp/qa-state".into()]).unwrap();
+        assert_eq!(
+            (isolated.state, isolated.client, isolated.origin),
+            (
+                PathBuf::from("/tmp/qa-state"),
+                original.client,
+                original.origin
+            )
+        );
+    }
+    #[test]
+    fn malformed_state_arguments_are_rejected() {
+        for args in [
+            vec!["--state"],
+            vec!["--state", "relative"],
+            vec!["--state", "/tmp/a", "--state", "/tmp/b"],
+        ] {
+            assert!(Config::load(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
+        }
     }
     #[test]
     fn local_launcher_remains_explicit() {

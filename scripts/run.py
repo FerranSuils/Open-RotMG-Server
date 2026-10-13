@@ -5,6 +5,7 @@ import io
 from pathlib import Path
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 from urllib.request import urlopen
@@ -18,7 +19,7 @@ LOG = ROOT / ".local/server.log"
 
 
 def prepare_client():
-    cache = ROOT / f".local/client-{REVISION}.zip"
+    cache = LOG.parent / f"client-{REVISION}.zip"
     cache.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if cache.exists():
         data = cache.read_bytes()
@@ -83,20 +84,35 @@ def port_number(value):
 def main():
     parser = argparse.ArgumentParser(prog="run.sh", description="Download the client and start your local OpenRotMG game.")
     parser.add_argument("port", type=port_number, help="Local server port")
-    parser.add_argument("--local-client", type=Path, metavar="DIR", help="Use your own client checkout instead of downloading the pinned client")
+    parser.add_argument("--client", "--local-client", dest="local_client", type=Path, metavar="DIR", help="Use your own client checkout instead of downloading the pinned client")
+    parser.add_argument("--state", type=Path, default=ROOT / ".local", metavar="DIR", help="Isolate saves, keys, client cache and logs in this directory")
     parser.add_argument("--dev-control", action="store_true", help="Enable loopback-only QA control")
     parser.add_argument("--shore-bots", action="store_true", help="Run three autonomous starter Wizards in the local Realm")
     parser.add_argument("--release", action="store_true", help="Build optimized gameplay")
     args = parser.parse_args()
     if shutil.which("cargo") is None:
         parser.error("Cargo not found. Install Rust/Cargo from https://rustup.rs/ and rerun.")
-    ROOT.joinpath(".local").mkdir(mode=0o700, exist_ok=True)
+    global LOG
+    state = args.state.resolve()
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    LOG = state / "server.log"
     with LOG.open("a") as log:
         try:
+            try:
+                with socket.socket() as probe:
+                    probe.bind(("127.0.0.1", args.port))
+            except OSError as error:
+                raise RuntimeError(f"Cannot listen on 127.0.0.1:{args.port}: {error}") from error
+            revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+            dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True).strip())
             client = args.local_client.resolve() if args.local_client is not None else prepare_client()
             prepare = client / "scripts/run.py"
             if not prepare.is_file():
                 raise RuntimeError(f"Missing client launcher: {prepare}. Use a complete Open-RotMG-Client checkout.")
+            receipt = f"Local source: {revision} dirty={dirty}; port={args.port}; state={state}; client={client}"
+            print(receipt, flush=True)
+            log.write(receipt + "\n")
+            log.flush()
             print(f"Preparing local client. Logs: {LOG}", flush=True)
             code = run([sys.executable, str(prepare), "--prepare-only"], client, log)
             if code:
@@ -105,7 +121,7 @@ def main():
             command = ["cargo", "run", "--locked"]
             if args.release:
                 command.append("--release")
-            command += ["--", "--client", str(client), "--port", str(args.port)]
+            command += ["--", "--client", str(client), "--port", str(args.port), "--state", str(state)]
             if args.dev_control:
                 command.append("--dev-control")
             if args.shore_bots:
