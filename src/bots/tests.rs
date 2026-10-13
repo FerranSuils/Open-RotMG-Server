@@ -102,6 +102,22 @@ fn same_observation_produces_resource_recovery_and_companion_choices() {
     assert_eq!(goals, vec![Goal::Recover, Goal::Loot(3), Goal::Follow(4)]);
 }
 #[test]
+fn explores_known_frontiers_toward_an_observed_distant_encounter() {
+    let content = content();
+    let mut v = view(&content);
+    let enemy = content.objects.values().find(|o| o.enemy).unwrap().kind;
+    v.objects.push(object(2, enemy, 39.5, 11.5));
+    let mut brain = Brain::new(PROFILES[1], &v);
+    brain.heading = std::f32::consts::PI;
+    let decision = brain.decide(&v, &content).unwrap();
+    assert_eq!(decision.goal, Goal::Explore(29, 11));
+    let grid = Grid::new(&v);
+    assert!(!grid.known.contains(&(39, 11)));
+    assert!(grid.segment(v.position, decision.movement.unwrap()));
+    assert!(decision.aim.is_none());
+}
+
+#[test]
 fn busy_clock_lifecycle_and_session_do_not_fabricate_actions() {
     let content = content();
     let mut v = view(&content);

@@ -530,8 +530,13 @@ impl Brain {
                     }
                     let value = |t| {
                         let p = center(t);
-                        (p.x - v.position.x) * self.heading.cos()
-                            + (p.y - v.position.y) * self.heading.sin()
+                        nearest.map_or_else(
+                            || {
+                                (p.x - v.position.x) * self.heading.cos()
+                                    + (p.y - v.position.y) * self.heading.sin()
+                            },
+                            |enemy| -p.distance(enemy.position),
+                        )
                     };
                     value(**a).total_cmp(&value(**b))
                 });
