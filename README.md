@@ -1,6 +1,8 @@
 <h1><img src=".github/readme-icon.png" width="44" height="44" align="absmiddle" alt=""> Open RotMG / Server</h1>
 
-Rust backend for the Realm of the Mad God 2012 (123.5.1) client. See [openrotmg.org/restoration](https://openrotmg.org/restoration/) for progress.
+Rust backend for the Realm of the Mad God 2012 (123.5.1) client.
+
+See https://openrotmg.org/restoration/ to see what's completed.
 
 
 ## Run locally
