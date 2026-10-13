@@ -15,6 +15,8 @@ use std::{
     time::Instant,
 };
 use tokio::sync::{mpsc, oneshot, watch};
+mod chat;
+pub(crate) use chat::chat_error;
 mod trade;
 pub use trade::{TradeAction, TradePlan};
 #[derive(Clone)]
@@ -227,6 +229,7 @@ pub struct Directory {
     ids: Arc<AtomicI32>,
     grants: BTreeMap<Vec<u8>, Grant>,
     portals: BTreeMap<i32, Portal>,
+    chat_budgets: BTreeMap<i32, chat::ChatBudget>,
     idle: BTreeMap<i32, u64>,
     next_world: i32,
     pub tick: u64,
@@ -273,6 +276,7 @@ impl Directory {
             ids: Arc::new(AtomicI32::new(1000)),
             grants: BTreeMap::new(),
             portals: BTreeMap::new(),
+            chat_budgets: BTreeMap::new(),
             idle: BTreeMap::new(),
             next_world: 1,
             tick: 0,
@@ -2598,7 +2602,7 @@ mod tests {
         let m = Arc::new(Map::load(Path::new("data/tutorial.wmap"), &c).unwrap());
         World::new(c, m).unwrap()
     }
-    fn ch(w: &World) -> Character {
+    pub(super) fn ch(w: &World) -> Character {
         Character {
             schema: 1,
             class: WIZARD,
@@ -2623,7 +2627,7 @@ mod tests {
             pirate_caves: 0,
         }
     }
-    fn directory() -> Directory {
+    pub(super) fn directory() -> Directory {
         Directory::load(
             Path::new("data"),
             Arc::new(Content::load(Path::new("data")).unwrap()),

@@ -113,5 +113,30 @@
         "wire": "0000001c0c1827d5e31a99cbeba562c3d7f096401561e7f0437c1e1b"
       }
     ]
+  },
+  {
+    "direction": "client_to_server",
+    "frames": [
+      {
+        "name": "PLAYERTEXT",
+        "plain": "0000001345000c436176653f20636166c3a921",
+        "wire": "0000001345c21b96ec116021c863ec49617aca"
+      }
+    ]
+  },
+  {
+    "direction": "server_to_client",
+    "frames": [
+      {
+        "name": "TEXT",
+        "plain": "00000028190006477565737431000003e900000000050000000c436176653f20636166c3a9210000",
+        "wire": "0000002819b287a6e364e82b52c4cc927b4e0d13d1ade3908f360661e481e086b6a035d4c304e192"
+      },
+      {
+        "name": "TEXT_private_error",
+        "plain": "000000221900072a4572726f722affffffff000000000000000005576169742e0000",
+        "wire": "000000221906b5ad07d7258d80344c7213e7cf7bf02b63a39332ecfdfc1e18d27277"
+      }
+    ]
   }
 ]

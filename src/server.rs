@@ -280,6 +280,11 @@ fn trade_offer(r: &mut Reader<'_>) -> Result<[bool; 12]> {
     }
     Ok(values)
 }
+fn player_text(r: &mut Reader<'_>) -> Result<String> {
+    let text = r.utf()?;
+    r.done()?;
+    Ok(text)
+}
 #[derive(Default)]
 struct Session {
     account: Option<Owner>,
@@ -460,6 +465,16 @@ async fn handle(
             a.world
                 .call(move |w| w.native_shoot(id, time, bullet, kind, pos, angle))
                 .await?;
+        }
+        wire::PLAYER_TEXT => {
+            let text = player_text(&mut r)?;
+            let id = player.context("chat before character")?;
+            let received = std::time::Instant::now();
+            if let Err(error) = a.world.directory(move |d| d.chat(id, text, received)).await {
+                tracing::warn!(player=id, error=%error, "local chat rejected");
+                tx.send(crate::world::chat_error(&error.to_string()))
+                    .await?;
+            }
         }
         wire::PONG => {
             r.i32()?;
@@ -1157,6 +1172,18 @@ mod tests {
         out.0[6] = 1;
         out.0.pop();
         assert!(trade_offer(&mut Reader::new(&out.0)).is_err());
+    }
+    #[test]
+    fn selected_player_text_has_only_one_utf_string() {
+        let mut out = Writer::new();
+        out.utf("café 😀");
+        assert_eq!(player_text(&mut Reader::new(&out.0)).unwrap(), "café 😀");
+        for end in 0..out.0.len() {
+            assert!(player_text(&mut Reader::new(&out.0[..end])).is_err());
+        }
+        out.utf("ForgedSender");
+        assert!(player_text(&mut Reader::new(&out.0)).is_err());
+        assert!(player_text(&mut Reader::new(&[0, 1, 0xff])).is_err());
     }
     #[test]
     fn guest_rate_is_bounded_and_expires() {
