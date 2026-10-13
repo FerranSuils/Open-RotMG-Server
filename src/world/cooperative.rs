@@ -77,12 +77,12 @@ impl Directory {
         world.updates(id, false)?;
         let mut out = Writer::new();
         out.i32(id).f32(position.x).f32(position.y);
-        for p in world
+        for (receiver, p) in world
             .players
-            .values()
-            .filter(|p| ready(p) && p.known.contains(&id))
+            .iter_mut()
+            .filter(|(_, p)| ready(p) && p.known.contains(&id))
         {
-            send(p, wire::GOTO, out.0.clone());
+            reconciliation::goto(p, *receiver == id, out.0.clone());
             send(p, wire::SHOW_EFFECT, effect(2, id, position));
         }
         tracing::info!(player=id, account, target, x=position.x, y=position.y, world=%world.name, "player teleported");
@@ -108,6 +108,10 @@ impl World {
         ensure!(
             ready(p),
             "Busy, dead, departing or quarantined players cannot teleport."
+        );
+        ensure!(
+            !p.correcting()?,
+            "Position correction awaits GOTO acknowledgement."
         );
         ensure!(id != target, "You are already at yourself.");
         let q = self

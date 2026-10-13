@@ -558,7 +558,7 @@ async fn handle(
             a.world
                 .call(
                     move |w| match w.native_move_received(id, pos, (time, received)) {
-                        Ok(()) => Ok(()),
+                        Ok(_) => Ok(()),
                         Err(e) => w.correct_position(id, time, &e.to_string()),
                     },
                 )
@@ -578,6 +578,7 @@ async fn handle(
             a.world
                 .call(move |w| {
                     w.native_shoot_received(id, (time, received), bullet, kind, pos, angle)
+                        .map(|_| ())
                 })
                 .await?;
         }
@@ -706,8 +707,10 @@ async fn handle(
             persist(a, plan).await?;
         }
         14 => {
-            r.i32()?;
+            let time = r.i32()?;
             r.done()?;
+            let id = player.context("GOTO ACK before character")?;
+            a.world.call(move |w| w.acknowledge_goto(id, time)).await?;
         }
         48 => {
             r.done()?;
