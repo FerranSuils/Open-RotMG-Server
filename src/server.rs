@@ -553,7 +553,7 @@ async fn handle(
             r.done()?;
             let id = player.context("MOVE before character")?;
             a.world
-                .call(move |w| match w.move_to(id, pos, time) {
+                .call(move |w| match w.native_move_to(id, pos, time) {
                     Ok(()) => Ok(()),
                     Err(e) => w.correct_position(id, time, &e.to_string()),
                 })

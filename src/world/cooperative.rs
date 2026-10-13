@@ -61,7 +61,7 @@ impl Directory {
         let p = world.players.get_mut(&id).unwrap();
         p.pos = position;
         p.movement_credit = 0.78;
-        p.last_move_at = world.now;
+        p.last_move_at = world.attack_epoch.elapsed().as_millis() as u64;
         let receipt = TeleportReceipt {
             player: id,
             character: p.character.id,
