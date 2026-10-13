@@ -124,7 +124,8 @@ struct Brain {
     recover_until: u64,
     tracks: BTreeMap<i32, (Pos, u64, Pos)>,
     next_teleport: u64,
-    regroup_call: Option<(i32, u64)>,
+    regroup_call: Option<(Journey, u64)>,
+    nexus_until: u64,
     next_call: u64,
     requested_until: u64,
     portal: Option<(i32, u64)>,
@@ -162,6 +163,11 @@ impl Brain {
             tracks: BTreeMap::new(),
             next_teleport: 0,
             regroup_call: None,
+            nexus_until: if view.map.name == "Nexus" {
+                view.time_ms + 10000
+            } else {
+                0
+            },
             next_call: 0,
             requested_until: 0,
             portal: None,
@@ -189,7 +195,8 @@ impl Brain {
             let leader = self.profile.name == self.profile.leader;
             if (!leader
                 && name == self.profile.leader
-                && text == "tp here"
+                && (text == "nexus"
+                    || (text == "tp here" && view.objects.iter().any(|o| o.id == actor)))
                 && self.requested_until > view.time_ms
                 && self.companion.is_none()
                 && self
@@ -201,7 +208,12 @@ impl Brain {
                         .iter()
                         .any(|p| p.leader == self.profile.name && p.name == name))
             {
-                self.regroup_call = Some((actor, view.time_ms + 5000));
+                let journey = if text == "nexus" {
+                    Journey::Nexus
+                } else {
+                    Journey::Regroup(actor)
+                };
+                self.regroup_call = Some((journey, view.time_ms + 5000));
             }
         }
         if recipient.is_empty()
@@ -428,21 +440,33 @@ impl Brain {
                 return Ok(decision);
             }
         }
+        if v.map.name == "Nexus" && v.time_ms < self.nexus_until {
+            return Ok(decision);
+        }
         if v.map.name == "Realm"
             && health >= 0.75
             && decision.item.is_none()
             && nearest.is_none_or(|e| e.position.distance(v.position) > 5.)
         {
-            if let Some((actor, _)) = self.regroup_call.take().filter(|(_, t)| *t > v.time_ms) {
+            if let Some((journey, _)) = self.regroup_call.take().filter(|(_, t)| *t > v.time_ms) {
                 if self.profile.name == self.profile.leader {
                     if v.time_ms >= self.next_call {
-                        decision.chat = Some("tp here");
+                        let Journey::Regroup(actor) = journey else {
+                            anyhow::bail!("leader received an invalid reunion request");
+                        };
+                        if v.objects.iter().any(|o| o.id == actor) {
+                            decision.chat = Some("tp here");
+                        } else {
+                            decision.chat = Some("nexus");
+                            decision.journey = Some(Journey::Nexus);
+                        }
                         self.next_call = v.time_ms + 10000;
                     }
                 } else if v.time_ms >= self.next_teleport {
-                    decision.goal = Goal::Follow(actor);
-                    decision.journey = Some(Journey::Regroup(actor));
+                    decision.journey = Some(journey);
                     self.next_teleport = v.time_ms + 10000;
+                }
+                if decision.journey.is_some() {
                     return Ok(decision);
                 }
             } else if self.profile.name != self.profile.leader

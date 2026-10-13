@@ -266,7 +266,7 @@ fn only_addressed_native_chat_changes_companion_memory() {
 }
 
 #[test]
-fn fresh_crewmate_rejoins_through_scoped_expiring_public_chat() {
+fn fresh_crewmate_meets_unseen_leader_in_nexus_through_expiring_public_chat() {
     let content = content();
     let mut v = view(&content);
     let packet = |name: &str, actor, recipient: &str, text: &str| {
@@ -305,16 +305,19 @@ fn fresh_crewmate_rejoins_through_scoped_expiring_public_chat() {
     leader
         .receive(packet("Trellis", 1, "", "tp?"), &leader_view)
         .unwrap();
-    assert_eq!(
-        leader.decide(&leader_view, &content).unwrap().chat,
-        Some("tp here")
-    );
+    let reply = leader.decide(&leader_view, &content).unwrap();
+    assert_eq!(reply.chat, Some("nexus"));
+    assert!(matches!(reply.journey, Some(Journey::Nexus)));
     follower
         .receive(packet("Mossy", 2, "", "tp here"), &v)
         .unwrap();
+    assert!(follower.regroup_call.is_none());
+    follower
+        .receive(packet("Mossy", 2, "", "nexus"), &v)
+        .unwrap();
     v.tick += 5;
     let decision = follower.decide(&v, &content).unwrap();
-    assert!(matches!(decision.journey, Some(Journey::Regroup(2))));
+    assert!(matches!(decision.journey, Some(Journey::Nexus)));
     assert!(decision.aim.is_none() && decision.item.is_none() && decision.movement.is_none());
     assert!(v.objects.is_empty());
     follower
@@ -324,33 +327,33 @@ fn fresh_crewmate_rejoins_through_scoped_expiring_public_chat() {
     assert!(follower.decide(&v, &content).unwrap().journey.is_none());
     let mut unsolicited = Brain::new(PROFILES[2], &v);
     unsolicited
-        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .receive(packet("Mossy", 2, "", "nexus"), &v)
         .unwrap();
     assert!(unsolicited.regroup_call.is_none());
     let mut occupied = Brain::new(PROFILES[2], &v);
     occupied.requested_until = v.time_ms + 5000;
     occupied.companion = Some(9);
     occupied
-        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .receive(packet("Mossy", 2, "", "nexus"), &v)
         .unwrap();
     assert!(occupied.regroup_call.is_none());
     occupied.companion = None;
     occupied.leader_seen = Some((2, v.position, v.time_ms));
     occupied
-        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .receive(packet("Mossy", 2, "", "nexus"), &v)
         .unwrap();
     assert!(occupied.regroup_call.is_none());
     let mut expired = Brain::new(PROFILES[2], &v);
     expired.requested_until = v.time_ms + 5000;
     expired
-        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .receive(packet("Mossy", 2, "", "nexus"), &v)
         .unwrap();
     v.time_ms += 5001;
     assert!(expired.decide(&v, &content).unwrap().journey.is_none());
     let mut injured = Brain::new(PROFILES[2], &v);
     injured.requested_until = v.time_ms + 5000;
     injured
-        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .receive(packet("Mossy", 2, "", "nexus"), &v)
         .unwrap();
     v.character.hp = 70;
     assert!(injured.decide(&v, &content).unwrap().journey.is_none());
@@ -368,6 +371,47 @@ fn fresh_crewmate_rejoins_through_scoped_expiring_public_chat() {
             .chat
             .is_none()
     );
+}
+
+#[test]
+fn observed_crew_can_teleport_and_nexus_arrivals_wait_for_peers() {
+    let content = content();
+    let mut v = view(&content);
+    let mut follower = Brain::new(PROFILES[2], &v);
+    follower.requested_until = v.time_ms + 5000;
+    let mut peer = object(2, WIZARD, 23.5, 11.5);
+    peer.name = "Mossy".into();
+    v.objects.push(peer);
+    let mut w = crate::wire::Writer::new();
+    w.utf("Mossy")
+        .i32(2)
+        .i32(0)
+        .u8(5)
+        .utf("")
+        .utf("tp here")
+        .utf("");
+    follower
+        .receive(
+            Packet {
+                id: wire::TEXT,
+                body: w.0,
+            },
+            &v,
+        )
+        .unwrap();
+    assert!(matches!(
+        follower.decide(&v, &content).unwrap().journey,
+        Some(Journey::Regroup(2))
+    ));
+    v.map.name = "Nexus".into();
+    v.objects.clear();
+    let mut arrived = Brain::new(PROFILES[2], &v);
+    let decision = arrived.decide(&v, &content).unwrap();
+    assert_eq!(decision.goal, Goal::Wait);
+    assert!(decision.journey.is_none() && decision.movement.is_none());
+    v.time_ms += 10001;
+    v.tick += 201;
+    assert_ne!(arrived.decide(&v, &content).unwrap().goal, Goal::Wait);
 }
 
 #[test]
