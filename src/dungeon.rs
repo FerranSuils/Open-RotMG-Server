@@ -9,6 +9,16 @@ pub const DUNGEONS: [(u16, &str, &str, u16); 4] = [
     (0x71a, "undead-lair", "Undead Lair", 0xd90),
 ];
 
+pub fn portal_drop(enemy: u16) -> Option<(u16, f64)> {
+    match enemy {
+        0x60e..=0x610 => Some((0x717, 0.01)),
+        0x654 => Some((0x718, 0.17)),
+        0x653 => Some((0x70c, 0.11)),
+        0x659 => Some((0x71a, 0.17)),
+        _ => None,
+    }
+}
+
 pub fn snake_pit(content: &Content, seed: u64) -> Result<Map> {
     let size = 90;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);

@@ -125,6 +125,43 @@ impl World {
         Ok(q.pos)
     }
 
+    pub(super) fn consumable_heal_nova(
+        &mut self,
+        owner: i32,
+        amount: i32,
+        range: f32,
+    ) -> Result<()> {
+        let p = self
+            .players
+            .get(&owner)
+            .context("committed healer disappeared")?;
+        if !ready(p) {
+            return Ok(());
+        }
+        let position = p.pos;
+        for q in self.players.values_mut().filter(|q| {
+            ready(q)
+                && q.pos.distance(position) < range
+                && q.conditions(self.now) & crate::condition::bit(crate::condition::SICK) == 0
+        }) {
+            let cap = q.character.effective(&self.content)?[0];
+            q.character.hp = (q.character.hp + amount).min(cap);
+        }
+        for q in self
+            .players
+            .values()
+            .filter(|q| ready(q) && q.known.contains(&owner))
+        {
+            send(
+                q,
+                wire::SHOW_EFFECT,
+                effect(5, owner, Pos { x: range, y: 0. }),
+            );
+        }
+        tracing::info!(owner, amount, range, "committed Snake Oil healing applied");
+        Ok(())
+    }
+
     pub(super) fn heal_nova(&mut self, id: i32, slot: Slot, item: &Object) -> Result<()> {
         let p = self.players.get(&id).context("healer missing")?;
         ensure!(
