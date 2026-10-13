@@ -254,21 +254,27 @@ impl Directory {
             "tick": self.tick, "max_tick_us": self.max_tick_us,
         })
     }
+    #[cfg(test)]
     pub fn load(path: &std::path::Path, content: Arc<Content>, max_players: usize) -> Result<Self> {
+        Self::with_seed(path, content, max_players, 0)
+    }
+    pub fn with_seed(
+        path: &std::path::Path,
+        content: Arc<Content>,
+        max_players: usize,
+        seed: u64,
+    ) -> Result<Self> {
         let mut templates = BTreeMap::new();
-        for name in [
-            "tutorial",
-            "nexus",
-            "nexus-limbo",
-            "realm-shore",
-            "vault",
-            "pirate-cave",
-        ] {
+        for name in ["tutorial", "nexus", "nexus-limbo", "vault", "pirate-cave"] {
             templates.insert(
                 name.to_string(),
                 Arc::new(Map::load(&path.join(format!("{name}.wmap")), &content)?),
             );
         }
+        templates.insert(
+            "realm-shore".into(),
+            Arc::new(crate::terrain::generate(&content, seed, 512)?),
+        );
         let mut d = Self {
             worlds: BTreeMap::new(),
             templates,
@@ -990,7 +996,7 @@ impl World {
         let mut o = Writer::new();
         if let Some(p) = self.players.get(&id) {
             let values = p.character.effective(&self.content)?;
-            o.i32(id).f32(p.pos.x).f32(p.pos.y).i16(34);
+            o.i32(id).f32(p.pos.x).f32(p.pos.y).i16(36);
             for (k, v) in [
                 (0, values[0]),
                 (1, p.character.hp),
@@ -1025,6 +1031,15 @@ impl World {
             stat(&mut o, 32, 0);
             stat(&mut o, 33, 0);
             stat(&mut o, 38, p.character.account);
+            stat(&mut o, 57, p.character.fame);
+            stat(
+                &mut o,
+                58,
+                [20, 150, 400, 800, 2000]
+                    .into_iter()
+                    .find(|n| *n > p.character.fame)
+                    .unwrap_or(0),
+            );
             text_stat(&mut o, 62, "");
             stat(&mut o, 63, 0);
         } else {
@@ -2017,6 +2032,8 @@ impl World {
         Ok(())
     }
     fn populate_shore(&mut self) -> Result<()> {
+        let &(x, y) = self.map.spawns.first().context("shore has no spawn")?;
+        let spawn = Pos { x, y };
         let mut candidates: Vec<_> = self
             .map
             .cells
@@ -2027,10 +2044,13 @@ impl World {
                     x: (i % self.map.width as usize) as f32 + 0.5,
                     y: (i / self.map.width as usize) as f32 + 0.5,
                 };
-                (matches!(c.terrain, 11 | 12) && self.walkable(pos)).then_some(pos)
+                (matches!(c.terrain, 11 | 12) && self.walkable(pos) && pos.distance(spawn) >= 12.)
+                    .then_some(pos)
             })
             .collect();
         candidates.shuffle(&mut self.rng);
+        // Keep the bounded starter population playable on a Realm-sized coastline.
+        candidates.sort_by(|a, b| a.distance(spawn).total_cmp(&b.distance(spawn)));
         for pos in candidates {
             if self.population.iter().any(|s| s.pos.distance(pos) < 6.) {
                 continue;
@@ -3636,7 +3656,10 @@ mod tests {
         let mut d = Directory::load(Path::new("data"), world().content, 16).unwrap();
         let w = d.worlds.get_mut(&-3).unwrap();
         assert_eq!(w.population.len(), 24);
+        let (x, y) = w.map.spawns[0];
+        let arrival = Pos { x, y };
         for spawn in &w.population {
+            assert!((12.0..60.0).contains(&spawn.pos.distance(arrival)));
             let cell =
                 &w.map.cells[spawn.pos.y as usize * w.map.width as usize + spawn.pos.x as usize];
             assert!(matches!(cell.terrain, 11 | 12));

@@ -140,15 +140,103 @@ async fn chars(
     let result: Result<String> = async {
         let guid = form.get("guid").context("guid is required")?.clone();
         ensure!(
-            form.get("password").is_none_or(|s| s.is_empty()),
-            "registered account login not implemented in this development build"
+            form.get("secret").is_none_or(|s| s.is_empty()),
+            "external platform authentication is not implemented"
         );
-        let account = a.store.list(guid).await?;
+        let password = form.get("password").context("password required")?.clone();
+        let account = a.store.characters(guid, password).await?;
         Ok(account.xml())
     }
     .await;
     match result {
         Ok(xml) => ([("content-type", "application/xml")], xml).into_response(),
+        Err(e) => error(e),
+    }
+}
+async fn account_request(
+    State(a): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Path(operation): axum::extract::Path<String>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    match admit(&a, &headers, peer) {
+        Ok(true) => {}
+        Ok(false) => return limited(),
+        Err(e) => return error(e),
+    }
+    let result: Result<String> = async {
+        let guid = form.get("guid").context("guid required")?.clone();
+        let id = match operation.as_str() {
+            "register" => {
+                a.store
+                    .register(
+                        guid,
+                        form.get("newGUID").context("newGUID required")?.clone(),
+                        form.get("newPassword")
+                            .context("newPassword required")?
+                            .clone(),
+                    )
+                    .await?
+            }
+            "verify" => {
+                let password = form.get("password").context("password required")?.clone();
+                ensure!(!password.is_empty(), "email and password required");
+                a.store.authenticate(guid, password).await?
+            }
+            _ => bail!("account operation not implemented"),
+        };
+        tracing::info!(account = id, operation, "account request completed");
+        Ok("<Success/>".into())
+    }
+    .await;
+    let xml = match result {
+        Ok(xml) => xml,
+        Err(e) => {
+            tracing::warn!(error=%e, operation, "account request rejected");
+            format!("<Error>{}</Error>", xml_escape(&e.to_string()))
+        }
+    };
+    // The original account service carries semantic failures in XML, not HTTP error pages.
+    (
+        [
+            ("content-type", "application/xml"),
+            ("cache-control", "no-store"),
+        ],
+        xml,
+    )
+        .into_response()
+}
+async fn legends(
+    State(a): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    match admit(&a, &headers, peer) {
+        Ok(true) => {}
+        Ok(false) => return limited(),
+        Err(e) => return error(e),
+    }
+    let result: Result<String> = async {
+        let span = form.get("timespan").context("timespan required")?.clone();
+        let account = form
+            .get("accountId")
+            .context("accountId required")?
+            .parse()?;
+        let character = form.get("charId").context("charId required")?.parse()?;
+        a.store.legends(span, account, character).await
+    }
+    .await;
+    match result {
+        Ok(xml) => (
+            [
+                ("content-type", "application/xml"),
+                ("cache-control", "no-store"),
+            ],
+            xml,
+        )
+            .into_response(),
         Err(e) => error(e),
     }
 }
@@ -343,8 +431,8 @@ async fn handle(
             let password = a.keys.decrypt(&r.utf()?)?;
             let secret = a.keys.decrypt(&r.utf()?)?;
             ensure!(
-                password.is_empty() && secret.is_empty(),
-                "only local guest accounts are enabled"
+                secret.is_empty(),
+                "external platform authentication is not implemented"
             );
             let keytime = r.i32()?;
             let n = usize::try_from(r.i16()?)?;
@@ -355,7 +443,7 @@ async fn handle(
                 r.utf()?;
             }
             r.done()?;
-            let id = a.store.authenticate(guid).await?;
+            let id = a.store.authenticate(guid, password).await?;
             *account = Some(a.claim(id)?);
             let (destination, character) = a
                 .world
@@ -1031,6 +1119,8 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
     let app = Router::new()
         .route("/legacy-api/char/list", post(chars))
         .route("/legacy-api/char/fame", post(fame))
+        .route("/legacy-api/account/{operation}", post(account_request))
+        .route("/legacy-api/fame/list", post(legends))
         .nest_service("/sfx", tower_http::services::ServeDir::new(a.sfx.clone()))
         .route("/client.swf", get(swf))
         .route("/game", get(websocket))
