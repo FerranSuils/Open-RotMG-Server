@@ -214,7 +214,7 @@ impl Directory {
             self.endgame.forced.remove(&player);
             return Ok(None);
         }
-        if p.pending || p.experience_queued > 0 || p.caves_queued > 0 {
+        if p.pending || p.experience_queued > 0 || p.clears_queued.iter().any(|count| *count > 0) {
             return Ok(None);
         }
         let output =
