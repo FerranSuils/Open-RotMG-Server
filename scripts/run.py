@@ -85,6 +85,8 @@ def main():
     parser.add_argument("port", type=port_number, help="Local server port")
     parser.add_argument("--local-client", type=Path, metavar="DIR", help="Use your own client checkout instead of downloading the pinned client")
     parser.add_argument("--dev-control", action="store_true", help="Enable loopback-only QA control")
+    parser.add_argument("--shore-bots", action="store_true", help="Run three autonomous starter Wizards in the local Realm")
+    parser.add_argument("--release", action="store_true", help="Build optimized gameplay")
     args = parser.parse_args()
     if shutil.which("cargo") is None:
         parser.error("Cargo not found. Install Rust/Cargo from https://rustup.rs/ and rerun.")
@@ -100,9 +102,14 @@ def main():
             if code:
                 raise RuntimeError(f"Client preparation exited with status {code}. See the error above and {LOG}.")
             print(f"Building and starting your local game. Logs: {LOG}", flush=True)
-            command = ["cargo", "run", "--locked", "--", "--client", str(client), "--port", str(args.port)]
+            command = ["cargo", "run", "--locked"]
+            if args.release:
+                command.append("--release")
+            command += ["--", "--client", str(client), "--port", str(args.port)]
             if args.dev_control:
                 command.append("--dev-control")
+            if args.shore_bots:
+                command.append("--shore-bots")
             code = run(command, ROOT, log)
             if code:
                 raise RuntimeError(f"Server exited with status {code}. See the error above and {LOG}.")

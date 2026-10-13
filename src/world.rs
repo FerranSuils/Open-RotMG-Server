@@ -17,10 +17,12 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 mod chat;
 pub(crate) use chat::chat_error;
+#[cfg(test)]
+mod bot_tests;
+mod trade;
 pub(crate) mod view;
 #[cfg(test)]
 mod view_tests;
-mod trade;
 pub use trade::{TradeAction, TradePlan};
 #[derive(Clone)]
 pub struct Output {
@@ -69,12 +71,18 @@ impl Entity {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Controller {
+    Human,
+    Qa,
+    Autonomous,
+}
 pub struct Player {
     pub character: Character,
     pub pos: Pos,
     pub tx: Option<Output>,
     pub departing: bool,
-    script_owned: bool,
+    controller: Controller,
     pub known: BTreeSet<i32>,
     known_since: BTreeMap<i32, u64>,
     tiles: BTreeSet<(i16, i16)>,
@@ -247,12 +255,17 @@ impl Directory {
             .worlds
             .values()
             .flat_map(|w| w.players.values())
-            .filter(|p| p.script_owned)
+            .filter(|p| p.controller == Controller::Qa)
             .count();
-        // Script-owned QA actors are not gameplay bots.
+        let bots = self
+            .worlds
+            .values()
+            .flat_map(|w| w.players.values())
+            .filter(|p| p.controller == Controller::Autonomous)
+            .count();
         serde_json::json!({
             "status": "development", "uptime_seconds": started.elapsed().as_secs(),
-            "worlds": self.worlds.len(), "players": players - qa_actors, "bots": 0, "qa_actors": qa_actors,
+            "worlds": self.worlds.len(), "players": players - qa_actors - bots, "bots": bots, "qa_actors": qa_actors,
             "entities": self.worlds.values().map(|w| w.entities.len()).sum::<usize>(),
             "projectiles": self.worlds.values().map(|w| w.bullets.len()).sum::<usize>(),
             "tick": self.tick, "max_tick_us": self.max_tick_us,
@@ -937,7 +950,11 @@ impl World {
                 character: ch,
                 pos: Pos { x, y },
                 departing: false,
-                script_owned: tx.is_none(),
+                controller: if tx.is_none() {
+                    Controller::Qa
+                } else {
+                    Controller::Human
+                },
                 tx,
                 known: BTreeSet::new(),
                 known_since: BTreeMap::new(),
@@ -977,6 +994,14 @@ impl World {
             character = char_id,
             "player entered development world"
         );
+        Ok(id)
+    }
+    pub fn enter_autonomous(&mut self, ch: Character, tx: Output) -> Result<i32> {
+        let id = self.enter(ch, Some(tx))?;
+        self.players
+            .get_mut(&id)
+            .context("new controller missing")?
+            .controller = Controller::Autonomous;
         Ok(id)
     }
     pub fn leave(&mut self, id: i32) -> Result<Character> {
@@ -1678,9 +1703,20 @@ impl World {
     pub fn action(&mut self, id: i32, a: Action) -> Result<Option<InventoryPlan>> {
         let p = self.players.get(&id).context("player missing")?;
         ensure!(
-            p.script_owned,
-            "script actions require a script-owned player; use /dev/join"
+            p.controller == Controller::Qa,
+            "script actions require a QA-owned player"
         );
+        self.controlled_action(id, a)
+    }
+    pub fn autonomous_action(&mut self, id: i32, a: Action) -> Result<Option<InventoryPlan>> {
+        ensure!(
+            self.players.get(&id).context("player missing")?.controller == Controller::Autonomous,
+            "autonomous actions require an autonomous controller"
+        );
+        self.controlled_action(id, a)
+    }
+    fn controlled_action(&mut self, id: i32, a: Action) -> Result<Option<InventoryPlan>> {
+        let p = self.players.get(&id).context("player missing")?;
         ensure!(
             p.character.alive
                 && !p.death_pending
@@ -2295,7 +2331,7 @@ impl World {
                     }
                 }
             }
-            if self.players[id].script_owned {
+            if self.players[id].controller != Controller::Human {
                 let pos = self.players[id].pos;
                 let time = self.now as i32;
                 if let Err(e) = self.move_to(*id, pos, time) {
@@ -2607,7 +2643,7 @@ mod tests {
     use super::*;
     use crate::content::WIZARD;
     use std::path::Path;
-    fn world() -> World {
+    pub(super) fn world() -> World {
         let c = Arc::new(Content::load(Path::new("data")).unwrap());
         let m = Arc::new(Map::load(Path::new("data/tutorial.wmap"), &c).unwrap());
         World::new(c, m).unwrap()
@@ -2861,7 +2897,7 @@ mod tests {
                 .err()
                 .unwrap()
                 .to_string()
-                .contains("script-owned")
+                .contains("QA-owned")
         );
     }
     #[test]

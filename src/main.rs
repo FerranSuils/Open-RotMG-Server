@@ -1,3 +1,4 @@
+mod bots;
 mod config;
 mod content;
 mod crypto;
@@ -79,6 +80,7 @@ async fn main() -> Result<()> {
         sfx: config.data.join("sfx"),
         max_players: config.max_players,
         behind_proxy: config.behind_proxy,
+        shore_bots: config.shore_bots,
         requests: Arc::default(),
         connections: Arc::new(tokio::sync::Semaphore::new(config.max_players * 2)),
         control,
