@@ -93,6 +93,9 @@ impl World {
     }
 
     pub(super) fn encounter_mechanics(&mut self, id: i32, target: Pos, elapsed: u64) -> Result<()> {
+        if crate::endgame::ROSTER.contains(&self.entities[&id].kind) {
+            return self.finale_mechanics(id, target, elapsed);
+        }
         let e = &self.entities[&id];
         let (kind, hp, pos, home) = (e.kind, e.hp, e.pos, e.home);
         let stage = encounter::stage(kind, hp, elapsed);
@@ -144,7 +147,7 @@ impl World {
                         }
                     }
                 }
-                0xd90 if stage % 4 == 0 => {
+                0xd90 if stage.is_multiple_of(4) => {
                     for (kind, count) in [
                         (0xdaa, 1),
                         (0xdaf, 2),
@@ -330,6 +333,9 @@ impl World {
     }
 
     pub(super) fn encounter_death(&mut self, defeated: &Entity) -> Result<()> {
+        if crate::endgame::ROSTER.contains(&defeated.kind) {
+            return self.finale_death(defeated);
+        }
         let (kind, count) = match defeated.kind {
             0xd9b | 0xd9c => (0xd9d, 4),
             0xd9e => (0xd9f, 6),

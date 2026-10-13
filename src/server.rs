@@ -827,6 +827,10 @@ async fn connection(socket: WebSocket, mut a: App) {
                 let player = session.player.expect("guarded loaded player");
                 match automatic_transfer(&a, player).await {
                     Ok(Some(transfer)) => {
+                        if transfer.player!=player || !transfer.output.packets.same_channel(&tx) {
+                            tracing::error!(player,"automatic transfer recipient differs from owned session");
+                            break;
+                        }
                         session.player = None;
                         session.reconnecting = true;
                         session.account.take();

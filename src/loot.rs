@@ -183,16 +183,17 @@ pub fn rewards(content: &Content, kind: u16, rng: &mut impl Rng) -> Vec<u16> {
         kind,
         0x917 | 0xd06 | 0xd90 | 0xd78 | 0xd79 | crate::endgame::ORYX | crate::endgame::ORYX2
     ) {
-        table(kind)
-            .iter()
-            .filter_map(|(chance, pick)| {
-                rng.gen_bool(*chance).then(|| {
+        let mut items = Vec::new();
+        for (chance, pick) in table(kind) {
+            if rng.gen_bool(*chance) {
+                items.push(
                     *candidates(content, *pick)
                         .choose(rng)
-                        .expect("validated loot candidates")
-                })
-            })
-            .collect()
+                        .expect("validated loot candidates"),
+                );
+            }
+        }
+        items
     } else {
         roll(content, kind, rng).into_iter().collect()
     }

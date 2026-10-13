@@ -17,6 +17,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 mod chat;
 mod endgame;
+mod endgame_ai;
 pub(crate) use chat::chat_error;
 pub use endgame::ForcedTransfer;
 #[cfg(test)]
@@ -209,6 +210,7 @@ pub struct World {
     pub players: BTreeMap<i32, Player>,
     pub bullets: Vec<Bullet>,
     grenades: Vec<mechanics::Grenade>,
+    finale: endgame_ai::Actors,
     cells: Vec<BTreeSet<i32>>,
     rng: rand::rngs::StdRng,
     pub now: u64,
@@ -309,6 +311,7 @@ impl Directory {
         max_players: usize,
         seed: u64,
     ) -> Result<Self> {
+        crate::endgame::validate(&content)?;
         let mut templates = BTreeMap::new();
         for name in [
             "tutorial",
@@ -356,6 +359,7 @@ impl Directory {
             let world = d.make(template, name, safe, None)?;
             d.worlds.insert(id, world);
         }
+        d.bind_realm_heroes(-3, d.worlds[&-3].hero_identities())?;
         let nexus = d.worlds.get_mut(&-2).expect("constructed Nexus");
         let pos = nexus
             .map
@@ -391,13 +395,17 @@ impl Directory {
         world.owner = owner;
         world.max_players = self.max_players;
         world.encounter = template == "realm-shore"
+            || template == crate::endgame::CASTLE
             || crate::dungeon::DUNGEONS
                 .iter()
+                .chain(crate::endgame::DUNGEONS)
                 .any(|(_, name, _, _)| *name == template);
         if template == "realm-shore" {
             world.populate_shore()?;
             world.populate_inland()?;
+            world.populate_realm_heroes()?;
         }
+        world.prepare_endgame()?;
         if template == "sprite-world" {
             let exits: Vec<_> = world
                 .entities
@@ -910,6 +918,7 @@ impl World {
             players: BTreeMap::new(),
             bullets: Vec::new(),
             grenades: Vec::new(),
+            finale: endgame_ai::Actors::default(),
             cells,
             rng: rand::rngs::StdRng::from_entropy(),
             now: 0,
@@ -2567,7 +2576,7 @@ impl World {
         let ids: Vec<_> = self
             .entities
             .values()
-            .filter(|e| self.content.objects[&e.kind].enemy || e.kind == 0x173)
+            .filter(|e| self.content.objects[&e.kind].enemy || matches!(e.kind, 0x173 | 0xd7d))
             .map(|e| e.id)
             .collect();
         for id in ids {
@@ -2607,10 +2616,20 @@ impl World {
             let elapsed = self.now - activated;
             if let Err(error) = self.encounter_mechanics(id, target, elapsed) {
                 tracing::error!(entity=id, kind, %error, "encounter mechanic refused");
+                continue;
             }
             let flags = self.entities[&id].conditions(self.now);
-            let (motion, mut speed) =
-                crate::encounter::movement(kind, self.entities[&id].hp, elapsed);
+            let (motion, mut speed) = if crate::endgame::ROSTER.contains(&kind) {
+                match self.finale_movement(id, elapsed) {
+                    Ok(movement) => movement,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"endgame movement refused");
+                        continue;
+                    }
+                }
+            } else {
+                crate::encounter::movement(kind, self.entities[&id].hp, elapsed)
+            };
             let goal = match motion {
                 Motion::Stationary => {
                     speed = 0.;
@@ -2724,7 +2743,17 @@ impl World {
                 continue;
             }
             let heading = (target.y - e.pos.y).atan2(target.x - e.pos.x);
-            let shots = phased_attacks(kind, e.hp, heading, elapsed);
+            let shots = if crate::endgame::ROSTER.contains(&kind) {
+                match self.finale_shots(id, heading, elapsed) {
+                    Ok(shots) => shots,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"endgame projectiles refused");
+                        continue;
+                    }
+                }
+            } else {
+                phased_attacks(kind, e.hp, heading, elapsed)
+            };
             let interval = match kind {
                 0x633 if elapsed % 10000 >= 5000 => 500,
                 0x917 if !(1875..3750).contains(&e.hp) => 1000,
@@ -4343,7 +4372,13 @@ mod tests {
                 .values()
                 .filter(|e| w.content.objects[&e.kind].enemy)
                 .count(),
-            w.population.len()
+            w.population.len() + w.hero_identities().len()
+        );
+        assert_eq!(w.hero_identities().len(), 6);
+        assert!(
+            w.population
+                .iter()
+                .all(|spawn| !crate::endgame::HEROES.contains(&spawn.kind))
         );
     }
     #[test]

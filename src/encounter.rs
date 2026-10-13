@@ -136,6 +136,7 @@ pub fn profile(kind: u16) -> Option<Profile> {
             1000,
             10.,
         ),
+        kind if crate::endgame::ROSTER.contains(&kind) => return crate::endgame::profile(kind),
         _ => return None,
     };
     Some(Profile {
@@ -374,6 +375,9 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
     }
 }
 pub fn validate(content: &Content, kind: u16) -> Result<()> {
+    if crate::endgame::ROSTER.contains(&kind) {
+        return crate::endgame::validate_kind(content, kind);
+    }
     ensure!(
         profile(kind).is_some(),
         "missing encounter profile for {kind:#x}"

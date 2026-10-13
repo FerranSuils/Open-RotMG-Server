@@ -1,6 +1,6 @@
 use crate::{
-    content::{Content, Map},
-    encounter::{Motion, Profile},
+    content::Content,
+    encounter::{Anchor, Motion, Profile},
 };
 use anyhow::{Result, ensure};
 use std::{collections::BTreeSet, f32::consts::TAU};
@@ -100,9 +100,25 @@ pub fn profile(kind: u16) -> Option<Profile> {
             1000,
             10.,
         ),
-        0xd70 | 0xd71 | 0xd7a | 0xd7d | 0xdf1 => (Motion::Wander, 0., 0, 0.),
-        0xd78 | 0xd79 => (Motion::Circle, 6., 200, 20.),
-        0xd7c => (Motion::Circle, 7., 900, 12.),
+        0xd70 | 0xd71 | 0xd7a | 0xd7d | 0xdf1 => (Motion::Stationary, 0., 0, 0.),
+        0xd78 | 0xd79 => (
+            Motion::Orbit {
+                anchor: Anchor::Home,
+                radius: 3.,
+            },
+            6.,
+            200,
+            20.,
+        ),
+        0xd7c => (
+            Motion::Orbit {
+                anchor: Anchor::Parent,
+                radius: 5.,
+            },
+            7.,
+            900,
+            12.,
+        ),
         0xd7e => (
             Motion::Chase {
                 sight: 10.,
@@ -158,8 +174,8 @@ pub fn profile(kind: u16) -> Option<Profile> {
             200,
             10.,
         ),
-        0xd87 => (Motion::Wander, 0., 500, 5.),
-        ORYX => (Motion::Wander, 0., 200, 25.),
+        0xd87 => (Motion::Stationary, 0., 500, 5.),
+        ORYX => (Motion::Stationary, 0., 200, 25.),
         ORYX2 => (
             Motion::Chase {
                 sight: 25.,
@@ -169,7 +185,25 @@ pub fn profile(kind: u16) -> Option<Profile> {
             500,
             25.,
         ),
-        0x1748 | 0x174a | 0x174b => (Motion::Circle, 3., 700, 25.),
+        0x1748 => (Motion::Stationary, 0., 700, 25.),
+        0x174a => (
+            Motion::Orbit {
+                anchor: Anchor::Parent,
+                radius: 1.,
+            },
+            3.,
+            700,
+            25.,
+        ),
+        0x174b => (
+            Motion::Orbit {
+                anchor: Anchor::Parent,
+                radius: 9.,
+            },
+            3.,
+            700,
+            25.,
+        ),
         0x1749 => (
             Motion::Chase {
                 sight: 15.,
@@ -179,7 +213,7 @@ pub fn profile(kind: u16) -> Option<Profile> {
             1000,
             12.,
         ),
-        0x944 => (Motion::Circle, 2., 2500, 15.),
+        0x944 => (Motion::Wander, 2., 2500, 15.),
         0xde0 => (
             Motion::Chase {
                 sight: 12.,
@@ -190,7 +224,7 @@ pub fn profile(kind: u16) -> Option<Profile> {
             12.,
         ),
         0xde1 | 0xde3 => (Motion::Wander, 2., 0, 0.),
-        0xde4 => (Motion::Wander, 0., 1000, 3.),
+        0xde4 => (Motion::Stationary, 0., 1000, 3.),
         0xde2 => (
             Motion::Chase {
                 sight: 10.,
@@ -260,7 +294,7 @@ pub struct BossFacts {
     pub invulnerable: bool,
     pub waves: Vec<Wave>,
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct BossBrain {
     phase: Option<OryxPhase>,
     rage_at: Option<u64>,
@@ -268,6 +302,12 @@ pub struct BossBrain {
     last_elapsed: Option<u64>,
 }
 impl BossBrain {
+    pub fn phase(&self) -> Option<OryxPhase> {
+        self.phase
+    }
+    pub fn rage_elapsed(&self, elapsed: u64) -> Option<u64> {
+        self.rage_at.map(|start| elapsed - start)
+    }
     pub fn update(&mut self, kind: u16, hp: i32, max_hp: i32, elapsed: u64) -> Result<BossFacts> {
         ensure!(
             matches!(kind, ORYX | ORYX2) && hp > 0 && max_hp > 0,
@@ -331,7 +371,7 @@ impl BossBrain {
                     kind: 0x1749,
                     count: if phase == OryxPhase::Rage { 10 } else { 5 },
                     radius: 3.,
-                    lifetime: 0,
+                    lifetime: 60_000,
                 });
                 self.next_summon = elapsed + 1500;
             } else if phase == OryxPhase::Opening {
@@ -339,7 +379,7 @@ impl BossBrain {
                     kind: 0x944,
                     count: 5,
                     radius: 3.,
-                    lifetime: 0,
+                    lifetime: 60_000,
                 });
                 self.next_summon = elapsed + 5000;
             }
@@ -367,6 +407,9 @@ pub struct GuardianFacts {
     pub heal: bool,
 }
 impl GuardianBrain {
+    pub fn awaiting_sword(&self) -> Option<i32> {
+        self.sword.filter(|_| self.sword_cleared_at.is_none())
+    }
     pub fn update(&mut self, peer_alive: bool, now: u64) -> Result<GuardianFacts> {
         if peer_alive || self.sword_cleared_at.is_some_and(|t| now >= t + 1400) {
             return Ok(GuardianFacts {
@@ -506,18 +549,15 @@ pub fn attacks(kind: u16, hp: i32, max_hp: i32, heading: f32, elapsed: u64) -> V
             ),
             OryxPhase::PrepareRage | OryxPhase::Rage => unreachable!(),
         },
-        ORYX2 => {
-            let mut shots = vec![];
-            if elapsed % 1500 < 500 {
-                shots.extend(ring(0, 8, heading));
-            }
-            if elapsed % 1000 < 500 {
-                for (index, count) in [(1, 3), (2, 3), (3, 2), (4, 3), (5, 2), (6, 3)] {
-                    shots.extend(fan(index, count, 10., heading));
-                }
-            }
-            shots
-        }
+        ORYX2 => oryx2_attacks(
+            if hp <= max_hp / 5 {
+                OryxPhase::Rage
+            } else {
+                OryxPhase::Opening
+            },
+            elapsed,
+            heading,
+        ),
         0x1748 => ring(0, 12, heading),
         0x174a | 0x174b => ring((elapsed / 700 % 2) as u8, 4, heading),
         0x1749 => fan((elapsed / 1000 % 2) as u8, 3, 10., heading),
@@ -532,6 +572,55 @@ pub fn attacks(kind: u16, hp: i32, max_hp: i32, heading: f32, elapsed: u64) -> V
     }
 }
 
+pub fn oryx2_attacks(phase: OryxPhase, age: u64, heading: f32) -> Vec<(u8, f32)> {
+    if phase == OryxPhase::PrepareRage {
+        return if age >= 4000 && age % 4000 < 500 {
+            vec![(13, 0.), (14, 30f32.to_radians())]
+        } else {
+            vec![]
+        };
+    }
+    assert!(
+        matches!(phase, OryxPhase::Opening | OryxPhase::Rage),
+        "invalid Oryx2 projectile phase"
+    );
+    let mut shots = vec![];
+    if age % 1500 < 500 {
+        shots.extend(ring(0, 8, heading));
+    }
+    if age % 1000 < 500 {
+        for (index, count) in [(1, 3), (2, 3), (3, 2), (4, 3), (5, 2), (6, 3)] {
+            shots.extend(fan(index, count, 10., heading));
+        }
+    }
+    if phase == OryxPhase::Rage {
+        if (8000..8500).contains(&age) {
+            shots.push((13, heading));
+        }
+        if (8500..9000).contains(&age) {
+            shots.push((14, heading));
+        }
+    }
+    shots
+}
+pub fn validate_kind(content: &Content, kind: u16) -> Result<()> {
+    let object = content.get(kind)?;
+    ensure!(
+        profile(kind).is_some(),
+        "unselected endgame encounter {kind:#x}"
+    );
+    for hp in [object.hp, object.hp / 2, (object.hp / 10).max(1)] {
+        for elapsed in (0..110_000).step_by(100) {
+            for (index, angle) in attacks(kind, hp, object.hp, 0., elapsed) {
+                ensure!(
+                    angle.is_finite() && object.projectiles.contains_key(&index),
+                    "endgame {kind:#x} emits absent selected projectile {index}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
 pub fn summons(kind: u16) -> &'static [Wave] {
     match kind {
         0x668 => &[
@@ -539,19 +628,19 @@ pub fn summons(kind: u16) -> &'static [Wave] {
                 kind: 0x669,
                 count: 3,
                 radius: 3.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
             Wave {
                 kind: 0x66a,
                 count: 3,
                 radius: 3.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
             Wave {
                 kind: 0x66b,
                 count: 3,
                 radius: 3.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
         ],
         0x67d => &[
@@ -559,75 +648,75 @@ pub fn summons(kind: u16) -> &'static [Wave] {
                 kind: 0x67e,
                 count: 3,
                 radius: 3.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
             Wave {
                 kind: 0x67f,
                 count: 3,
                 radius: 3.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
             Wave {
                 kind: 0x680,
                 count: 3,
                 radius: 3.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
             Wave {
                 kind: 0x681,
                 count: 3,
                 radius: 3.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
             Wave {
                 kind: 0x682,
                 count: 3,
                 radius: 3.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
         ],
         0xd7d => &[Wave {
             kind: 0xd7e,
             count: 1,
             radius: 1.,
-            lifetime: 0,
+            lifetime: 60_000,
         }],
         0xd7f => &[Wave {
             kind: 0xd80,
             count: 20,
             radius: 3.,
-            lifetime: 0,
+            lifetime: 60_000,
         }],
         0xd82 => &[Wave {
             kind: 0xd81,
             count: 4,
             radius: 3.,
-            lifetime: 0,
+            lifetime: 60_000,
         }],
         0x944 => &[
             Wave {
                 kind: 0xdf2,
                 count: 1,
                 radius: 2.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
             Wave {
                 kind: 0xde0,
                 count: 1,
                 radius: 2.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
             Wave {
                 kind: 0xde1,
                 count: 1,
                 radius: 2.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
             Wave {
                 kind: 0xde3,
                 count: 1,
                 radius: 2.,
-                lifetime: 0,
+                lifetime: 60_000,
             },
         ],
         0xde1 => &[Wave {
@@ -660,8 +749,8 @@ pub(crate) fn loot(kind: u16) -> &'static [(f64, crate::loot::Pick)] {
             (0.01, Item(0xa21)),
             (0.01, Item(0xa1f)),
         ],
-        0xd78 => &[(1., Item(0xa20))],
-        0xd79 => &[(1., Item(0xa20)), (0.003, Item(0xc05))],
+        0xd78 => &[(1., Item(0xa20)), (0.003, Item(0xc05))],
+        0xd79 => &[(1., Item(0xa20))],
         ORYX => &[
             (0.3, Item(0xa1f)),
             (0.3, Item(0xa20)),
@@ -711,6 +800,18 @@ pub(crate) fn loot(kind: u16) -> &'static [(f64, crate::loot::Pick)] {
     }
 }
 pub fn validate(content: &Content) -> Result<()> {
+    for (kind, hp, defense) in [
+        (ORYX, 85_000, 60),
+        (ORYX2, 75_000, 60),
+        (0xd78, 60_000, 100),
+        (0xd79, 60_000, 100),
+    ] {
+        let o = content.get(kind)?;
+        ensure!(
+            o.hp == hp && o.defense == defense,
+            "selected endgame strength changed for {kind:#x}"
+        );
+    }
     for kind in HEROES {
         ensure!(
             content.get(kind)?.quest,
@@ -719,7 +820,7 @@ pub fn validate(content: &Content) -> Result<()> {
     }
     for kind in ROSTER {
         crate::loot::validate(content, *kind)?;
-        let object = content.get(*kind)?;
+        validate_kind(content, *kind)?;
         for wave in summons(*kind) {
             ensure!(
                 wave.count > 0 && wave.count <= 20 && wave.radius.is_finite() && wave.radius > 0.,
@@ -730,20 +831,6 @@ pub fn validate(content: &Content) -> Result<()> {
                 "unhandled summon {:#x}",
                 wave.kind
             );
-        }
-        ensure!(
-            profile(*kind).is_some(),
-            "endgame object {kind:#x} has no selected AI"
-        );
-        for elapsed in (0..110_000).step_by(100) {
-            for hp in [object.hp, (object.hp / 10).max(1)] {
-                for (index, angle) in attacks(*kind, hp, object.hp, 0., elapsed) {
-                    ensure!(
-                        angle.is_finite() && object.projectiles.contains_key(&index),
-                        "endgame object {kind:#x} emits unsupported projectile {index}"
-                    );
-                }
-            }
         }
     }
     for kind in [LOCKED_CELLAR, 0x700, 0xd7b] {
@@ -763,6 +850,7 @@ pub fn validate(content: &Content) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::Map;
     use std::{
         collections::{BTreeMap, VecDeque},
         path::Path,
@@ -899,13 +987,13 @@ mod tests {
                 assert_eq!(counts[&0x944], 44);
             }
             for cell in &map.cells {
-                if let Some(kind) = cell.object {
-                    if content.objects[&kind].enemy {
-                        assert!(
-                            profile(kind).is_some(),
-                            "{template} contains unhandled enemy {kind:#x}"
-                        );
-                    }
+                if let Some(kind) = cell.object
+                    && content.objects[&kind].enemy
+                {
+                    assert!(
+                        profile(kind).is_some(),
+                        "{template} contains unhandled enemy {kind:#x}"
+                    );
                 }
             }
             let (x, y) = map.spawns[0];
