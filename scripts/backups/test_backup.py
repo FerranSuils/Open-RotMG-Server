@@ -295,7 +295,7 @@ INSERT INTO password_resets VALUES(1,'NEVER_EXPORT_RESET_TOKEN_HASH',100,1000);"
         self.add_latest_state()
         with closing(sqlite3.connect(self.game)) as db, db:
             db.execute('CREATE TABLE shore_bots(name TEXT PRIMARY KEY,account INTEGER NOT NULL UNIQUE REFERENCES accounts(id))')
-            for account, name in enumerate(['Cautious', 'Confident', 'Greedy'], 2):
+            for account, name in enumerate(['Cautious', 'Confident', 'Greedy', 'Healer', 'Leader', 'Social'], 2):
                 db.execute('INSERT INTO accounts VALUES(?,?,?)', (account, f'BOT_LOGIN_MUST_NEVER_BE_UPLOADED_{account}', name))
                 db.execute('INSERT INTO shore_bots VALUES(?,?)', (name, account))
                 stats = dict(self.stats, id=account, account=account, name=name, alive=account != 2,
@@ -311,7 +311,8 @@ INSERT INTO password_resets VALUES(1,'NEVER_EXPORT_RESET_TOKEN_HASH',100,1000);"
         before = self.export()
         self.assertEqual(before['schema'], 3)
         self.assertEqual(before['game']['shore_bots'], [{'name': name, 'account': account}
-                         for name, account in [('Cautious', 2), ('Confident', 3), ('Greedy', 4)]])
+                         for name, account in [('Cautious', 2), ('Confident', 3), ('Greedy', 4),
+                                               ('Healer', 5), ('Leader', 6), ('Social', 7)]])
         raw = gzip.decompress(self.output.read_bytes())
         for credential in [b'GUEST_LOGIN_MUST_NEVER_BE_UPLOADED', b'BOT_LOGIN_MUST_NEVER_BE_UPLOADED', b'"guid"']:
             self.assertNotIn(credential, raw)
@@ -321,7 +322,7 @@ INSERT INTO password_resets VALUES(1,'NEVER_EXPORT_RESET_TOKEN_HASH',100,1000);"
         self.assertEqual(backup.snapshot(restored / 'game.db', backup.SHORE_GAME), before['game'])
         self.assertEqual(backup.snapshot(restored / 'levels.sqlite', backup.DISCORD), before['discord'])
         with closing(sqlite3.connect(restored / 'game.db')) as db:
-            self.assertEqual(db.execute('SELECT guid FROM accounts ORDER BY id').fetchall(), [(None,)] * 4)
+            self.assertEqual(db.execute('SELECT guid FROM accounts ORDER BY id').fetchall(), [(None,)] * 7)
             self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
             self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
             db.execute('PRAGMA foreign_keys=ON')

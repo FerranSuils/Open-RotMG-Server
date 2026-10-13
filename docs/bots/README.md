@@ -1,14 +1,18 @@
 # Gameplay bots: vision and research
 
-The user approved the autonomous Wizard shore prototype, its gameplay PR and production deployment. Further population slices remain unselected.
+The user approved the autonomous Wizard shore prototype and its production deployment, then selected a combined combat and cooperative Priest-adventuring extension. That extension is being verified locally; it has no merge or deployment approval.
 
 The two video reports record observations and limits; `research/decision-spike.md` records the earlier offline experiment.
 
-## Local shore prototype
+## Local autonomous crews
 
-Run `./run.sh 18923 --shore-bots --release`, then enter the Realm through its normal portal. Bayleaf prioritizes recovery, Mossy resources and Trellis companions. They start with ordinary Wizard equipment, use the restricted player view, earn XP and accessible loot, and save through ordinary inventory/progression rules. Native local chat `Trellis follow me` requests following while the sender is visible; it does not reveal a hidden position.
+Run `./run.sh 18923 --shore-bots --release`, then enter the Realm normally. Mossy leads Bayleaf/Trellis; Reed leads Juniper/Bramble. Profiles weigh recovery, resources and companions differently. They use restricted observations and ordinary movement, combat, inventory, XP, teleport and transfer rules. Uninvited humans are not permanent anchors. Native local chat `Trellis follow me` requests a temporary follow while the sender is visible.
 
-This flag is default-off and separate from QA control. Hosting can explicitly set `shore_bots: true` with capacity for three bots plus humans; production QA controls remain prohibited. Human, QA and autonomous ownership/counts are distinct. Saved bot accounts resume their committed character; a dead character stays retired. There is no automatic replacement, trade negotiation, dungeon routing or language service. The candidate shore and passing mechanical tests do not establish historical authenticity or the complete community vision.
+Wizards predict visible projectile paths, lead an observed target, kite within weapon range, cast equipped spells and commit to recovery. Crews remember recent contacts, revisit observed hunting grounds after quiet exploration and respond to observed Pirate Cave calls. Priests cast equipped tomes for actual nearby injury, MP and accepted cooldowns.
+
+The flag remains default-off and separate from QA control. Reserve at least seven slots for six bots and a human. Living saves resume unchanged. After committed permanent death, a fresh character receives normal starter gear; Bayleaf/Juniper choose Priest only if that same account earned its Wizard-level-five unlock. Dead inventory is never inherited. Trade negotiation and language services remain outside this slice.
+
+Verification is incomplete: mechanical combat/social/lifecycle tests and exact six-character restart checks pass, native Wizard crews are visible, and ordinary bot regrouping and earned cave entry/clear/return are confirmed in runtime and committed-save receipts across three seeds. A sustained run exposed a cover-orbit deadlock; the firing-lane approach regression and subsequent ordinary outings pass. Earned Priest healing, natural rebuilding, comparative behavior acceptance and the finished demo remain unverified. Fixtures are not earned-gameplay evidence. Neither passing tests nor the candidate Realm establishes historical authenticity or the complete community vision.
 
 ## Approved north star
 
@@ -100,4 +104,4 @@ Two bounded local checks passed: the ten existing world boundary tests, and a co
 1. Should the first proof emphasize believable combat, or include a small meaningful chat/group interaction immediately? Recommendation: combat plus one interaction, not sophisticated banter.
 2. Should the initial population start with mixed progression/gear or earn everything from starter characters? Recommendation: starter characters for the prototype; decide any one-time population seeding before trading is enabled.
 
-The selected shore slice does not approve further population phases. Revisit the shared gameplay dependencies before expanding it.
+The selected cooperative extension does not approve the remaining population phases. Revisit shared gameplay dependencies before expanding it.

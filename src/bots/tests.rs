@@ -1,4 +1,5 @@
 use super::*;
+use crate::content::WIZARD;
 use crate::world::view::{
     Lifecycle, MapInfo, OwnCharacter, Session, Tile, VisibleObject, VisibleProjectile,
 };
@@ -36,6 +37,8 @@ fn view(content: &Content) -> PlayerView {
             stats: [100, 100, 12, 0, 10, 15, 12, 12],
             items: class.equipment.clone(),
             inventory_revision: 0,
+            pirate_caves: 0,
+            ability_ready_ms: 0,
         },
         lifecycle: Lifecycle {
             alive: true,
@@ -66,6 +69,7 @@ fn object(id: i32, kind: u16, x: f32, y: f32) -> VisibleObject {
         name: String::new(),
         position: Pos { x, y },
         hp: 100,
+        max_hp: 100,
         equipped: vec![],
         contents: vec![],
         blocks: false,
@@ -91,7 +95,7 @@ fn same_observation_produces_resource_recovery_and_companion_choices() {
     ally.name = "Mossy".into();
     ally.equipped = vec![0xa97];
     v.objects.push(ally);
-    let goals: Vec<_> = PROFILES
+    let goals: Vec<_> = PROFILES[..3]
         .iter()
         .map(|p| Brain::new(*p, &v).decide(&v, &content).unwrap().goal)
         .collect();
@@ -193,7 +197,8 @@ fn held_resources_compatible_upgrades_and_margin_survive_seeded_replay() {
     }
     let enemy = content.objects.values().find(|o| o.enemy).unwrap().kind;
     v.objects = vec![object(2, enemy, 18.5, 11.5), object(3, enemy, 17.5, 11.5)];
-    v.tick += 1;
+    v.tick = 200;
+    v.time_ms = 10000;
     left.goal = Goal::Fight(2);
     assert_eq!(left.decide(&v, &content).unwrap().goal, Goal::Fight(2));
 }
@@ -219,4 +224,360 @@ fn only_addressed_native_chat_changes_companion_memory() {
     assert!(brain.companion.is_none());
     assert!(brain.receive(packet("Trellis follow me"), &v).unwrap());
     assert_eq!(brain.companion, Some(9));
+}
+
+#[test]
+fn selected_target_controls_aim_and_equipped_spell_cooldown() {
+    let content = content();
+    let mut v = view(&content);
+    let enemy = content.objects.values().find(|o| o.enemy).unwrap().kind;
+    v.objects = vec![object(2, enemy, 15.5, 11.5), object(3, enemy, 11.5, 14.5)];
+    v.objects[0].hp = 1000;
+    let mut brain = Brain::new(PROFILES[1], &v);
+    brain.goal = Goal::Fight(2);
+    let first = brain.decide(&v, &content).unwrap();
+    assert_eq!(first.goal, Goal::Fight(2));
+    assert!(first.aim.unwrap().abs() < 0.01);
+    assert!(matches!(first.item, Some(Action::Use { slot: 1, x, y }) if x == 15.5 && y == 11.5));
+    v.character.ability_ready_ms = v.time_ms
+        + content
+            .get(v.character.items[1] as u16)
+            .unwrap()
+            .cooldown_ms;
+    v.tick += 4;
+    v.time_ms += 200;
+    assert!(brain.decide(&v, &content).unwrap().item.is_none());
+    v.tick += 20;
+    v.time_ms += 1000;
+    v.character.mp = 0;
+    assert!(brain.decide(&v, &content).unwrap().item.is_none());
+}
+
+#[test]
+fn kites_from_close_targets_and_does_not_fire_through_known_cover() {
+    let content = content();
+    let mut v = view(&content);
+    let enemy = content.objects.values().find(|o| o.enemy).unwrap().kind;
+    v.objects.push(object(2, enemy, 13.5, 11.5));
+    let mut brain = Brain::new(PROFILES[1], &v);
+    let decision = brain.decide(&v, &content).unwrap();
+    assert_eq!(decision.goal, Goal::Fight(2));
+    assert!(decision.movement.unwrap().distance(v.objects[0].position) > 2.);
+    let mut wall = object(9, WIZARD, 12.5, 11.5);
+    wall.blocks = true;
+    v.objects.push(wall);
+    v.tick += 4;
+    v.time_ms += 200;
+    let blocked = brain.decide(&v, &content).unwrap();
+    assert!(blocked.aim.is_none());
+    assert!(blocked.item.is_none());
+    assert!(blocked.movement.is_some());
+    let mut path = blocked;
+    for _ in 0..8 {
+        brain.goal = path.goal.clone();
+        v.position = path
+            .movement
+            .expect("blocked target needs an approach route");
+        v.tick += 4;
+        v.time_ms += 200;
+        path = brain.decide(&v, &content).unwrap();
+        if path.aim.is_some() {
+            break;
+        }
+    }
+    assert!(
+        path.aim.is_some(),
+        "must reach a firing lane instead of orbiting behind cover"
+    );
+}
+
+#[test]
+fn observed_motion_leads_aim_and_recovery_has_a_release_threshold() {
+    let content = content();
+    let mut v = view(&content);
+    let enemy = content.objects.values().find(|o| o.enemy).unwrap().kind;
+    v.objects.push(object(2, enemy, 15.5, 11.5));
+    let mut brain = Brain::new(PROFILES[0], &v);
+    brain.decide(&v, &content).unwrap();
+    v.tick += 6;
+    v.time_ms += 300;
+    v.objects[0].position.y += 0.6;
+    assert!(
+        brain.decide(&v, &content).unwrap().aim.unwrap() > angle(v.position, v.objects[0].position)
+    );
+    v.tick += 6;
+    v.time_ms += 300;
+    v.character.hp = 50;
+    let recovery = brain.decide(&v, &content).unwrap();
+    assert_eq!(recovery.goal, Goal::Recover);
+    assert!(recovery.aim.is_none());
+    brain.goal = recovery.goal;
+    v.tick += 100;
+    v.time_ms += 5000;
+    v.character.hp = 65;
+    assert_eq!(brain.decide(&v, &content).unwrap().goal, Goal::Recover);
+    v.tick += 6;
+    v.time_ms += 300;
+    v.character.hp = 90;
+    assert_eq!(brain.decide(&v, &content).unwrap().goal, Goal::Fight(2));
+}
+
+#[test]
+fn dodge_scores_the_swept_player_path_not_only_the_endpoint() {
+    let content = content();
+    let mut v = view(&content);
+    v.projectiles.push(VisibleProjectile {
+        owner: 9,
+        id: 0,
+        start: Pos { x: 12.125, y: 10. },
+        position: Pos { x: 12.125, y: 10. },
+        angle: std::f32::consts::FRAC_PI_2,
+        speed: 100.,
+        lifetime_ms: 1000.,
+        amplitude: 0.,
+        frequency: 0.,
+        passes_cover: false,
+    });
+    let crossing = Pos { x: 12.75, y: 11.5 };
+    let away = Pos { x: 10.25, y: 11.5 };
+    assert!(combat::clearance(&v, crossing) < 0.2);
+    assert!(combat::clearance(&v, away) > 0.6);
+}
+
+#[test]
+fn cohorts_choose_distinct_observed_leaders_not_an_uninvited_human() {
+    let content = content();
+    let mut v = view(&content);
+    for (id, name, x, y) in [
+        (2, "Mossy", 21.5, 11.5),
+        (3, "Reed", 11.5, 21.5),
+        (4, "Human", 10.5, 11.5),
+    ] {
+        let mut peer = object(id, WIZARD, x, y);
+        peer.name = name.into();
+        peer.equipped = v.character.items[..4].to_vec();
+        v.objects.push(peer);
+    }
+    assert_eq!(
+        Brain::new(PROFILES[2], &v)
+            .decide(&v, &content)
+            .unwrap()
+            .goal,
+        Goal::Follow(2)
+    );
+    assert_eq!(
+        Brain::new(PROFILES[3], &v)
+            .decide(&v, &content)
+            .unwrap()
+            .goal,
+        Goal::Follow(3)
+    );
+    v.objects.retain(|o| o.name != "Mossy");
+    assert!(matches!(
+        Brain::new(PROFILES[1], &v)
+            .decide(&v, &content)
+            .unwrap()
+            .goal,
+        Goal::Explore(..)
+    ));
+}
+
+#[test]
+fn priest_heals_actual_public_injury_and_respects_range_mana_and_cooldown() {
+    let content = content();
+    let mut v = view(&content);
+    v.character.class = crate::content::PRIEST;
+    v.character.items = content.get(v.character.class).unwrap().equipment.clone();
+    let mut peer = object(2, WIZARD, 12.5, 11.5);
+    peer.equipped = vec![0xa97];
+    peer.name = "Mossy".into();
+    v.objects.push(peer);
+    let mut brain = Brain::new(PROFILES[0], &v);
+    assert!(brain.decide(&v, &content).unwrap().item.is_none());
+    v.tick += 6;
+    v.time_ms += 300;
+    v.objects[0].hp = 40;
+    assert!(matches!(
+        brain.decide(&v, &content).unwrap().item,
+        Some(Action::Use { slot: 1, .. })
+    ));
+    v.character.ability_ready_ms = v.time_ms
+        + content
+            .get(v.character.items[1] as u16)
+            .unwrap()
+            .cooldown_ms;
+    v.tick += 6;
+    v.time_ms += 300;
+    assert!(brain.decide(&v, &content).unwrap().item.is_none());
+    v.tick += 100;
+    v.time_ms += 5000;
+    v.character.mp = 0;
+    assert!(brain.decide(&v, &content).unwrap().item.is_none());
+    v.tick += 6;
+    v.time_ms += 300;
+    v.character.mp = 100;
+    v.objects[0].position.x = 25.5;
+    assert!(brain.decide(&v, &content).unwrap().item.is_none());
+}
+
+#[test]
+fn leader_waits_for_a_real_straggler_and_invitation_expires() {
+    let content = content();
+    let mut v = view(&content);
+    let mut peer = object(2, WIZARD, 23.5, 11.5);
+    peer.name = "Trellis".into();
+    peer.equipped = v.character.items[..4].to_vec();
+    v.objects.push(peer);
+    let d = Brain::new(PROFILES[1], &v).decide(&v, &content).unwrap();
+    assert_eq!(d.goal, Goal::Gather(2));
+    assert!(d.movement.is_none());
+    let mut brain = Brain::new(PROFILES[0], &v);
+    brain.companion = Some(2);
+    brain.invitation_until = v.time_ms;
+    brain.decide(&v, &content).unwrap();
+    assert!(brain.companion.is_none());
+}
+
+#[test]
+fn regroup_requests_only_a_visible_healthy_peer_and_is_paced() {
+    let content = content();
+    let mut v = view(&content);
+    let mut leader = object(2, WIZARD, 21.5, 11.5);
+    leader.name = "Mossy".into();
+    leader.equipped = v.character.items[..4].to_vec();
+    v.objects.push(leader);
+    let mut brain = Brain::new(PROFILES[2], &v);
+    assert!(matches!(
+        brain.decide(&v, &content).unwrap().journey,
+        Some(Journey::Regroup(2))
+    ));
+    v.tick += 5;
+    v.time_ms += 250;
+    assert!(brain.decide(&v, &content).unwrap().journey.is_none());
+    v.tick += 300;
+    v.time_ms += 15000;
+    v.objects[0].hp = 40;
+    assert!(brain.decide(&v, &content).unwrap().journey.is_none());
+    v.tick += 5;
+    v.time_ms += 250;
+    v.objects.clear();
+    assert!(brain.decide(&v, &content).unwrap().journey.is_none());
+}
+
+#[test]
+fn earned_portal_call_and_committed_cave_clear_drive_normal_transfers() {
+    let content = content();
+    let mut v = view(&content);
+    v.character.level = 2;
+    for (id, name) in [(2, "Bayleaf"), (3, "Trellis")] {
+        let mut member = object(id, WIZARD, 12.5, 11.5);
+        member.name = name.into();
+        member.equipped = v.character.items[..4].to_vec();
+        v.objects.push(member);
+    }
+    v.objects.push(object(4, 0x717, 12.5, 11.5));
+    let leader = Brain::new(PROFILES[1], &v).decide(&v, &content).unwrap();
+    assert_eq!(leader.goal, Goal::Portal(4));
+    assert_eq!(leader.chat, Some("pc here"));
+    assert!(matches!(leader.journey, Some(Journey::Portal(4))));
+    v.objects[0].name = "Mossy".into();
+    v.objects.remove(1);
+    let mut follower = Brain::new(PROFILES[2], &v);
+    follower.decide(&v, &content).unwrap();
+    let mut out = crate::wire::Writer::new();
+    out.utf("Mossy")
+        .i32(2)
+        .i32(0)
+        .u8(5)
+        .utf("")
+        .utf("pc here")
+        .utf("");
+    follower
+        .receive(
+            Packet {
+                id: wire::TEXT,
+                body: out.0,
+            },
+            &v,
+        )
+        .unwrap();
+    v.objects.remove(0);
+    v.tick += 5;
+    v.time_ms += 250;
+    assert!(matches!(
+        follower.decide(&v, &content).unwrap().journey,
+        Some(Journey::Portal(4))
+    ));
+    v.map.name = "Pirate Cave".into();
+    v.objects[0].kind = 0x71d;
+    let mut cave = Brain::new(PROFILES[2], &v);
+    assert!(cave.decide(&v, &content).unwrap().journey.is_none());
+    v.tick += 5;
+    v.time_ms += 250;
+    v.character.pirate_caves += 1;
+    assert!(matches!(
+        cave.decide(&v, &content).unwrap().journey,
+        Some(Journey::Portal(4))
+    ));
+}
+
+#[test]
+fn quiet_exploration_revisits_only_an_actually_observed_hunting_ground() {
+    let content = content();
+    let mut v = view(&content);
+    let enemy = content.objects.values().find(|o| o.enemy).unwrap().kind;
+    v.objects.push(object(2, enemy, 15.5, 11.5));
+    let mut brain = Brain::new(PROFILES[1], &v);
+    brain.decide(&v, &content).unwrap();
+    v.objects.clear();
+    v.position.x = 25.5;
+    v.tick += 700;
+    v.time_ms += 35000;
+    assert_eq!(
+        brain.decide(&v, &content).unwrap().goal,
+        Goal::Revisit(15, 11)
+    );
+    v.tick += 4;
+    v.time_ms += 200;
+    let fresh = Brain::new(PROFILES[1], &v).decide(&v, &content).unwrap();
+    assert!(matches!(fresh.goal, Goal::Explore(..)));
+}
+
+#[test]
+fn crews_search_recent_observed_contacts_without_teleporting_to_hidden_peers() {
+    let content = content();
+    let mut v = view(&content);
+    let mut peer = object(2, WIZARD, 19.5, 11.5);
+    peer.name = "Mossy".into();
+    peer.equipped = v.character.items[..4].to_vec();
+    v.objects.push(peer);
+    let mut follower = Brain::new(PROFILES[2], &v);
+    follower.decide(&v, &content).unwrap();
+    v.objects.clear();
+    v.tick += 5;
+    v.time_ms += 250;
+    let search = follower.decide(&v, &content).unwrap();
+    assert_eq!(search.goal, Goal::Follow(2));
+    assert!(search.movement.is_some());
+    assert!(search.journey.is_none());
+    v.tick += 300;
+    v.time_ms += 15000;
+    assert!(matches!(
+        follower.decide(&v, &content).unwrap().goal,
+        Goal::Explore(..)
+    ));
+
+    let mut peer = object(2, WIZARD, 19.5, 11.5);
+    peer.name = "Trellis".into();
+    peer.equipped = v.character.items[..4].to_vec();
+    v.objects.push(peer);
+    let mut leader = Brain::new(PROFILES[1], &v);
+    leader.decide(&v, &content).unwrap();
+    v.objects.clear();
+    v.position.x = 25.5;
+    v.tick += 4;
+    v.time_ms += 200;
+    let search = leader.decide(&v, &content).unwrap();
+    assert_eq!(search.goal, Goal::Gather(2));
+    assert!(search.movement.is_some());
 }
