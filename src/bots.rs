@@ -185,7 +185,14 @@ impl Brain {
         r.done()?;
         if actor > 0 && actor != self.session.1 && recipient.is_empty() {
             let leader = self.profile.name == self.profile.leader;
-            if (!leader && name == self.profile.leader && text == "tp here")
+            if (!leader
+                && name == self.profile.leader
+                && text == "tp here"
+                && self.next_call > view.time_ms
+                && self.companion.is_none()
+                && self
+                    .leader_seen
+                    .is_none_or(|(_, _, seen)| view.time_ms.saturating_sub(seen) >= 10000))
                 || (leader
                     && text == "tp?"
                     && PROFILES

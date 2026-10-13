@@ -297,13 +297,33 @@ fn fresh_crewmate_rejoins_through_scoped_expiring_public_chat() {
         .unwrap();
     v.tick += 5;
     assert!(follower.decide(&v, &content).unwrap().journey.is_none());
+    let mut unsolicited = Brain::new(PROFILES[2], &v);
+    unsolicited
+        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .unwrap();
+    assert!(unsolicited.regroup_call.is_none());
+    let mut occupied = Brain::new(PROFILES[2], &v);
+    occupied.next_call = v.time_ms + 10000;
+    occupied.companion = Some(9);
+    occupied
+        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .unwrap();
+    assert!(occupied.regroup_call.is_none());
+    occupied.companion = None;
+    occupied.leader_seen = Some((2, v.position, v.time_ms));
+    occupied
+        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .unwrap();
+    assert!(occupied.regroup_call.is_none());
     let mut expired = Brain::new(PROFILES[2], &v);
+    expired.next_call = v.time_ms + 10000;
     expired
         .receive(packet("Mossy", 2, "", "tp here"), &v)
         .unwrap();
     v.time_ms += 5001;
     assert!(expired.decide(&v, &content).unwrap().journey.is_none());
     let mut injured = Brain::new(PROFILES[2], &v);
+    injured.next_call = v.time_ms + 10000;
     injured
         .receive(packet("Mossy", 2, "", "tp here"), &v)
         .unwrap();
