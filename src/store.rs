@@ -706,6 +706,103 @@ mod tests {
         assert!(s.consume_stat(ch, 4, 4, 1).await.is_err());
     }
     #[tokio::test]
+    async fn permanent_potion_conflicts_with_trade_and_vault_without_duplication() {
+        let content = Content::load(Path::new("data")).unwrap();
+        let s = Store::open(Path::new(":memory:"), &content).unwrap();
+        for (index, kind) in [(4, 0xa21), (5, 0xa4c), (7, 0xa35)] {
+            for vault_exchange in [false, true] {
+                for potion_first in [false, true] {
+                    let guid = format!("potion-race-{index}-{vault_exchange}-{potion_first}");
+                    let owner = s.list(guid.clone()).await.unwrap();
+                    let recipient = s.list(format!("{guid}-recipient")).await.unwrap();
+                    let mut source = s
+                        .create(owner.id, content.get(WIZARD).unwrap())
+                        .await
+                        .unwrap();
+                    let target = s
+                        .create(recipient.id, content.get(WIZARD).unwrap())
+                        .await
+                        .unwrap();
+                    source.items[4] = kind;
+                    source.revision = s
+                        .exchange(
+                            vec![InventoryWrite {
+                                id: source.id,
+                                account: source.account,
+                                revision: source.revision,
+                                items: source.items.clone(),
+                            }],
+                            None,
+                        )
+                        .await
+                        .unwrap()[0];
+                    let mut remaining = source.items.clone();
+                    remaining[4] = -1;
+                    let mut writes = vec![InventoryWrite {
+                        id: source.id,
+                        account: source.account,
+                        revision: source.revision,
+                        items: remaining,
+                    }];
+                    let vault = if vault_exchange {
+                        let mut vault = s.vault(owner.id).await.unwrap();
+                        vault.items[0] = kind;
+                        Some(vault)
+                    } else {
+                        let mut items = target.items.clone();
+                        items[4] = kind;
+                        writes.push(InventoryWrite {
+                            id: target.id,
+                            account: target.account,
+                            revision: target.revision,
+                            items,
+                        });
+                        None
+                    };
+                    if potion_first {
+                        s.consume_stat(source.clone(), 4, index, 1).await.unwrap();
+                        assert!(s.exchange(writes, vault).await.is_err());
+                    } else {
+                        s.exchange(writes, vault).await.unwrap();
+                        assert!(s.consume_stat(source.clone(), 4, index, 1).await.is_err());
+                    }
+                    let saved = s.load(owner.id, source.id).await.unwrap();
+                    let other = s.load(recipient.id, target.id).await.unwrap();
+                    let chest = s.vault(owner.id).await.unwrap();
+                    assert_eq!(
+                        saved.base[index],
+                        source.base[index] + i32::from(potion_first)
+                    );
+                    assert_eq!(saved.items[4], -1);
+                    let count = saved
+                        .items
+                        .iter()
+                        .chain(&other.items)
+                        .chain(&chest.items)
+                        .filter(|&&item| item == kind)
+                        .count();
+                    assert_eq!(count, usize::from(!potion_first));
+                    assert_eq!(
+                        other.items[4],
+                        if !potion_first && !vault_exchange {
+                            kind
+                        } else {
+                            target.items[4]
+                        }
+                    );
+                    assert_eq!(
+                        chest.items[0],
+                        if !potion_first && vault_exchange {
+                            kind
+                        } else {
+                            -1
+                        }
+                    );
+                }
+            }
+        }
+    }
+    #[tokio::test]
     async fn cooperative_progress_batch_rolls_back_every_stale_participant() {
         let content = Content::load(Path::new("data")).unwrap();
         let s = Store::open(Path::new(":memory:"), &content).unwrap();
