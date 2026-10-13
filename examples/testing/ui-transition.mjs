@@ -14,30 +14,32 @@ export async function exampleNexusReturn(call, serverLog, character) {
   if (!initial || typeof initial.fields.world !== 'string' || initial.fields.world === 'Nexus') {
     throw new Error('Start this example with the owned character in a non-Nexus world');
   }
-  const bounds = await call('Runtime.evaluate', {
-    expression: `JSON.stringify((() => {
-      const player = document.querySelector('ruffle-player');
-      if (!player) throw Error('Ruffle game not found');
-      if (document.hidden || !document.hasFocus() || document.activeElement !== player)
-        throw Error('Focus the owned Ruffle game before dispatching input');
-      const r = player.getBoundingClientRect();
-      if (r.width <= 0 || r.height <= 0 || r.left < 0 || r.top < 0 || r.right > innerWidth || r.bottom > innerHeight)
-        throw Error('Game lies outside input viewport');
-      return {x:r.x, y:r.y, width:r.width, height:r.height, scale:1};
-    })())`, returnByValue: true,
-  });
-  if (bounds.exceptionDetails) throw new Error(JSON.stringify(bounds.exceptionDetails));
-  const clip = JSON.parse(bounds.result.value);
   const key = { key: 'Insert', code: 'Insert', windowsVirtualKeyCode: 45 };
   let failure;
   try {
+    // CDP page focus and DOM focus do not activate the user's desktop window.
+    await call('Emulation.setFocusEmulationEnabled', {enabled:true});
+    const bounds = await call('Runtime.evaluate', {
+      expression: `JSON.stringify((() => {
+        const player = document.querySelector('ruffle-player');
+        if (!player) throw Error('Ruffle game not found');
+        player.focus({preventScroll:true});
+        if (document.hidden || !document.hasFocus() || document.activeElement !== player)
+          throw Error('Owned Ruffle game did not acquire page-local focus; use an isolated display');
+        const r = player.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0 || r.left < 0 || r.top < 0 || r.right > innerWidth || r.bottom > innerHeight)
+          throw Error('Game lies outside input viewport');
+        return {x:r.x, y:r.y, width:r.width, height:r.height, scale:1};
+      })())`, returnByValue: true,
+    });
+    if (bounds.exceptionDetails) throw new Error(JSON.stringify(bounds.exceptionDetails));
+    const clip = JSON.parse(bounds.result.value);
     await call('Input.dispatchKeyEvent', { type: 'keyDown', ...key });
     await call('Page.captureScreenshot', {format:'png', clip});
     await wait(80);
     await call('Input.dispatchKeyEvent', { type: 'keyUp', ...key });
     const deadline = Date.now() + 30000;
     while (Date.now() < deadline) {
-      // Reading the actual game frame also keeps hidden QA windows advancing.
       await call('Page.captureScreenshot', {format:'png', clip});
       const current = await readFile(serverLog, 'utf8');
       if (!current.startsWith(before)) throw new Error('Server log rotated during the transition');
@@ -54,11 +56,16 @@ export async function exampleNexusReturn(call, serverLog, character) {
     failure = error;
     throw error;
   } finally {
-    try {
-      await call('Input.dispatchKeyEvent', { type: 'keyUp', ...key });
-    } catch (cleanup) {
-      if (!failure) throw cleanup;
-      console.error('Key release also failed; original transition error retained:', cleanup);
+    const cleanupErrors = [];
+    for (const [method, params] of [
+      ['Input.dispatchKeyEvent', {type:'keyUp', ...key}],
+      ['Emulation.setFocusEmulationEnabled', {enabled:false}],
+    ]) {
+      try { await call(method, params); } catch (error) { cleanupErrors.push(error); }
+    }
+    if (cleanupErrors.length) {
+      if (!failure) throw new AggregateError(cleanupErrors, 'Native input cleanup failed');
+      console.error('Native input cleanup also failed; original transition error retained:', cleanupErrors);
     }
   }
 }
