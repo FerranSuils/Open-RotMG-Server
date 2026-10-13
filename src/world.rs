@@ -1409,6 +1409,23 @@ impl World {
             .context("movement server clock regressed")?;
         let credit = (p.movement_credit + speed * server_elapsed as f32).min(speed * 350. + 0.3);
         let charged = input_distance((server_elapsed as f32).min(350.));
+        tracing::debug!(
+            player = id,
+            client_time = time,
+            received,
+            ground = cell.ground,
+            speed,
+            client_elapsed_ms = elapsed,
+            server_elapsed_ms = server_elapsed,
+            previous_credit = p.movement_credit,
+            credit,
+            charged,
+            from_x = p.pos.x,
+            from_y = p.pos.y,
+            to_x = pos.x,
+            to_y = pos.y,
+            "native motion budget"
+        );
         ensure!(
             charged <= credit + 0.001,
             "movement exceeds server time budget: distance={distance} credit={credit} server_elapsed_ms={server_elapsed} client_elapsed_ms={elapsed} previous_credit={}",
@@ -1427,9 +1444,31 @@ impl World {
         );
         Ok(credit - charged)
     }
+    #[cfg(test)]
     pub fn native_move_to(&mut self, id: i32, pos: Pos, time: i32) -> Result<()> {
         // Skipped simulation ticks must not reduce real movement funding or desynchronize SHOOT prediction.
-        let received = self.attack_epoch.elapsed().as_millis() as u64;
+        self.native_move_received(id, pos, (time, Instant::now()))
+    }
+    pub fn native_move_received(
+        &mut self,
+        id: i32,
+        pos: Pos,
+        (time, received): (i32, Instant),
+    ) -> Result<()> {
+        let queued_ms = received.elapsed().as_millis();
+        let received = received
+            .checked_duration_since(self.attack_epoch)
+            .context("native MOVE predates world epoch")?
+            .as_millis() as u64;
+        tracing::debug!(
+            player = id,
+            client_time = time,
+            received,
+            queued_ms,
+            x = pos.x,
+            y = pos.y,
+            "native MOVE ingress"
+        );
         self.move_timed(id, pos, time, received)
     }
     pub fn move_to(&mut self, id: i32, pos: Pos, time: i32) -> Result<()> {
@@ -1479,6 +1518,7 @@ impl World {
             })
         })
     }
+    #[cfg(test)]
     pub fn native_shoot(
         &mut self,
         id: i32,
@@ -1489,7 +1529,33 @@ impl World {
         angle: f32,
     ) -> Result<()> {
         // Skipped actor ticks must not charge real client attacks against a slower simulation clock.
-        let received = self.attack_epoch.elapsed().as_millis() as u64;
+        self.native_shoot_received(id, (time, Instant::now()), bullet, kind, start, angle)
+    }
+    pub fn native_shoot_received(
+        &mut self,
+        id: i32,
+        (time, received): (i32, Instant),
+        bullet: u8,
+        kind: u16,
+        start: Pos,
+        angle: f32,
+    ) -> Result<()> {
+        let queued_ms = received.elapsed().as_millis();
+        let received = received
+            .checked_duration_since(self.attack_epoch)
+            .context("native SHOOT predates world epoch")?
+            .as_millis() as u64;
+        tracing::debug!(
+            player = id,
+            client_time = time,
+            received,
+            queued_ms,
+            bullet,
+            x = start.x,
+            y = start.y,
+            angle,
+            "native SHOOT ingress"
+        );
         self.shoot_timed(id, (time, received), bullet, kind, start, angle)
     }
     // Fixture tests drive fixed ticks without sleeping, so script shots use simulation time.
@@ -1535,16 +1601,25 @@ impl World {
             p.character.items[0] == kind as i32,
             "weapon does not match equipped item"
         );
-        // SHOOT can precede MOVE, and stationary clients need not send MOVE; prediction cannot advance movement credit.
+        let item = self.content.get(kind)?;
+        ensure!(item.shots > 0, "weapon projectile count is zero");
+        let shot_index = if time == p.last_attack {
+            p.attack_count
+        } else {
+            0
+        };
+        // The client displaces every muzzle along central aim, not each projectile's spread angle.
+        let aim =
+            angle + item.arc.to_radians() * ((item.shots - 1) as f32 / 2. - shot_index as f32);
+        // Prediction cannot advance movement credit or authoritative position.
         let center = Pos {
-            x: start.x - 0.3 * angle.cos(),
-            y: start.y - 0.3 * angle.sin(),
+            x: start.x - 0.3 * aim.cos(),
+            y: start.y - 0.3 * aim.sin(),
         };
         if p.pos.distance(center) > 0.001 {
             self.validate_move_at(id, center, time, received)
                 .with_context(|| format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at))?;
         }
-        let item = self.content.get(kind)?;
         let spec = item
             .projectiles
             .get(&0)
@@ -4040,6 +4115,46 @@ mod tests {
         assert_eq!(own[0]["angle"], 0.);
     }
     #[test]
+    fn native_spread_uses_central_muzzle_without_funding_false_centres() {
+        let mut w = world();
+        let player = w.enter(ch(&w), None).unwrap();
+        let kind = 0xc03;
+        let item = w.content.get(kind).unwrap();
+        let shots = item.shots;
+        let gap = item.arc.to_radians();
+        assert_eq!(shots, 10);
+        let p = w.players.get_mut(&player).unwrap();
+        p.character.items[0] = i32::from(kind);
+        p.next_bullet = 0;
+        p.last_move = 1000;
+        p.last_move_at = w.now;
+        p.movement_credit = 0.;
+        let pos = p.pos;
+        let aim = 0.8f32;
+        let muzzle = Pos {
+            x: pos.x + 0.3 * aim.cos(),
+            y: pos.y + 0.3 * aim.sin(),
+        };
+        for index in 0..shots {
+            let angle = aim + gap * (index as f32 - (shots - 1) as f32 / 2.);
+            if index == 1 {
+                assert!(
+                    w.shoot(player, 1000, index as u8, kind, muzzle, angle + 0.5)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("invalid shot origin")
+                );
+                assert_eq!(w.players[&player].attack_count, 1);
+            }
+            w.shoot(player, 1000, index as u8, kind, muzzle, angle)
+                .unwrap();
+        }
+        assert_eq!(w.players[&player].attack_count, shots);
+        assert_eq!(w.players[&player].movement_credit, 0.);
+        assert_eq!(w.players[&player].pos.x, pos.x);
+        assert_eq!(w.players[&player].pos.y, pos.y);
+    }
+    #[test]
     fn native_shoot_before_move_uses_the_same_speed_time_and_wall_budget() {
         let mut w = world();
         let id = w.enter(ch(&w), None).unwrap();
@@ -4525,6 +4640,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn queued_native_receipt_does_not_borrow_later_actor_processing_time() {
+        let mut w = world();
+        let player = w.enter(ch(&w), None).unwrap();
+        let pos = w.players[&player].pos;
+        w.attack_epoch = Instant::now() - std::time::Duration::from_millis(2000);
+        let received = w.attack_epoch + std::time::Duration::from_millis(1100);
+        let p = w.players.get_mut(&player).unwrap();
+        p.last_move = 1000;
+        p.last_move_at = 1000;
+        p.movement_credit = 0.;
+        let forged = Pos {
+            x: pos.x + 0.7,
+            y: pos.y,
+        };
+        assert!(
+            w.native_move_received(player, forged, (1100, received))
+                .unwrap_err()
+                .to_string()
+                .contains("server time budget")
+        );
+        assert!(
+            format!(
+                "{:#}",
+                w.native_shoot_received(
+                    player,
+                    (1100, received),
+                    1,
+                    0xa97,
+                    Pos {
+                        x: forged.x + 0.3,
+                        y: forged.y
+                    },
+                    0.
+                )
+                .unwrap_err()
+            )
+            .contains("server time budget")
+        );
+        assert_eq!(w.players[&player].movement_credit, 0.);
+        assert_eq!(w.players[&player].pos.x, pos.x);
+        w.native_move_received(
+            player,
+            Pos {
+                x: pos.x + 0.4,
+                y: pos.y,
+            },
+            (1100, received),
+        )
+        .unwrap();
+        assert_eq!(w.players[&player].last_move_at, 1100);
+    }
     #[test]
     fn native_attack_credit_uses_receive_time_not_skipped_simulation_ticks() {
         let mut w = world();

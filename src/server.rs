@@ -1,3 +1,4 @@
+mod input;
 use crate::{
     content::{Content, WIZARD},
     crypto::Keys,
@@ -17,6 +18,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
+use input::Incoming;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -416,6 +418,7 @@ async fn handle(
     session: &mut Session,
     tx: &mpsc::Sender<Packet>,
     lost: &tokio::sync::watch::Sender<bool>,
+    received: std::time::Instant,
 ) -> Result<()> {
     let Session {
         account,
@@ -553,10 +556,12 @@ async fn handle(
             r.done()?;
             let id = player.context("MOVE before character")?;
             a.world
-                .call(move |w| match w.native_move_to(id, pos, time) {
-                    Ok(()) => Ok(()),
-                    Err(e) => w.correct_position(id, time, &e.to_string()),
-                })
+                .call(
+                    move |w| match w.native_move_received(id, pos, (time, received)) {
+                        Ok(()) => Ok(()),
+                        Err(e) => w.correct_position(id, time, &e.to_string()),
+                    },
+                )
                 .await?;
         }
         wire::PLAYER_SHOOT => {
@@ -571,13 +576,14 @@ async fn handle(
             r.done()?;
             let id = player.context("shoot before character")?;
             a.world
-                .call(move |w| w.native_shoot(id, time, bullet, kind, pos, angle))
+                .call(move |w| {
+                    w.native_shoot_received(id, (time, received), bullet, kind, pos, angle)
+                })
                 .await?;
         }
         wire::PLAYER_TEXT => {
             let text = player_text(&mut r)?;
             let id = player.context("chat before character")?;
-            let received = std::time::Instant::now();
             if let Err(error) = a.world.directory(move |d| d.chat(id, text, received)).await {
                 tracing::warn!(player=id, error=%error, "local chat rejected");
                 tx.send(crate::world::chat_error(&error.to_string()))
@@ -588,7 +594,6 @@ async fn handle(
             let target = r.i32()?;
             r.done()?;
             let id = player.context("teleport before character")?;
-            let received = std::time::Instant::now();
             if let Err(error) = a
                 .world
                 .directory(move |d| d.teleport(id, target, received))
@@ -774,9 +779,11 @@ async fn handle(
     Ok(())
 }
 async fn connection(socket: WebSocket, mut a: App) {
-    let (mut wsout, mut wsin) = socket.split();
+    let (mut wsout, wsin) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Packet>(64);
     let (lost, mut lost_rx) = tokio::sync::watch::channel(false);
+    // Actor work and output backpressure must not manufacture late, clustered input receipts.
+    let (mut incoming, _input_task) = input::receive(wsin, lost.clone());
     let mut shutdown = a.shutdown.subscribe();
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
     tokio::pin!(deadline);
@@ -785,20 +792,13 @@ async fn connection(socket: WebSocket, mut a: App) {
     let mut reconnect_sent = false;
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut serial = 0;
-    let mut packet_window = std::time::Instant::now();
-    let mut packet_count = 0usize;
     'connection: loop {
         tokio::select! {
-            incoming=wsin.next()=>match incoming {
-                Some(Ok(Message::Binary(bytes)))=>{
-                    let packets=match codec.feed(&bytes) {Ok(p)=>p,Err(e)=>{tracing::error!(error=%e,"invalid packet stream");break;}};
-                    if packet_window.elapsed().as_secs()>=1 {packet_window=std::time::Instant::now();packet_count=0;}
-                    packet_count=packet_count.saturating_add(packets.len());
-                    if packet_count>512 {tracing::warn!(player=session.player,"input packet rate exceeded");break;}
-                    for packet in packets {
-                        if session.reconnecting { break; }
+            event=incoming.recv()=>match event {
+                Some(Incoming::Command(packet, received, _bytes))=>{
+                    if !session.reconnecting {
                         let id=packet.id;
-                        if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost).await {
+                        if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost,received).await {
                             tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,error=%format_args!("{e:#}"),"game command rejected");
                             if matches!(id,1|21|37|57) && let Some(player) = session.player {
                                 let reason = e.to_string();
@@ -817,10 +817,8 @@ async fn connection(socket: WebSocket, mut a: App) {
                         }
                     }
                 },
-                Some(Ok(Message::Ping(bytes)))=>{if wsout.send(Message::Pong(bytes)).await.is_err(){break}},
-                Some(Ok(Message::Close(_)))|None=>break,
-                Some(Ok(_))=>{tracing::warn!("non-binary game message rejected");break},
-                Some(Err(e))=>{tracing::warn!(error=%e,"WebSocket failed");break},
+                Some(Incoming::Ping(bytes))=>{if wsout.send(Message::Pong(bytes)).await.is_err(){break}},
+                None=>break,
             },
             _=shutdown.changed()=>break,
             _=lost_rx.changed()=>{tracing::warn!(player=session.player,"closing slow game connection before its state diverges");break;},
