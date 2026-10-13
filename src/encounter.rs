@@ -2,12 +2,20 @@ use crate::content::Content;
 use anyhow::{Result, ensure};
 
 #[derive(Clone, Copy)]
+pub enum Anchor {
+    Player,
+    Parent,
+    Kind(u16),
+    Home,
+}
+#[derive(Clone, Copy)]
 pub enum Motion {
     Stationary,
     Wander,
     Chase { sight: f32, stop: f32 },
     Circle,
-    Protect { kind: u16, distance: f32 },
+    Orbit { anchor: Anchor, radius: f32 },
+    Protect { anchor: Anchor, distance: f32 },
 }
 #[derive(Clone, Copy)]
 pub struct Profile {
@@ -20,7 +28,7 @@ pub fn profile(kind: u16) -> Option<Profile> {
     use Motion::*;
     let chase = |stop| Chase { sight: 10., stop };
     let (motion, speed, interval, range) = match kind {
-        0x172 | 0x175..=0x179 => (Stationary, 0., 0, 0.),
+        0x172 | 0x173 | 0x175..=0x179 => (Stationary, 0., 0, 0.),
         0x600 => (
             Chase {
                 sight: 6.,
@@ -70,7 +78,7 @@ pub fn profile(kind: u16) -> Option<Profile> {
         0x652 | 0xd05 => (Wander, 2., 1000, 12.),
         0x653 => (
             Protect {
-                kind: 0x652,
+                anchor: Anchor::Parent,
                 distance: 2.,
             },
             4.,
@@ -89,15 +97,23 @@ pub fn profile(kind: u16) -> Option<Profile> {
         0x229 => (chase(5.), 10., 300, 10.),
         0x917 => (Stationary, 0., 500, 15.),
         0x918 => (
-            Protect {
-                kind: 0x917,
-                distance: 10.,
+            Orbit {
+                anchor: Anchor::Kind(0x917),
+                radius: 20.,
             },
             10.,
             1000,
             20.,
         ),
-        0x919 => (chase(2.), 4., 1000, 20.),
+        0x919 => (
+            Protect {
+                anchor: Anchor::Parent,
+                distance: 2.,
+            },
+            4.,
+            1000,
+            20.,
+        ),
         0xd06 => (Wander, 3., 400, 12.),
         0xd07..=0xd0a => (Stationary, 0., 300, 100.),
         0xd90 => (Wander, 0.5, 150, 12.),
@@ -109,10 +125,11 @@ pub fn profile(kind: u16) -> Option<Profile> {
         0xda2 | 0xda3 => (Stationary, 0., 1000, 3.),
         0xda4 => (chase(1.), 12., 1000, 10.),
         0xda5 | 0xda6 => (chase(7.), 10., 1000, 10.),
-        0xdb0 | 0xdb2 => (chase(1.), 12., 1000, 10.),
+        0xdaa | 0xdac => (chase(7.), 9., 1000, 8.),
+        0xdab | 0xdad..=0xdaf | 0xdb0 | 0xdb2 => (chase(1.), 12., 1000, 10.),
         0xdb1 => (
             Protect {
-                kind: 0xd90,
+                anchor: Anchor::Parent,
                 distance: 6.,
             },
             10.,
@@ -127,6 +144,59 @@ pub fn profile(kind: u16) -> Option<Profile> {
         interval,
         range,
     })
+}
+pub fn stage(kind: u16, hp: i32, elapsed: u64) -> u64 {
+    match kind {
+        0x917 => {
+            if hp >= 5625 {
+                0
+            } else if hp >= 3750 {
+                1
+            } else if hp >= 1875 {
+                2
+            } else {
+                3
+            }
+        }
+        0xd06 => {
+            elapsed / 43300 * 5
+                + match elapsed % 43300 {
+                    0..2000 => 0,
+                    2000..2300 => 1,
+                    2300..12300 => 2,
+                    12300..32300 => 3,
+                    _ => 4,
+                }
+        }
+        0xd90 => elapsed / 13000,
+        _ => 0,
+    }
+}
+pub fn movement(kind: u16, hp: i32, elapsed: u64) -> (Motion, f32) {
+    let p = profile(kind).expect("validated encounter motion");
+    match kind {
+        0x917 if (3750..5625).contains(&hp) => (Motion::Wander, 3.),
+        0xd06 => match stage(kind, hp, elapsed) % 5 {
+            0 | 4 => (Motion::Wander, 3.),
+            1 => (
+                Motion::Chase {
+                    sight: 10.,
+                    stop: 2.,
+                },
+                36.,
+            ),
+            2 => (
+                Motion::Orbit {
+                    anchor: Anchor::Player,
+                    radius: 4.,
+                },
+                10.8,
+            ),
+            3 => (Motion::Stationary, 0.),
+            _ => unreachable!(),
+        },
+        _ => (p.motion, p.speed),
+    }
 }
 fn spread(index: u8, count: usize, gap: f32, heading: f32) -> Vec<(u8, f32)> {
     (0..count)
@@ -155,7 +225,7 @@ pub fn attacks(kind: u16, hp: i32, heading: f32) -> Vec<(u8, f32)> {
 pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8, f32)> {
     match kind {
         0x927 if hp < 640 => vec![(0, heading), (1, heading)],
-        0x172 | 0x175..=0x179 | 0x927 | 0x68a..=0x68f | 0x653 => vec![],
+        0x172 | 0x173 | 0x175..=0x179 | 0x927 | 0x68a..=0x68f | 0x653 => vec![],
         0x60e => spread(0, 2, 10., heading),
         0x610 => ring(0, 5, 0.),
         0x600
@@ -186,7 +256,7 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
         | 0xd97
         | 0xd9b..=0xd9d
         | 0xda4
-        | 0xdb0..=0xdb2 => vec![(0, heading)],
+        | 0xdaa..=0xdb2 => vec![(0, heading)],
         0x609 => spread(
             0,
             3,
@@ -249,19 +319,20 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
             }
         }
         0x659 => spread(0, 7, 25., heading),
-        0x225 | 0x228 | 0xd95 | 0xd98 | 0xd9e | 0xd9f => spread(0, 3, 6., heading),
+        0x228 | 0xd95 | 0xd98 | 0xd9e | 0xd9f => spread(0, 3, 6., heading),
+        0x225 => spread(0, 3, 6., heading),
         0x917 if (3750..5625).contains(&hp) => vec![],
         0x917 if (1875..3750).contains(&hp) => ring(1, 8, elapsed as f32 / 1000.),
         0x917 => (0..4)
             .flat_map(|i| spread(0, 2, 10., i as f32 * std::f32::consts::FRAC_PI_2))
             .collect(),
-        0xd06 if elapsed % 45000 < 2000 => vec![],
-        0xd06 if elapsed % 45000 < 12000 => {
+        0xd06 if elapsed % 43300 < 2300 => vec![],
+        0xd06 if elapsed % 43300 < 12300 => {
             let mut shots = spread(0, 2, 10., heading);
             shots.extend(spread(0, 2, 10., heading + std::f32::consts::PI));
             shots
         }
-        0xd06 if elapsed % 45000 < 32000 => ring(0, 3, elapsed as f32 / 1000.),
+        0xd06 if elapsed % 43300 < 32300 => ring(0, 3, elapsed as f32 / 1000.),
         0xd06 => spread(0, 3, 15., heading),
         0xd07..=0xd0a => {
             let corner: f32 = match kind {
@@ -271,8 +342,11 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
                 0xd0a => 180.,
                 _ => unreachable!(),
             };
+            if elapsed < 2000 {
+                return vec![];
+            }
             let mut shots = vec![(0, corner.to_radians()), (0, (corner + 90.).to_radians())];
-            if (elapsed / 6000) % 3 == 1 {
+            if (elapsed - 2000) / 6000 == 1 {
                 shots.push((0, (corner + 45.).to_radians()));
             }
             shots
@@ -294,8 +368,7 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
             shots.extend(ring(1, 8, 0.));
             shots
         }
-        0xda2 => ring(0, 10, 0.),
-        0xda3 => spread(0, 6, 18., heading),
+        0xda2 | 0xda3 => ring(0, 12, heading),
         0xda5 | 0xda6 => vec![(u8::from((elapsed / 4000) % 2 == 1), heading)],
         _ => panic!("attack requested without an explicit encounter profile"),
     }

@@ -22,6 +22,9 @@ mod bot_tests;
 mod cooperative;
 #[cfg(test)]
 mod cooperative_tests;
+mod mechanics;
+#[cfg(test)]
+mod mechanics_tests;
 mod progression;
 #[cfg(test)]
 mod progression_tests;
@@ -66,6 +69,10 @@ pub struct Entity {
     phase: f32,
     next_shot: u64,
     activated: Option<u64>,
+    stage: Option<u64>,
+    parent: Option<i32>,
+    expires: Option<u64>,
+    next_aux: u64,
     bullet: u8,
 }
 impl Entity {
@@ -169,6 +176,7 @@ pub struct InventoryPlan {
     pub character: i32,
     pub bag: Option<(i32, Vec<i32>)>,
     pub healing: i32,
+    pub healing_nova: Option<(i32, f32)>,
     pub mana: i32,
     pub stat_growth: Option<(Character, Slot, usize, i32)>,
     pub vault: Option<Vault>,
@@ -197,6 +205,7 @@ pub struct World {
     pub entities: BTreeMap<i32, Entity>,
     pub players: BTreeMap<i32, Player>,
     pub bullets: Vec<Bullet>,
+    grenades: Vec<mechanics::Grenade>,
     cells: Vec<BTreeSet<i32>>,
     rng: rand::rngs::StdRng,
     pub now: u64,
@@ -404,6 +413,13 @@ impl Directory {
                 crate::encounter::validate(&world.content, kind)?;
                 crate::loot::validate(&world.content, kind)?;
             }
+        }
+        for kind in [
+            0x173, 0x653, 0x918, 0x919, 0xd07, 0xd08, 0xd09, 0xd0a, 0xdaa, 0xdab, 0xdac, 0xdad,
+            0xdae, 0xdaf, 0xdb0, 0xdb1, 0xdb2,
+        ] {
+            crate::encounter::validate(&world.content, kind)?;
+            crate::loot::validate(&world.content, kind)?;
         }
         Ok(world)
     }
@@ -825,6 +841,10 @@ impl World {
                         damage: BTreeMap::new(),
                         next_shot: 0,
                         activated: None,
+                        stage: None,
+                        parent: None,
+                        expires: None,
+                        next_aux: 0,
                         bullet: 0,
                     };
                     for setting in c.config.split(';').filter(|s| !s.is_empty()) {
@@ -865,6 +885,7 @@ impl World {
             entities,
             players: BTreeMap::new(),
             bullets: Vec::new(),
+            grenades: Vec::new(),
             cells,
             rng: rand::rngs::StdRng::from_entropy(),
             now: 0,
@@ -962,6 +983,10 @@ impl World {
                 damage: BTreeMap::new(),
                 next_shot: 0,
                 activated: None,
+                stage: None,
+                parent: None,
+                expires: None,
+                next_aux: 0,
                 bullet: 0,
             },
         );
@@ -1650,6 +1675,18 @@ impl World {
                 self.players.get_mut(&id).unwrap().pending = true;
                 Ok(Some(plan))
             }
+            "HealNova" if item.kind == 0xa3f => {
+                ensure!(
+                    item.activations == 1 && item.heal == 100 && item.heal_range == 10.,
+                    "invalid selected Snake Oil activation"
+                );
+                let mut items = p.character.items.clone();
+                items[slot.slot] = -1;
+                let mut plan = self.plan(id, items, None, 0);
+                plan.healing_nova = Some((item.heal, item.heal_range));
+                self.players.get_mut(&id).unwrap().pending = true;
+                Ok(Some(plan))
+            }
             "HealNova" => {
                 self.heal_nova(id, slot, &item)?;
                 Ok(None)
@@ -1737,6 +1774,7 @@ impl World {
             character: p.character.id,
             bag,
             healing,
+            healing_nova: None,
             mana: 0,
             stat_growth: None,
             vault: None,
@@ -1931,7 +1969,11 @@ impl World {
                         "reserved potion base stats changed"
                     );
                     let cap = self.content.classes[&p.character.class].caps[index];
-                    p.character.base[index] = (snapshot.base[index] + amount).min(cap);
+                    ensure!(
+                        snapshot.base[index] + amount <= cap,
+                        "reserved potion exceeds current class cap"
+                    );
+                    p.character.base[index] = snapshot.base[index] + amount;
                     tracing::info!(
                         player = plan.player,
                         stat = crate::content::STATS[index].0,
@@ -1980,6 +2022,9 @@ impl World {
             }
         }
         send(p, 4, o.0);
+        if let Some((amount, range)) = plan.healing_nova {
+            self.consumable_heal_nova(plan.player, amount, range)?;
+        }
         Ok(())
     }
     pub fn action(&mut self, id: i32, a: Action) -> Result<Option<InventoryPlan>> {
@@ -2285,6 +2330,10 @@ impl World {
             4 => 0x509,
             _ => bail!("unsupported loot bag appearance"),
         };
+        ensure!(
+            items.len() <= 8,
+            "loot exceeds bag capacity; split rewards before packaging"
+        );
         items.resize(8, -1);
         let id = self.spawn_entity(kind, pos, items)?;
         let bag = self.entities.get_mut(&id).unwrap();
@@ -2475,11 +2524,13 @@ impl World {
         let ids: Vec<_> = self
             .entities
             .values()
-            .filter(|e| self.content.objects[&e.kind].enemy)
+            .filter(|e| self.content.objects[&e.kind].enemy || e.kind == 0x173)
             .map(|e| e.id)
             .collect();
         for id in ids {
-            let entity = &self.entities[&id];
+            let Some(entity) = self.entities.get(&id) else {
+                continue;
+            };
             let kind = entity.kind;
             let pos = entity.pos;
             let profile = profile(kind).expect("validated encounter profile");
@@ -2489,7 +2540,19 @@ impl World {
                 .filter(|p| p.character.alive && !p.death_pending && !p.departing)
                 .min_by(|a, b| pos.distance(a.pos).total_cmp(&pos.distance(b.pos)))
                 .map(|p| p.pos);
-            let Some(target) = nearest.filter(|p| pos.distance(*p) < 20.) else {
+            let wake = match kind {
+                0xd06 => 11.,
+                0xd90 => 8.,
+                _ => 20.,
+            };
+            let Some(target) = nearest.filter(|p| {
+                pos.distance(*p)
+                    < if entity.activated.is_some() {
+                        20.
+                    } else {
+                        wake
+                    }
+            }) else {
                 continue;
             };
             let activated = *self
@@ -2499,33 +2562,53 @@ impl World {
                 .activated
                 .get_or_insert(self.now);
             let elapsed = self.now - activated;
+            if let Err(error) = self.encounter_mechanics(id, target, elapsed) {
+                tracing::error!(entity=id, kind, %error, "encounter mechanic refused");
+            }
             let flags = self.entities[&id].conditions(self.now);
-            let mut speed = profile.speed;
-            let goal = match profile.motion {
+            let (motion, mut speed) =
+                crate::encounter::movement(kind, self.entities[&id].hp, elapsed);
+            let goal = match motion {
                 Motion::Stationary => {
                     speed = 0.;
                     Some(pos)
                 }
-                Motion::Protect {
-                    kind: parent,
-                    distance,
-                } => {
-                    let leader = self
-                        .entities
-                        .values()
-                        .filter(|e| e.kind == parent)
-                        .min_by(|a, b| pos.distance(a.pos).total_cmp(&pos.distance(b.pos)))
-                        .map(|e| e.pos);
-                    if leader.is_some_and(|leader| pos.distance(leader) <= distance) {
+                Motion::Protect { anchor, distance } => {
+                    let leader = match self.orbit_anchor(id, anchor, target) {
+                        Ok(leader) => leader,
+                        Err(error) => {
+                            tracing::error!(entity=id, %error, "protection anchor refused");
+                            continue;
+                        }
+                    };
+                    if pos.distance(leader) <= distance {
                         speed = 0.;
                     }
-                    leader
+                    Some(leader)
                 }
                 Motion::Chase { sight, stop } if pos.distance(target) < sight => {
                     if pos.distance(target) <= stop {
                         speed = 0.;
                     }
                     Some(target)
+                }
+                Motion::Orbit { anchor, radius } => {
+                    let target = match self.orbit_anchor(id, anchor, target) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            tracing::error!(entity=id, %error, "orbit anchor refused");
+                            continue;
+                        }
+                    };
+                    let e = self.entities.get_mut(&id).unwrap();
+                    if e.goal.is_none() {
+                        e.phase = (pos.y - target.y).atan2(pos.x - target.x);
+                    }
+                    e.phase = (e.phase + speed / radius * 0.05) % std::f32::consts::TAU;
+                    Some(Pos {
+                        x: target.x + e.phase.cos() * radius,
+                        y: target.y + e.phase.sin() * radius,
+                    })
                 }
                 Motion::Circle => {
                     let boss = self
@@ -2547,12 +2630,21 @@ impl World {
                 }
                 _ => None,
             };
+            let goal = if kind == 0xd06 && pos.distance(self.entities[&id].home) > 7. {
+                speed = 7.8;
+                Some(
+                    self.orbit_anchor(id, crate::encounter::Anchor::Home, target)
+                        .expect("live boss home"),
+                )
+            } else {
+                goal
+            };
             let goal = if let Some(goal) = goal {
                 goal
             } else {
                 let e = self.entities.get_mut(&id).unwrap();
-                speed = match profile.motion {
-                    Motion::Wander => profile.speed,
+                speed = match motion {
+                    Motion::Wander => speed,
                     Motion::Chase { .. } if kind == 0x600 => 4.,
                     Motion::Chase { .. } if !(0x687..=0x689).contains(&kind) => 4.,
                     Motion::Protect { .. } => profile.speed,
@@ -2593,8 +2685,8 @@ impl World {
             let interval = match kind {
                 0x633 if elapsed % 10000 >= 5000 => 500,
                 0x917 if !(1875..3750).contains(&e.hp) => 1000,
-                0xd06 if elapsed % 45000 >= 32000 => 1300,
-                0xd06 if elapsed % 45000 >= 12000 => 500,
+                0xd06 if elapsed % 43300 >= 32300 => 1300,
+                0xd06 if elapsed % 43300 >= 12300 => 500,
                 0xd90 if (elapsed / 13000) % 4 == 1 => 2000,
                 0xd90 if (elapsed / 13000) % 4 >= 2 => 1000,
                 _ => profile.interval,
@@ -2769,7 +2861,9 @@ impl World {
             self.remove_entity(id);
             tracing::debug!(entity = id, "empty or expired transient loot bag removed");
         }
+        self.mechanic_expiry();
         let shots = self.npc_step();
+        self.grenade_step();
         for id in &ids {
             if let Err(e) = self.updates(*id, false) {
                 tracing::error!(player=id,error=%e,"world update failed");
@@ -2957,15 +3051,19 @@ impl World {
                                 }
                             }
                             if self.name == "Realm"
-                                && matches!(e.kind, 0x60e..=0x610)
-                                && self.rng.gen_bool(0.01)
+                                && let Some((portal, chance)) = crate::dungeon::portal_drop(e.kind)
+                                && self.rng.gen_bool(chance)
                             {
-                                self.portal_requests.push((0x717, e.pos));
+                                self.portal_requests.push((portal, e.pos));
                                 tracing::info!(
                                     enemy = e.kind,
                                     entity = target,
-                                    "Cube defeat earned a dungeon portal"
+                                    portal,
+                                    "defeat earned a dungeon portal"
                                 );
+                            }
+                            if let Err(error) = self.encounter_death(&e) {
+                                tracing::error!(enemy=e.kind, %error, "defeat mechanic failed");
                             }
                             if self.encounter
                                 && let Err(error) = self.drop_loot(&e)

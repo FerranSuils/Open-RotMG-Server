@@ -620,6 +620,13 @@ async fn handle(
             r.i32()?;
             r.done()?;
         }
+        59 => {
+            player.context("area acknowledgement before character")?;
+            r.i32()?;
+            r.f32()?;
+            r.f32()?;
+            r.done()?;
+        }
         66 | 51 => collision_report(packet.id == 66, &mut r)?,
         30 => {
             r.i32()?;
