@@ -284,6 +284,9 @@ fn fresh_crewmate_meets_unseen_leader_in_nexus_through_expiring_public_chat() {
         }
     };
     let mut follower = Brain::new(PROFILES[2], &v);
+    assert!(follower.decide(&v, &content).unwrap().chat.is_none());
+    v.time_ms += 10000;
+    v.tick += 200;
     assert_eq!(follower.decide(&v, &content).unwrap().chat, Some("tp?"));
     assert_eq!(follower.next_call, v.time_ms + 30000);
     assert_eq!(follower.requested_until, v.time_ms + 5000);
@@ -298,6 +301,8 @@ fn fresh_crewmate_meets_unseen_leader_in_nexus_through_expiring_public_chat() {
     let mut leader_view = view(&content);
     leader_view.session.player = 2;
     let mut leader = Brain::new(PROFILES[1], &leader_view);
+    leader_view.time_ms += 10000;
+    leader_view.tick += 200;
     leader
         .receive(packet("Juniper", 9, "", "tp?"), &leader_view)
         .unwrap();

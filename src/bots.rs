@@ -168,7 +168,7 @@ impl Brain {
             } else {
                 0
             },
-            next_call: 0,
+            next_call: view.time_ms + 10000,
             requested_until: 0,
             portal: None,
             leader_seen: None,
