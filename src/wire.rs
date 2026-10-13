@@ -12,6 +12,8 @@ pub const MOVE: u8 = 7;
 pub const PLAYER_SHOOT: u8 = 38;
 pub const PING: u8 = 6;
 pub const PONG: u8 = 16;
+pub const PLAYER_TEXT: u8 = 69;
+pub const TEXT: u8 = 25;
 const MAX_FRAME: usize = 1_048_576;
 const CLIENT_OUT: &[u8] = &[
     0x31, 0x1f, 0x80, 0x69, 0x14, 0x51, 0xc7, 0x1b, 0x09, 0xa1, 0x3a, 0x2a, 0x6e,
