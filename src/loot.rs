@@ -177,16 +177,17 @@ pub fn roll(content: &Content, kind: u16, rng: &mut impl Rng) -> Option<u16> {
 }
 pub fn rewards(content: &Content, kind: u16, rng: &mut impl Rng) -> Vec<u16> {
     if matches!(kind, 0x917 | 0xd06 | 0xd90) {
-        table(kind)
-            .iter()
-            .filter_map(|(chance, pick)| {
-                rng.gen_bool(*chance).then(|| {
+        let mut rewards = Vec::new();
+        for (chance, pick) in table(kind) {
+            if rng.gen_bool(*chance) {
+                rewards.push(
                     *candidates(content, *pick)
                         .choose(rng)
-                        .expect("validated loot candidates")
-                })
-            })
-            .collect()
+                        .expect("validated loot candidates"),
+                );
+            }
+        }
+        rewards
     } else {
         roll(content, kind, rng).into_iter().collect()
     }

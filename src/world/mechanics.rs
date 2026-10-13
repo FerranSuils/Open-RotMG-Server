@@ -144,7 +144,7 @@ impl World {
                         }
                     }
                 }
-                0xd90 if stage % 4 == 0 => {
+                0xd90 if stage.is_multiple_of(4) => {
                     for (kind, count) in [
                         (0xdaa, 1),
                         (0xdaf, 2),

@@ -1347,7 +1347,11 @@ impl World {
         }
         Ok(())
     }
+    #[cfg(test)]
     fn validate_move(&self, id: i32, pos: Pos, time: i32) -> Result<f32> {
+        self.validate_move_at(id, pos, time, self.now)
+    }
+    fn validate_move_at(&self, id: i32, pos: Pos, time: i32, received: u64) -> Result<f32> {
         ensure!(
             pos.x.is_finite() && pos.y.is_finite(),
             "non-finite movement"
@@ -1400,8 +1404,7 @@ impl World {
             pos.y,
             speed * elapsed + 0.3
         );
-        let server_elapsed = self
-            .now
+        let server_elapsed = received
             .checked_sub(p.last_move_at)
             .context("movement server clock regressed")?;
         let credit = (p.movement_credit + speed * server_elapsed as f32).min(speed * 350. + 0.3);
@@ -1424,18 +1427,26 @@ impl World {
         );
         Ok(credit - charged)
     }
+    pub fn native_move_to(&mut self, id: i32, pos: Pos, time: i32) -> Result<()> {
+        // Skipped simulation ticks must not reduce real movement funding or desynchronize SHOOT prediction.
+        let received = self.attack_epoch.elapsed().as_millis() as u64;
+        self.move_timed(id, pos, time, received)
+    }
     pub fn move_to(&mut self, id: i32, pos: Pos, time: i32) -> Result<()> {
+        self.move_timed(id, pos, time, self.now)
+    }
+    fn move_timed(&mut self, id: i32, pos: Pos, time: i32, received: u64) -> Result<()> {
         let p = self.players.get(&id).context("player missing")?;
         ensure!(
             p.last_move == 0 || i64::from(time) - i64::from(p.last_move) <= 1000,
             "movement time jump"
         );
-        let remaining_credit = self.validate_move(id, pos, time)?;
+        let remaining_credit = self.validate_move_at(id, pos, time, received)?;
         let p = self.players.get_mut(&id).unwrap();
         p.movement_credit = remaining_credit;
         p.pos = pos;
         p.last_move = time;
-        p.last_move_at = self.now;
+        p.last_move_at = received;
         Ok(())
     }
     pub fn walkable(&self, pos: Pos) -> bool {
@@ -1530,7 +1541,7 @@ impl World {
             y: start.y - 0.3 * angle.sin(),
         };
         if p.pos.distance(center) > 0.001 {
-            self.validate_move(id, center, time)
+            self.validate_move_at(id, center, time, received)
                 .with_context(|| format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at))?;
         }
         let item = self.content.get(kind)?;
@@ -4443,6 +4454,77 @@ mod tests {
             assert!(w.bullets.is_empty());
         }
     }
+    #[test]
+    fn native_movement_and_shot_origin_use_receive_time_without_funding_client_time() {
+        let mut w = world();
+        let player = w.enter(ch(&w), None).unwrap();
+        let pos = w
+            .map
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(i, _)| Pos {
+                x: (i % w.map.width as usize) as f32 + 0.5,
+                y: (i / w.map.width as usize) as f32 + 0.5,
+            })
+            .find(|p| {
+                w.walkable(*p)
+                    && w.walkable(Pos {
+                        x: p.x + 2.,
+                        y: p.y,
+                    })
+            })
+            .unwrap();
+        let p = w.players.get_mut(&player).unwrap();
+        p.pos = pos;
+        p.last_move = 1000;
+        p.last_move_at = 1000;
+        p.movement_credit = 0.;
+        w.now = 1000;
+        w.attack_epoch = Instant::now() - std::time::Duration::from_millis(2000);
+        let next = Pos {
+            x: pos.x + 0.4,
+            y: pos.y,
+        };
+        assert!(w.move_to(player, next, 1100).is_err());
+        w.native_move_to(player, next, 1100).unwrap();
+        let received = w.players[&player].last_move_at;
+        assert!(received >= 2000);
+        w.players.get_mut(&player).unwrap().movement_credit = 0.;
+        let forged = Pos {
+            x: next.x + 0.4,
+            y: next.y,
+        };
+        assert!(
+            w.move_timed(player, forged, 1200, received)
+                .unwrap_err()
+                .to_string()
+                .contains("server time budget")
+        );
+        let error = w
+            .shoot_timed(
+                player,
+                (1200, received),
+                1,
+                0xa97,
+                Pos {
+                    x: forged.x + 0.3,
+                    y: forged.y,
+                },
+                0.,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("server time budget"));
+        assert_eq!(w.players[&player].movement_credit, 0.);
+        assert_eq!(w.players[&player].pos.x, next.x);
+        assert!(
+            w.move_timed(player, next, 1200, received - 1)
+                .unwrap_err()
+                .to_string()
+                .contains("server clock regressed")
+        );
+    }
+
     #[test]
     fn native_attack_credit_uses_receive_time_not_skipped_simulation_ticks() {
         let mut w = world();
