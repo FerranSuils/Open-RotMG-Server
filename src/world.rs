@@ -17,6 +17,9 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 mod chat;
 pub(crate) use chat::chat_error;
+pub(crate) mod view;
+#[cfg(test)]
+mod view_tests;
 mod trade;
 pub use trade::{TradeAction, TradePlan};
 #[derive(Clone)]
@@ -73,6 +76,7 @@ pub struct Player {
     pub departing: bool,
     script_owned: bool,
     pub known: BTreeSet<i32>,
+    known_since: BTreeMap<i32, u64>,
     tiles: BTreeSet<(i16, i16)>,
     pub death_started: bool,
     killer: String,
@@ -690,7 +694,7 @@ fn send(p: &Player, id: u8, body: Vec<u8>) {
     if let Some(tx) = &p.tx
         && tx.packets.try_send(Packet { id, body }).is_err()
     {
-        let _ = tx.lost.send(true);
+        tx.lost.send_replace(true);
         tracing::warn!(
             character = p.character.id,
             "slow/closed connection; packet queue full"
@@ -936,6 +940,7 @@ impl World {
                 script_owned: tx.is_none(),
                 tx,
                 known: BTreeSet::new(),
+                known_since: BTreeMap::new(),
                 tiles: BTreeSet::new(),
                 death_started: false,
                 killer: String::new(),
@@ -1113,7 +1118,12 @@ impl World {
             }
             send(&self.players[&id], wire::UPDATE, o.0);
         }
-        self.players.get_mut(&id).unwrap().known = visible;
+        let p = self.players.get_mut(&id).unwrap();
+        p.known_since.retain(|entity, _| visible.contains(entity));
+        for entity in &visible {
+            p.known_since.entry(*entity).or_insert(self.now);
+        }
+        p.known = visible;
         Ok(())
     }
     fn validate_move(&self, id: i32, pos: Pos, time: i32) -> Result<f32> {
@@ -2626,6 +2636,25 @@ mod tests {
             tiles: 0,
             pirate_caves: 0,
         }
+    }
+    pub(super) fn receive(
+        d: &mut Directory,
+        world: i32,
+        account: i32,
+        class: u16,
+    ) -> (i32, mpsc::Receiver<Packet>) {
+        let w = d.worlds.get_mut(&world).unwrap();
+        let mut c = super::tests::ch(w);
+        c.id = account + 100;
+        c.account = account;
+        c.class = class;
+        c.base = w.content.classes[&class].base;
+        c.items = w.content.objects[&class].equipment.clone();
+        let (packets, mut rx) = mpsc::channel(128);
+        let (lost, _) = watch::channel(false);
+        let id = w.enter(c, Some(Output { packets, lost })).unwrap();
+        while rx.try_recv().is_ok() {}
+        (id, rx)
     }
     pub(super) fn directory() -> Directory {
         Directory::load(

@@ -907,8 +907,12 @@ async fn observe(
     let result: Result<serde_json::Value> = async {
         control(&a, &headers)?;
         a.world
-            .for_player(input.player)
-            .call(move |w| w.observe(input.player))
+            .directory(move |d| {
+                let scope = d.location(input.player)?;
+                let mut frame = d.worlds[&scope].observe(input.player)?;
+                frame["player_view"] = serde_json::to_value(d.player_view(input.player)?)?;
+                Ok(frame)
+            })
             .await
     }
     .await;
