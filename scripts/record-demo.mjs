@@ -250,7 +250,6 @@ export async function capture(options) {
   try {
     busy = await c.eval('Boolean(window.__rotmgDemo)');
     requireValue(!busy, 'Another recorder is active; refuse overlapping controllers');
-    await c.call('Page.bringToFront');
     receipt.window=await visible(c,options.target,{wait:controls.wait});
     await controls.wait(2000);
     await page(c,'start'); active='probe'; await controls.wait(150);

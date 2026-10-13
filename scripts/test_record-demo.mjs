@@ -6,6 +6,10 @@ import path from 'node:path';
 import {input, point, socket, transfer, attachment, visible} from './record-demo.mjs';
 
 const rect={x:8,y:114.25,width:800,height:600,pixels:[1200,900]};
+test('recorder cannot activate tabs or mutate window state',async()=>{
+  const source=await fs.readFile(new URL('record-demo.mjs',import.meta.url),'utf8');
+  assert.doesNotMatch(source,/Page\.bringToFront|Target\.activateTarget|Browser\.setWindowBounds/);
+});
 test('visibility observes asynchronous restoration and refuses minimized or hidden pages',async()=>{
   let clock=0, polls=0;
   const c={call:async(method,p)=>{assert.equal(method,'Browser.getWindowForTarget');assert.equal(p.targetId,'owned');polls++;return {bounds:{windowState:polls===1?'minimized':'normal'}};},eval:async()=>polls<3};
