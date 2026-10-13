@@ -58,10 +58,14 @@ impl Directory {
             "Teleport rate registry is full."
         );
         let world = self.resolve(Target::Player(id))?;
+        let movement_received = received
+            .checked_duration_since(world.attack_epoch)
+            .context("teleport predates world epoch")?
+            .as_millis() as u64;
         let p = world.players.get_mut(&id).unwrap();
         p.pos = position;
         p.movement_credit = 0.78;
-        p.last_move_at = world.attack_epoch.elapsed().as_millis() as u64;
+        p.last_move_at = movement_received;
         let receipt = TeleportReceipt {
             player: id,
             character: p.character.id,
