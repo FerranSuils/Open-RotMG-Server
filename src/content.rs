@@ -4,6 +4,7 @@ use serde::Serialize;
 use std::{collections::BTreeMap, io::Read, path::Path};
 
 pub const WIZARD: u16 = 0x030e;
+pub const PRIEST: u16 = 0x0310;
 pub const STATS: [(u8, &str); 8] = [
     (0, "MaxHitPoints"),
     (3, "MaxMagicPoints"),
@@ -61,6 +62,9 @@ pub struct Object {
     pub mana_cost: i32,
     pub activate: String,
     pub heal: i32,
+    pub heal_range: f32,
+    pub activations: usize,
+    pub cooldown_ms: u64,
     pub enemy: bool,
     pub quest: bool,
     pub xp_multiplier: f32,
@@ -202,6 +206,15 @@ impl Content {
                     .map(str::parse)
                     .transpose()?
                     .unwrap_or(0),
+                heal_range: child(n, "Activate")
+                    .and_then(|p| p.attribute("range"))
+                    .map(str::parse)
+                    .transpose()?
+                    .unwrap_or(0.),
+                activations: n.children().filter(|p| p.has_tag_name("Activate")).count(),
+                cooldown_ms: std::time::Duration::try_from_secs_f32(number(n, "Cooldown", 0.5)?)?
+                    .as_millis()
+                    .try_into()?,
                 enemy: child(n, "Enemy").is_some(),
                 quest: child(n, "Quest").is_some(),
                 xp_multiplier: number(n, "XpMult", 1.)?,
@@ -564,6 +577,34 @@ mod tests {
             "sourced cave boss is disconnected from spawn"
         );
         assert!(cave.cells.iter().any(|c| c.config.starts_with("conn:")));
+    }
+    #[test]
+    fn selected_priest_starter_and_tiered_healing_are_exact() {
+        let c = Content::load(Path::new("data")).unwrap();
+        assert_eq!(c.get(PRIEST).unwrap().slots[..4], [8, 4, 14, 9]);
+        assert_eq!(
+            c.get(PRIEST).unwrap().equipment[..5],
+            [0xa04, 0xa31, -1, -1, 0xa22]
+        );
+        for (tier, kind, amount, range, cost) in [
+            (0, 0xa31, 100, 5., 60),
+            (1, 0xad7, 130, 5.5, 65),
+            (2, 0xa32, 165, 6., 70),
+            (3, 0xad8, 205, 6.5, 75),
+            (4, 0xa33, 250, 7., 80),
+            (5, 0xa5b, 300, 8., 85),
+            (6, 0xb25, 300, 8., 85),
+        ] {
+            let o = c.get(kind).unwrap();
+            assert_eq!(
+                (o.tier, o.heal, o.heal_range, o.mana_cost),
+                (Some(tier), amount, range, cost)
+            );
+            assert_eq!(
+                (o.activate.as_str(), o.activations, o.cooldown_ms),
+                ("HealNova", 1, 500)
+            );
+        }
     }
     #[test]
     fn candidate_map_is_lossless() {

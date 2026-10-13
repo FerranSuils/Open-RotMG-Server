@@ -1,4 +1,4 @@
-use crate::content::{Content, Object, WIZARD};
+use crate::content::{Class, Content, Object, PRIEST, WIZARD};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -150,6 +150,7 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 pub struct Store {
     tx: mpsc::Sender<Job>,
     legacy_base: [i32; 8],
+    classes: std::sync::Arc<std::collections::BTreeMap<u16, Class>>,
     hashes: std::sync::Arc<tokio::sync::Semaphore>,
     dummy_hash: String,
 }
@@ -246,6 +247,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         Ok(Self {
             tx,
             legacy_base,
+            classes: std::sync::Arc::new(content.classes.clone()),
             hashes: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
             dummy_hash: accounts::hash("unknown-account")?,
         })
@@ -317,33 +319,47 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             Ok(account.characters.pop())
         }
     }
-    pub async fn create(&self, account: i32, wizard: &Object) -> Result<Character> {
+    pub async fn create(&self, account: i32, class: &Object) -> Result<Character> {
         ensure!(
-            wizard.kind == WIZARD && wizard.class == "Player",
+            matches!(class.kind, WIZARD | PRIEST) && class.class == "Player",
             "playable class is not implemented"
         );
+        let kind = class.kind;
+        let requirements = self
+            .classes
+            .get(&kind)
+            .context("class metadata missing")?
+            .requires
+            .clone();
         let base = [
-            wizard.hp,
-            wizard.mp,
-            wizard.attack,
-            wizard.defense,
-            wizard.speed,
-            wizard.dexterity,
-            wizard.vitality,
-            wizard.wisdom,
+            class.hp,
+            class.mp,
+            class.attack,
+            class.defense,
+            class.speed,
+            class.dexterity,
+            class.vitality,
+            class.wisdom,
         ];
-        let hp = wizard.hp;
-        let mp = wizard.mp;
-        let items = wizard.equipment.clone();
+        let hp = class.hp;
+        let mp = class.mp;
+        let items = class.equipment.clone();
         self.call(move |c| {
             let tx = c.transaction()?;
+            for (required_class, required_level) in requirements {
+                let best: Option<i32> = tx.query_row(
+                    "SELECT max(json_extract(stats,\'$.level\')) FROM characters WHERE account=?1 AND json_extract(stats,\'$.class\')=?2",
+                    params![account, required_class], |r| r.get(0),
+                )?;
+                ensure!(best.is_some_and(|level| level >= required_level), "class {kind:#x} is locked: requires {required_class:#x} level {required_level}");
+            }
             let name: String =
                 tx.query_row("SELECT name FROM accounts WHERE id=?1", [account], |r| {
                     r.get(0)
                 })?;
             let mut ch = Character {
                 schema: 1,
-                class: WIZARD,
+                class: kind,
                 base,
                 id: 0,
                 account,
@@ -751,6 +767,50 @@ mod tests {
                 .text(),
             Some("5")
         );
+    }
+    #[tokio::test]
+    async fn priest_creation_is_locked_transactionally_then_uses_selected_stats_and_persistence() {
+        let c = Content::load(Path::new("data")).unwrap();
+        let s = Store::open(Path::new(":memory:"), &c).unwrap();
+        let a = s.list("priest-unlock".into()).await.unwrap();
+        assert!(s.create(a.id, c.get(PRIEST).unwrap()).await.is_err());
+        let mut wizard = s.create(a.id, c.get(WIZARD).unwrap()).await.unwrap();
+        wizard.level = 4;
+        wizard.exp = level_start(4).unwrap();
+        s.progress(wizard.clone()).await.unwrap();
+        wizard.hp = 0;
+        wizard.alive = false;
+        s.death(wizard, "ordinary death fixture".into())
+            .await
+            .unwrap();
+        assert!(s.create(a.id, c.get(PRIEST).unwrap()).await.is_err());
+        let mut wizard = s.create(a.id, c.get(WIZARD).unwrap()).await.unwrap();
+        wizard.level = 5;
+        wizard.exp = level_start(5).unwrap();
+        s.progress(wizard.clone()).await.unwrap();
+        assert!(s.create(a.id, c.get(PRIEST).unwrap()).await.is_err());
+        wizard.hp = 0;
+        wizard.alive = false;
+        s.death(wizard, "ordinary death fixture".into())
+            .await
+            .unwrap();
+        let priest = s.create(a.id, c.get(PRIEST).unwrap()).await.unwrap();
+        assert_eq!(priest.class, PRIEST);
+        assert_eq!(priest.base, c.classes[&PRIEST].base);
+        assert_eq!(priest.items, c.get(PRIEST).unwrap().equipment);
+        assert_eq!(priest.effective(&c).unwrap(), priest.base);
+        let mut next = priest.clone();
+        assert!(
+            next.gain_experience(&c, 800, &mut rand::thread_rng())
+                .unwrap()
+        );
+        s.progress(next.clone()).await.unwrap();
+        let loaded = s.load(a.id, priest.id).await.unwrap();
+        assert_eq!(
+            (loaded.class, loaded.level, loaded.base, loaded.items),
+            (PRIEST, next.level, next.base, next.items)
+        );
+        assert!(s.create(a.id, c.get(0x0300).unwrap()).await.is_err());
     }
     #[tokio::test]
     async fn equipment_derives_stats_without_stacking_or_backpack_bonuses() {
