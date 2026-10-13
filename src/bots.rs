@@ -332,7 +332,11 @@ impl Brain {
                 .iter()
                 .filter(|kind| **kind >= 0)
                 .any(|kind| content.objects[&(*kind as u16)].activate == "Heal");
-            if health < 0.15 && !held_heal && decision.item.is_none() && v.map.name != "Nexus" {
+            if health < (self.profile.recovery * 0.6).max(0.25)
+                && !held_heal
+                && decision.item.is_none()
+                && v.map.name != "Nexus"
+            {
                 decision.journey = Some(Journey::Nexus);
                 return Ok(decision);
             }

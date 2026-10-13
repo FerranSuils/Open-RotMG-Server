@@ -292,6 +292,28 @@ fn kites_from_close_targets_and_does_not_fire_through_known_cover() {
 }
 
 #[test]
+fn committed_disengagement_uses_nexus_before_the_last_hit_without_held_healing() {
+    let content = content();
+    let mut v = view(&content);
+    v.character.hp = 30;
+    v.character
+        .items
+        .iter_mut()
+        .skip(4)
+        .for_each(|item| *item = -1);
+    let mut brain = Brain::new(PROFILES[0], &v);
+    let escaped = brain.decide(&v, &content).unwrap();
+    assert_eq!(escaped.goal, Goal::Recover);
+    assert!(matches!(escaped.journey, Some(Journey::Nexus)));
+    assert!(escaped.aim.is_none());
+    v.character.items[4] = 2594;
+    let mut brain = Brain::new(PROFILES[0], &v);
+    let stocked = brain.decide(&v, &content).unwrap();
+    assert!(stocked.journey.is_none());
+    assert!(matches!(stocked.item, Some(Action::Use { slot: 4, .. })));
+}
+
+#[test]
 fn observed_motion_leads_aim_and_recovery_has_a_release_threshold() {
     let content = content();
     let mut v = view(&content);
