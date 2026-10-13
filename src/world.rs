@@ -976,6 +976,7 @@ impl World {
         tracing::info!(
             player = id,
             character = char_id,
+            world = %self.name,
             "player entered development world"
         );
         Ok(id)
@@ -1158,7 +1159,11 @@ impl World {
         } else {
             (i64::from(time) - i64::from(p.last_move)) as f32
         };
-        ensure!(elapsed >= 0., "movement time reversed");
+        ensure!(
+            elapsed >= 0.,
+            "movement time reversed: client_time={time} previous_client_time={}",
+            p.last_move
+        );
         let cell = self
             .map
             .cell(p.pos.x, p.pos.y)
@@ -1166,16 +1171,25 @@ impl World {
         let speed = (0.004
             + (0.0096 - 0.004) * p.character.effective(&self.content)?[4] as f32 / 75.)
             * self.content.grounds[&cell.ground];
-        ensure!(
-            p.pos.distance(pos) <= speed * elapsed + 0.3,
-            "movement exceeds speed"
-        );
-        let credit = (p.movement_credit + speed * (self.now - p.last_move_at) as f32)
-            .min(speed * 350. + 0.3);
         let distance = p.pos.distance(pos);
         ensure!(
+            distance <= speed * elapsed + 0.3,
+            "movement exceeds speed: from=({}, {}) to=({}, {}) distance={distance} allowed={} speed={speed} client_elapsed_ms={elapsed}",
+            p.pos.x,
+            p.pos.y,
+            pos.x,
+            pos.y,
+            speed * elapsed + 0.3
+        );
+        let server_elapsed = self
+            .now
+            .checked_sub(p.last_move_at)
+            .context("movement server clock regressed")?;
+        let credit = (p.movement_credit + speed * server_elapsed as f32).min(speed * 350. + 0.3);
+        ensure!(
             distance <= credit + 0.001,
-            "movement exceeds server time budget"
+            "movement exceeds server time budget: distance={distance} credit={credit} server_elapsed_ms={server_elapsed} client_elapsed_ms={elapsed} previous_credit={}",
+            p.movement_credit
         );
         let samples = (distance / 0.1).ceil().max(1.) as usize;
         ensure!(
@@ -1292,7 +1306,7 @@ impl World {
         };
         if p.pos.distance(center) > 0.001 {
             self.validate_move(id, center, time)
-                .with_context(|| format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} move_age_ms={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now - p.last_move_at))?;
+                .with_context(|| format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at))?;
         }
         let item = self.content.get(kind)?;
         let spec = item
@@ -2622,11 +2636,18 @@ fn inside_box(a: Pos, b: Pos) -> bool {
     (a.x - b.x).abs() <= 0.5 && (a.y - b.y).abs() <= 0.5
 }
 #[cfg(test)]
+#[path = "../examples/testing/cover.rs"]
+mod cover_example;
+#[cfg(test)]
+#[path = "../examples/testing/timing.rs"]
+mod timing_example;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::content::WIZARD;
     use std::path::Path;
-    fn world() -> World {
+    pub(super) fn world() -> World {
         let c = Arc::new(Content::load(Path::new("data")).unwrap());
         let m = Arc::new(Map::load(Path::new("data/tutorial.wmap"), &c).unwrap());
         World::new(c, m).unwrap()

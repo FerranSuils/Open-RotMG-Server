@@ -3,6 +3,9 @@ mod content;
 mod crypto;
 mod encounter;
 mod loot;
+#[cfg(test)]
+#[path = "../examples/testing/prepared-state.rs"]
+mod prepared_state_example;
 mod server;
 mod store;
 mod terrain;
@@ -27,6 +30,7 @@ async fn main() -> Result<()> {
     let (config, dev_control) = config::Config::load(&args)?;
     let client = config.client;
     let state = config.state;
+    tracing::info!(address=%config.bind, state=%state.display(), client=%client.display(), data=%config.data.display(), "local environment selected");
     std::fs::create_dir_all(&state)?;
     #[cfg(unix)]
     {

@@ -22,6 +22,10 @@ class LauncherTests(unittest.TestCase):
         self.patch = patch.multiple(launcher, ROOT=self.root, LOG=self.root / ".local/server.log",
                                     SHA256=hashlib.sha256(self.data).hexdigest())
         self.patch.start()
+        self.git = patch.object(launcher.subprocess, 'check_output', side_effect=lambda command, **_: 'test-revision\n' if command[1] == 'rev-parse' else '')
+        self.git.start()
+        self.port = patch.object(launcher.socket, 'socket')
+        self.port.start()
 
     def archive(self, files):
         stream = io.BytesIO()
@@ -33,6 +37,8 @@ class LauncherTests(unittest.TestCase):
         return stream.getvalue()
 
     def tearDown(self):
+        self.port.stop()
+        self.git.stop()
         self.patch.stop()
         self.temp.cleanup()
 
@@ -93,9 +99,39 @@ class LauncherTests(unittest.TestCase):
                     patch.object(launcher, 'run', return_value=0) as run:
                 self.assertEqual(launcher.main(), 0)
                 self.assertEqual(run.call_count, 2)
-                self.assertEqual(run.call_args.args[0], ['cargo', 'run', '--locked', '--', '--client', str(self.client), *expected])
+                self.assertEqual(run.call_args.args[0], ['cargo', 'run', '--locked', '--', '--client', str(self.client), *expected[:2], '--state', str(self.root / '.local'), *expected[2:]])
                 if '--local-client' in args:
                     download.assert_not_called()
+
+    def test_explicit_state_is_used_for_saves_cache_and_logs(self):
+        state = self.root / 'isolated'
+        with patch('sys.argv', ['run.py', '8081', '--state', str(state)]), \
+                patch.object(launcher.shutil, 'which', return_value='/cargo'), \
+                patch.object(launcher, 'urlopen', return_value=io.BytesIO(self.data)), \
+                patch.object(launcher, 'run', return_value=0) as run:
+            launcher.main()
+        self.assertEqual((run.call_args.args[0][-2:], launcher.LOG.parent,
+                          (state / f'client-{launcher.REVISION}.zip').exists(),
+                          (self.root / '.local').exists()),
+                         (['--state', str(state)], state, True, False))
+
+    def test_client_alias_is_explicit_and_receipt_identifies_environment(self):
+        (self.client / 'scripts').mkdir(parents=True)
+        (self.client / 'scripts/run.py').touch()
+        with patch('sys.argv', ['run.py', '8081', '--client', str(self.client)]), \
+                patch.object(launcher.shutil, 'which', return_value='/cargo'), \
+                patch.object(launcher, 'run', return_value=0), \
+                patch.object(launcher, 'prepare_client', side_effect=AssertionError('custom client must not download')):
+            launcher.main()
+        self.assertIn(f'Local source: test-revision dirty=False; port=8081; state={self.root / ".local"}; client={self.client}', launcher.LOG.read_text())
+
+    def test_occupied_port_fails_before_download(self):
+        with patch('sys.argv', ['run.py', '8081']), \
+                patch.object(launcher.shutil, 'which', return_value='/cargo'), \
+                patch.object(launcher.socket, 'socket', side_effect=OSError('address already in use')), \
+                patch.object(launcher, 'prepare_client', side_effect=AssertionError('must fail before download')):
+            launcher.main()
+        self.assertIn('Cannot listen on 127.0.0.1:8081', launcher.LOG.read_text())
 
     def test_missing_port_fails_before_setup(self):
         for args in [[], ['--dev-control'], ['--local-client', str(self.client)]]:
