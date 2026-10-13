@@ -9,19 +9,27 @@ from pathlib import Path
 import re
 import sqlite3
 
-GAME = {
+LEGACY_GAME = {
     'accounts': ('id', 'guid', 'name'),
     'characters': ('id', 'account', 'stats', 'items', 'revision', 'alive'),
     'deaths': ('character', 'snapshot', 'killed_by', 'died_at'),
 }
+GAME = {**LEGACY_GAME, 'vaults': ('account', 'items', 'revision')}
 DISCORD = {'levels': ('guild_id', 'user_id', 'username', 'xp', 'last_xp_at', 'last_message_id')}
 CHARACTER = {'id', 'account', 'name', 'level', 'exp', 'fame', 'hp', 'mp', 'items', 'revision',
              'alive', 'created_at', 'shots', 'hits', 'kills', 'quests', 'tiles'}
 
 
 def character(value):
-    if not isinstance(value, dict) or set(value) != CHARACTER:
+    if not isinstance(value, dict) or set(value) not in (CHARACTER, CHARACTER | {'schema', 'class', 'base', 'pirate_caves'}):
         raise ValueError('Unsupported character payload; review the credential-free export schema')
+    if 'schema' in value:
+        if type(value['schema']) is not int or value['schema'] != 1 or type(value['class']) is not int or not 0 <= value['class'] <= 65535:
+            raise ValueError('Invalid character schema/class')
+        if not isinstance(value['base'], list) or len(value['base']) != 8 or any(type(i) is not int or i < 0 for i in value['base']):
+            raise ValueError('Invalid character base stats')
+        if type(value['pirate_caves']) is not int or value['pirate_caves'] < 0:
+            raise ValueError('Invalid character dungeon counter')
     if not isinstance(value['name'], str) or type(value['alive']) is not bool:
         raise ValueError('Invalid character name/alive types')
     for key in CHARACTER - {'name', 'alive', 'items'}:
@@ -40,8 +48,11 @@ def snapshot(path, schema):
         if db.execute('PRAGMA foreign_key_check').fetchall():
             raise ValueError('Source SQLite foreign keys failed')
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-        if tables != set(schema):
+        schemas = schema if isinstance(schema, list) else [schema]
+        matched = [candidate for candidate in schemas if tables == set(candidate)]
+        if len(matched) != 1:
             raise ValueError('Unsupported database tables; update and test the export schema before backing up')
+        schema = matched[0]
         result = {}
         for table, columns in schema.items():
             if tuple(r[1] for r in db.execute('PRAGMA table_info(' + table + ')')) != columns:
@@ -53,12 +64,12 @@ def snapshot(path, schema):
 
 
 def validate(bundle):
-    if set(bundle) != {'schema', 'created_at', 'revisions', 'game', 'discord'} or bundle['schema'] != 1:
+    if set(bundle) != {'schema', 'created_at', 'revisions', 'game', 'discord'} or type(bundle['schema']) is not int or bundle['schema'] not in (1, 2):
         raise ValueError('Unsupported backup envelope')
     datetime.datetime.strptime(bundle['created_at'], '%Y-%m-%dT%H:%M:%SZ')
     if set(bundle['revisions']) != {'server', 'discord_bot'} or any(not re.fullmatch('[0-9a-f]{40}', v) for v in bundle['revisions'].values()):
         raise ValueError('Invalid source revisions')
-    for name, schema in [('game', GAME), ('discord', DISCORD)]:
+    for name, schema in [('game', LEGACY_GAME if bundle['schema'] == 1 else GAME), ('discord', DISCORD)]:
         data = bundle[name]
         if set(data) != set(schema):
             raise ValueError('Unsupported backup tables: ' + name)
@@ -73,14 +84,21 @@ def validate(bundle):
             raise ValueError('Invalid inventory')
     for row in bundle['game']['deaths']:
         character(json.loads(row['snapshot']))
+    for row in bundle['game'].get('vaults', []):
+        items = json.loads(row['items'])
+        if type(row['account']) is not int or row['account'] <= 0 or type(row['revision']) is not int or row['revision'] < 0:
+            raise ValueError('Invalid vault account/revision')
+        if not isinstance(items, list) or len(items) != 8 or any(type(i) is not int or not -1 <= i <= 65535 for i in items):
+            raise ValueError('Invalid eight-slot vault inventory')
     return bundle
 
 
 def export(game, discord, output, server_revision, bot_revision):
+    game_data = snapshot(game, [LEGACY_GAME, GAME])
     bundle = validate({
-        'schema': 1, 'created_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'schema': 2 if 'vaults' in game_data else 1, 'created_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         'revisions': {'server': Path(server_revision).read_text().strip(), 'discord_bot': Path(bot_revision).read_text().strip()},
-        'game': snapshot(game, GAME), 'discord': snapshot(discord, DISCORD),
+        'game': game_data, 'discord': snapshot(discord, DISCORD),
     })
     data = gzip.compress(json.dumps(bundle, sort_keys=True, separators=(',', ':')).encode(), mtime=0)
     output = Path(output)
@@ -103,6 +121,8 @@ CREATE UNIQUE INDEX one_living_character ON characters(account) WHERE alive=1;
 CREATE TABLE deaths(character INTEGER PRIMARY KEY REFERENCES characters(id),snapshot TEXT NOT NULL,killed_by TEXT NOT NULL,died_at INTEGER NOT NULL);""",
         'discord': """CREATE TABLE levels(guild_id TEXT NOT NULL,user_id TEXT NOT NULL,username TEXT NOT NULL,xp INTEGER NOT NULL CHECK(xp>=0 AND xp<=9007199254740991),last_xp_at INTEGER NOT NULL,last_message_id TEXT NOT NULL,PRIMARY KEY(guild_id,user_id)) STRICT;""",
     }
+    if bundle['schema'] == 2:
+        definitions['game'] += '\nCREATE TABLE vaults(account INTEGER PRIMARY KEY REFERENCES accounts(id),items TEXT NOT NULL CHECK(json_array_length(items)=8),revision INTEGER NOT NULL DEFAULT 0);'
     for name, filename in [('game', 'game.db'), ('discord', 'levels.sqlite')]:
         with closing(sqlite3.connect(':memory:')) as db, db:
             db.execute('PRAGMA foreign_keys=ON')
