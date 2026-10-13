@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rand::{Rng, SeedableRng, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicI32, Ordering},
@@ -28,6 +28,10 @@ mod cooperative_tests;
 mod mechanics;
 #[cfg(test)]
 mod mechanics_tests;
+mod reconciliation;
+#[cfg(test)]
+mod reconciliation_tests;
+pub use reconciliation::NativeInput;
 mod progression;
 #[cfg(test)]
 mod progression_tests;
@@ -131,6 +135,8 @@ pub struct Player {
     attack_count: i32,
     last_move: i32,
     last_move_at: u64,
+    goto_acks: VecDeque<(bool, Instant)>,
+    discarded_attack: Option<(i32, i32)>,
     tick: i32,
     last_ability: u64,
 }
@@ -1113,6 +1119,8 @@ impl World {
                 attack_count: 0,
                 last_move: 0,
                 last_move_at: self.now,
+                goto_acks: VecDeque::new(),
+                discarded_attack: None,
                 tick: 0,
                 last_ability: 0,
             },
@@ -1484,13 +1492,14 @@ impl World {
     pub fn native_move_to(&mut self, id: i32, pos: Pos, time: i32) -> Result<()> {
         // Skipped simulation ticks must not reduce real movement funding or desynchronize SHOOT prediction.
         self.native_move_received(id, pos, (time, Instant::now()))
+            .map(|_| ())
     }
     pub fn native_move_received(
         &mut self,
         id: i32,
         pos: Pos,
         (time, received): (i32, Instant),
-    ) -> Result<()> {
+    ) -> Result<NativeInput> {
         let queued_ms = received.elapsed().as_millis();
         let received = received
             .checked_duration_since(self.attack_epoch)
@@ -1505,7 +1514,11 @@ impl World {
             y = pos.y,
             "native MOVE ingress"
         );
-        self.move_timed(id, pos, time, received)
+        if self.discard_correcting_move(id, pos, time)? {
+            return Ok(NativeInput::DiscardedUntilGotoAck);
+        }
+        self.move_timed(id, pos, time, received)?;
+        Ok(NativeInput::Applied)
     }
     pub fn move_to(&mut self, id: i32, pos: Pos, time: i32) -> Result<()> {
         self.move_timed(id, pos, time, self.now)
@@ -1566,6 +1579,7 @@ impl World {
     ) -> Result<()> {
         // Skipped actor ticks must not charge real client attacks against a slower simulation clock.
         self.native_shoot_received(id, (time, Instant::now()), bullet, kind, start, angle)
+            .map(|_| ())
     }
     pub fn native_shoot_received(
         &mut self,
@@ -1575,7 +1589,7 @@ impl World {
         kind: u16,
         start: Pos,
         angle: f32,
-    ) -> Result<()> {
+    ) -> Result<NativeInput> {
         let queued_ms = received.elapsed().as_millis();
         let received = received
             .checked_duration_since(self.attack_epoch)
@@ -1592,7 +1606,12 @@ impl World {
             angle,
             "native SHOOT ingress"
         );
-        self.shoot_timed(id, (time, received), bullet, kind, start, angle)
+        if self.discard_correcting_shot(id, time, bullet, kind, start, angle)? {
+            return Ok(NativeInput::DiscardedUntilGotoAck);
+        }
+        self.shoot_timed(id, (time, received), bullet, kind, start, angle)?;
+        self.players.get_mut(&id).unwrap().discarded_attack = None;
+        Ok(NativeInput::Applied)
     }
     // Fixture tests drive fixed ticks without sleeping, so script shots use simulation time.
     pub fn shoot(
@@ -2226,10 +2245,10 @@ impl World {
     pub fn correct_position(&mut self, id: i32, time: i32, reason: &str) -> Result<()> {
         let p = self.players.get_mut(&id).context("player missing")?;
         let previous_time = p.last_move;
-        p.last_move = time;
+        ensure!(!p.correcting()?, "position correction is already pending");
         let mut out = Writer::new();
         out.i32(id).f32(p.pos.x).f32(p.pos.y);
-        send(p, wire::GOTO, out.0);
+        reconciliation::goto(p, true, out.0);
         tracing::warn!(
             player = id,
             previous_time,
@@ -2911,6 +2930,7 @@ impl World {
         self.now += 50;
         self.tick += 1;
         self.trade_step();
+        self.expire_goto_acks();
         let ids: Vec<_> = self.players.keys().copied().collect();
         for id in &ids {
             let p = &self.players[id];
