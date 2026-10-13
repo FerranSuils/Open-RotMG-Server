@@ -124,6 +124,8 @@ struct Brain {
     recover_until: u64,
     tracks: BTreeMap<i32, (Pos, u64, Pos)>,
     next_teleport: u64,
+    regroup_call: Option<(i32, u64)>,
+    next_call: u64,
     portal: Option<(i32, u64)>,
     leader_seen: Option<(i32, Pos, u64)>,
     contacts: BTreeMap<i32, (Pos, u64)>,
@@ -158,6 +160,8 @@ impl Brain {
             recover_until: 0,
             tracks: BTreeMap::new(),
             next_teleport: 0,
+            regroup_call: None,
+            next_call: 0,
             portal: None,
             leader_seen: None,
             contacts: BTreeMap::new(),
@@ -179,6 +183,18 @@ impl Brain {
         let text = r.utf()?;
         r.utf()?;
         r.done()?;
+        if actor > 0 && actor != self.session.1 && recipient.is_empty() {
+            let leader = self.profile.name == self.profile.leader;
+            if (!leader && name == self.profile.leader && text == "tp here")
+                || (leader
+                    && text == "tp?"
+                    && PROFILES
+                        .iter()
+                        .any(|p| p.leader == self.profile.name && p.name == name))
+            {
+                self.regroup_call = Some((actor, view.time_ms + 5000));
+            }
+        }
         if recipient.is_empty()
             && name == self.profile.leader
             && text == "pc here"
@@ -401,6 +417,33 @@ impl Brain {
                     to: own(v, to),
                 });
                 return Ok(decision);
+            }
+        }
+        if v.map.name == "Realm"
+            && health >= 0.75
+            && decision.item.is_none()
+            && nearest.is_none_or(|e| e.position.distance(v.position) > 5.)
+        {
+            if let Some((actor, _)) = self.regroup_call.take().filter(|(_, t)| *t > v.time_ms) {
+                if self.profile.name == self.profile.leader {
+                    if v.time_ms >= self.next_call {
+                        decision.chat = Some("tp here");
+                        self.next_call = v.time_ms + 10000;
+                    }
+                } else if v.time_ms >= self.next_teleport {
+                    decision.goal = Goal::Follow(actor);
+                    decision.journey = Some(Journey::Regroup(actor));
+                    self.next_teleport = v.time_ms + 10000;
+                    return Ok(decision);
+                }
+            } else if self.profile.name != self.profile.leader
+                && self
+                    .leader_seen
+                    .is_none_or(|(_, _, seen)| v.time_ms.saturating_sub(seen) >= 10000)
+                && v.time_ms >= self.next_call
+            {
+                decision.chat = Some("tp?");
+                self.next_call = v.time_ms + 10000;
             }
         }
         let mut choices = Vec::new();

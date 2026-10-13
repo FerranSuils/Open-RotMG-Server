@@ -243,6 +243,89 @@ fn only_addressed_native_chat_changes_companion_memory() {
 }
 
 #[test]
+fn fresh_crewmate_rejoins_through_scoped_expiring_public_chat() {
+    let content = content();
+    let mut v = view(&content);
+    let packet = |name: &str, actor, recipient: &str, text: &str| {
+        let mut w = crate::wire::Writer::new();
+        w.utf(name)
+            .i32(actor)
+            .i32(0)
+            .u8(5)
+            .utf(recipient)
+            .utf(text)
+            .utf("");
+        Packet {
+            id: wire::TEXT,
+            body: w.0,
+        }
+    };
+    let mut follower = Brain::new(PROFILES[2], &v);
+    assert_eq!(follower.decide(&v, &content).unwrap().chat, Some("tp?"));
+    v.tick += 5;
+    assert!(follower.decide(&v, &content).unwrap().chat.is_none());
+    for (name, actor, recipient) in [("Reed", 9, ""), ("Mossy", -1, ""), ("Mossy", 2, "Human")] {
+        follower
+            .receive(packet(name, actor, recipient, "tp here"), &v)
+            .unwrap();
+        assert!(follower.regroup_call.is_none());
+    }
+    let mut leader_view = view(&content);
+    leader_view.session.player = 2;
+    let mut leader = Brain::new(PROFILES[1], &leader_view);
+    leader
+        .receive(packet("Juniper", 9, "", "tp?"), &leader_view)
+        .unwrap();
+    assert!(leader.regroup_call.is_none());
+    leader
+        .receive(packet("Trellis", 1, "", "tp?"), &leader_view)
+        .unwrap();
+    assert_eq!(
+        leader.decide(&leader_view, &content).unwrap().chat,
+        Some("tp here")
+    );
+    follower
+        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .unwrap();
+    v.tick += 5;
+    let decision = follower.decide(&v, &content).unwrap();
+    assert!(matches!(decision.journey, Some(Journey::Regroup(2))));
+    assert!(decision.aim.is_none() && decision.item.is_none() && decision.movement.is_none());
+    assert!(v.objects.is_empty());
+    follower
+        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .unwrap();
+    v.tick += 5;
+    assert!(follower.decide(&v, &content).unwrap().journey.is_none());
+    let mut expired = Brain::new(PROFILES[2], &v);
+    expired
+        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .unwrap();
+    v.time_ms += 5001;
+    assert!(expired.decide(&v, &content).unwrap().journey.is_none());
+    let mut injured = Brain::new(PROFILES[2], &v);
+    injured
+        .receive(packet("Mossy", 2, "", "tp here"), &v)
+        .unwrap();
+    v.character.hp = 70;
+    assert!(injured.decide(&v, &content).unwrap().journey.is_none());
+    v.character.hp = 100;
+    let mut endangered = Brain::new(PROFILES[1], &leader_view);
+    endangered
+        .receive(packet("Trellis", 1, "", "tp?"), &leader_view)
+        .unwrap();
+    let kind = content.objects.values().find(|o| o.enemy).unwrap().kind;
+    leader_view.objects.push(object(9, kind, 14.5, 11.5));
+    assert!(
+        endangered
+            .decide(&leader_view, &content)
+            .unwrap()
+            .chat
+            .is_none()
+    );
+}
+
+#[test]
 fn selected_target_controls_aim_and_equipped_spell_cooldown() {
     let content = content();
     let mut v = view(&content);
