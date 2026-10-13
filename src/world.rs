@@ -2434,10 +2434,7 @@ impl World {
         )
     }
     fn loot_bag(&mut self, pos: Pos, owner: Option<i32>, mut items: Vec<i32>) -> Result<i32> {
-        ensure!(
-            !items.is_empty() && items.len() <= 8,
-            "loot bag requires one to eight items"
-        );
+        ensure!(!items.is_empty(), "loot bag requires at least one item");
         ensure!(
             self.bag_expiry.len() < 128,
             "transient loot bag limit reached"
@@ -2541,7 +2538,12 @@ impl World {
             return Ok(());
         }
         let mut drops = BTreeMap::<i32, Vec<i32>>::new();
-        let attempts = (eligible.len() * if private { 1 } else { 2 }).min(8);
+        // Private boss rewards belong to every eligible character, not only the first eight.
+        let attempts = if private {
+            eligible.len()
+        } else {
+            (eligible.len() * 2).min(8)
+        };
         for i in 0..attempts {
             for item in crate::loot::rewards(&self.content, defeated.kind, &mut self.rng) {
                 let owner = if private {

@@ -189,6 +189,74 @@ fn selected_dungeons_credit_character_identity_once_and_publish_exits_after_comm
 }
 
 #[test]
+fn selected_private_boss_rewards_reach_every_eligible_player_including_the_ninth() {
+    let mut directory = Directory::load(Path::new("data"), tests::world().content, 16).unwrap();
+    for (template, kind, potion) in [("snake-pit", 0x917, 0xa21), ("undead-lair", 0xd90, 0xa35)] {
+        let scope = directory.instance(template, None).unwrap();
+        let w = directory.worlds.get_mut(&scope).unwrap();
+        let boss = w.entities.values().find(|e| e.kind == kind).unwrap().id;
+        let position = w.entities[&boss].pos;
+        let threshold = w.content.objects[&kind].hp / 10;
+        let mut participants = Vec::new();
+        for index in 0..10 {
+            let mut character = tests::ch(w);
+            character.account = 800 + index;
+            character.id = 900 + index;
+            let player = w.enter(character, None).unwrap();
+            w.players.get_mut(&player).unwrap().pos = position;
+            if index < 9 {
+                w.entities
+                    .get_mut(&boss)
+                    .unwrap()
+                    .damage
+                    .insert(900 + index, threshold + 1);
+                participants.push(player);
+            }
+        }
+        let defeated = w.remove_entity(boss);
+        w.drop_loot(&defeated).unwrap();
+        for player in &participants {
+            let account = w.players[player].character.account;
+            let bags = w
+                .entities
+                .values()
+                .filter(|e| e.extra_stats.contains(&(54, account)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                bags.len(),
+                1,
+                "eligible account {account} lost its private reward"
+            );
+            assert_eq!(
+                bags[0].items.iter().filter(|item| **item == potion).count(),
+                1
+            );
+        }
+        assert!(
+            !w.entities
+                .values()
+                .any(|e| e.extra_stats.contains(&(54, 809)))
+        );
+        let plans = w.pending_progress().unwrap();
+        assert_eq!(plans.len(), 9);
+        let exit = w.clear_exit.unwrap();
+        assert!(!w.entities[&exit].published);
+        for (player, snapshot) in plans {
+            w.finish_progress(player, snapshot).unwrap();
+        }
+        assert!(w.entities[&exit].published);
+        assert!(
+            participants.iter().all(|player| w.players[player]
+                .character
+                .dungeons
+                .iter()
+                .sum::<u64>()
+                == 1)
+        );
+    }
+}
+
+#[test]
 fn timed_conditions_expire_and_quiet_blocks_mana_consumption_and_spells() {
     let mut w = tests::world();
     w.safe = true;
