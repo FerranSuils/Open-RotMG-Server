@@ -4,6 +4,23 @@ use serde::Serialize;
 use std::{collections::BTreeMap, io::Read, path::Path};
 
 pub const WIZARD: u16 = 0x030e;
+pub const STATS: [(u8, &str); 8] = [
+    (0, "MaxHitPoints"),
+    (3, "MaxMagicPoints"),
+    (20, "Attack"),
+    (21, "Defense"),
+    (22, "Speed"),
+    (28, "Dexterity"),
+    (26, "HpRegen"),
+    (27, "MpRegen"),
+];
+#[derive(Clone, Debug)]
+pub struct Class {
+    pub base: [i32; 8],
+    pub caps: [i32; 8],
+    pub growth: [(i32, i32); 8],
+    pub requires: Vec<(u16, i32)>,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct Projectile {
     pub speed: f32,
@@ -12,6 +29,7 @@ pub struct Projectile {
     pub max: i32,
     pub amplitude: f32,
     pub frequency: f32,
+    pub passes_cover: bool,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Object {
@@ -29,9 +47,14 @@ pub struct Object {
     pub equipment: Vec<i32>,
     pub slots: Vec<i32>,
     pub slot_type: i32,
+    pub tier: Option<u8>,
+    pub soulbound: bool,
+    pub bag_type: u8,
+    pub put_normal: bool,
+    pub put_soulbound: bool,
     pub bonuses: Vec<(u8, i32)>,
     pub unsupported_equipment: bool,
-    pub projectile: Option<Projectile>,
+    pub projectiles: BTreeMap<u8, Projectile>,
     pub shots: i32,
     pub arc: f32,
     pub rate: f32,
@@ -39,13 +62,19 @@ pub struct Object {
     pub activate: String,
     pub heal: i32,
     pub enemy: bool,
+    pub quest: bool,
+    pub xp_multiplier: f32,
     pub blocks: bool,
+    pub occupy_square: bool,
+    pub enemy_occupy_square: bool,
+    pub static_object: bool,
     pub destructible: bool,
 }
 #[derive(Clone)]
 pub struct Content {
     pub objects: BTreeMap<u16, Object>,
     pub grounds: BTreeMap<u8, f32>,
+    pub classes: BTreeMap<u16, Class>,
 }
 fn child<'a, 'i>(n: Node<'a, 'i>, tag: &str) -> Option<Node<'a, 'i>> {
     n.children().find(|c| c.has_tag_name(tag))
@@ -100,19 +129,27 @@ impl Content {
         let mut objects = BTreeMap::new();
         for n in doc.root_element().children().filter(|n| n.is_element()) {
             let id = kind(n.attribute("type").context("object has no type")?)?;
-            let projectile = child(n, "Projectile")
-                .map(|p| -> Result<Projectile> {
-                    let fixed = number(p, "Damage", 0.)? as i32;
-                    Ok(Projectile {
-                        speed: number(p, "Speed", 100.)?,
-                        lifetime: number(p, "LifetimeMS", 0.)?,
-                        min: number(p, "MinDamage", fixed as f32)? as i32,
-                        max: number(p, "MaxDamage", fixed as f32)? as i32,
-                        amplitude: number(p, "Amplitude", 0.)?,
-                        frequency: number(p, "Frequency", 1.)?,
-                    })
-                })
-                .transpose()?;
+            let mut projectiles = BTreeMap::new();
+            for p in n.children().filter(|p| p.has_tag_name("Projectile")) {
+                let index = match p.attribute("id") {
+                    Some(index) => index.parse::<u8>()?,
+                    None => 0,
+                };
+                let fixed = number(p, "Damage", 0.)? as i32;
+                let projectile = Projectile {
+                    speed: number(p, "Speed", 100.)?,
+                    lifetime: number(p, "LifetimeMS", 0.)?,
+                    min: number(p, "MinDamage", fixed as f32)? as i32,
+                    max: number(p, "MaxDamage", fixed as f32)? as i32,
+                    amplitude: number(p, "Amplitude", 0.)?,
+                    frequency: number(p, "Frequency", 1.)?,
+                    passes_cover: child(p, "PassesCover").is_some(),
+                };
+                ensure!(
+                    projectiles.insert(index, projectile).is_none(),
+                    "duplicate projectile {index} on object {id:#x}"
+                );
+            }
             let o = Object {
                 kind: id,
                 name: n.attribute("id").context("object has no name")?.into(),
@@ -128,6 +165,13 @@ impl Content {
                 equipment: list(n, "Equipment")?,
                 slots: list(n, "SlotTypes")?,
                 slot_type: number(n, "SlotType", 0.)? as i32,
+                tier: child(n, "Tier")
+                    .map(|_| text(n, "Tier").parse::<u8>())
+                    .transpose()?,
+                soulbound: child(n, "Soulbound").is_some(),
+                bag_type: number(n, "BagType", 0.)? as u8,
+                put_normal: child(n, "CanPutNormalObjects").is_some(),
+                put_soulbound: child(n, "CanPutSoulboundObjects").is_some(),
                 bonuses: n
                     .children()
                     .filter(|x| {
@@ -147,7 +191,7 @@ impl Content {
                 unsupported_equipment: n.children().any(|x| {
                     x.has_tag_name("ActivateOnEquip") && x.text() != Some("IncrementStat")
                 }),
-                projectile,
+                projectiles,
                 shots: number(n, "NumProjectiles", 1.)? as i32,
                 arc: number(n, "ArcGap", 11.25)?,
                 rate: number(n, "RateOfFire", 1.)?,
@@ -159,7 +203,12 @@ impl Content {
                     .transpose()?
                     .unwrap_or(0),
                 enemy: child(n, "Enemy").is_some(),
+                quest: child(n, "Quest").is_some(),
+                xp_multiplier: number(n, "XpMult", 1.)?,
                 blocks: child(n, "OccupySquare").is_some() || child(n, "FullOccupy").is_some(),
+                occupy_square: child(n, "OccupySquare").is_some(),
+                enemy_occupy_square: child(n, "EnemyOccupySquare").is_some(),
+                static_object: child(n, "Static").is_some(),
                 destructible: child(n, "Enemy").is_some(),
             };
             ensure!(
@@ -167,6 +216,69 @@ impl Content {
                 "duplicate object type {id:#x}"
             );
         }
+        let mut classes = BTreeMap::new();
+        for n in doc
+            .root_element()
+            .children()
+            .filter(|n| child(*n, "Player").is_some())
+        {
+            let id = kind(n.attribute("type").context("class type missing")?)?;
+            let mut definition = Class {
+                base: [0; 8],
+                caps: [0; 8],
+                growth: [(0, 0); 8],
+                requires: vec![],
+            };
+            for (i, (_, tag)) in STATS.iter().enumerate() {
+                let stat = child(n, tag).context("class base stat missing")?;
+                definition.base[i] = stat
+                    .text()
+                    .context("class base stat empty")?
+                    .trim()
+                    .parse()?;
+                definition.caps[i] = stat
+                    .attribute("max")
+                    .context("class cap missing")?
+                    .parse()?;
+                let growth = n
+                    .children()
+                    .find(|p| p.has_tag_name("LevelIncrease") && p.text() == Some(tag))
+                    .context("class growth missing")?;
+                definition.growth[i] = (
+                    growth
+                        .attribute("min")
+                        .context("growth minimum missing")?
+                        .parse()?,
+                    growth
+                        .attribute("max")
+                        .context("growth maximum missing")?
+                        .parse()?,
+                );
+                let (min, max) = definition.growth[i];
+                ensure!(
+                    definition.base[i] >= 0
+                        && definition.caps[i] >= definition.base[i]
+                        && min >= 0
+                        && max >= min,
+                    "invalid class stat {id:#x} {tag}"
+                );
+            }
+            for unlock in n.children().filter(|p| p.has_tag_name("UnlockLevel")) {
+                let name = unlock.text().context("unlock class missing")?;
+                let parent = objects
+                    .values()
+                    .find(|o| o.name == name && o.class == "Player")
+                    .context("unknown unlock class")?;
+                let level: i32 = unlock
+                    .attribute("level")
+                    .context("unlock level missing")?
+                    .parse()?;
+                ensure!((1..=20).contains(&level), "invalid unlock level");
+                definition.requires.push((parent.kind, level));
+            }
+            classes.insert(id, definition);
+        }
+        ensure!(classes.len() == 13, "unexpected player class count");
         let data = std::fs::read_to_string(dir.join("grounds.xml"))?;
         let doc = roxmltree::Document::parse(&data)?;
         let mut grounds = BTreeMap::new();
@@ -186,13 +298,28 @@ impl Content {
             objects.len() == 2201 && grounds.len() == 173,
             "unexpected 123.5.1 content counts"
         );
-        let out = Self { objects, grounds };
+        let out = Self {
+            objects,
+            grounds,
+            classes,
+        };
         let w = out.get(WIZARD)?;
+        ensure!(
+            out.unlocked(WIZARD, &BTreeMap::new())?,
+            "Wizard must be unlocked for a new account"
+        );
         ensure!(
             w.hp > 0 && w.equipment.len() == 12 && w.slots.len() == 12,
             "invalid Wizard definition"
         );
         Ok(out)
+    }
+    pub fn unlocked(&self, class: u16, records: &BTreeMap<u16, i32>) -> Result<bool> {
+        let class = self.classes.get(&class).context("unknown player class")?;
+        Ok(class
+            .requires
+            .iter()
+            .all(|(kind, level)| records.get(kind).is_some_and(|best| best >= level)))
     }
     pub fn get(&self, k: u16) -> Result<&Object> {
         self.objects
@@ -205,6 +332,7 @@ pub struct Cell {
     pub ground: u8,
     pub object: Option<u16>,
     pub config: String,
+    pub terrain: u8,
     pub region: u8,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -267,22 +395,21 @@ impl Map {
             let object = if name.is_empty() {
                 None
             } else {
-                Some(
-                    content
-                        .objects
-                        .values()
-                        .find(|o| o.name == name)
-                        .with_context(|| format!("unknown map object {name}"))?
-                        .kind,
-                )
+                let mut matches = content.objects.values().filter(|o| o.name == name);
+                let object = matches
+                    .next()
+                    .with_context(|| format!("unknown map object {name}"))?;
+                ensure!(matches.next().is_none(), "ambiguous map object {name}");
+                Some(object.kind)
             };
             let config = r.string()?;
-            let _terrain = r.byte()?;
+            let terrain = r.byte()?;
             let region = r.byte()?;
             dict.push(Cell {
                 ground,
                 object,
                 config,
+                terrain,
                 region,
             });
         }
@@ -332,6 +459,111 @@ mod tests {
         assert_eq!(w.equipment[1], 0xa2e);
         assert_eq!(w.hp, 100);
         assert!(c.grounds.contains_key(&0x61) && c.grounds.contains_key(&0x65));
+        assert!(c.objects[&0x120].static_object);
+        assert!(!c.objects[&0x683].static_object);
+        assert!(c.objects[&0x120].occupy_square && c.objects[&0x120].enemy_occupy_square);
+        assert!(c.objects[&0x100].occupy_square && !c.objects[&0x100].enemy_occupy_square);
+        assert!(!c.objects[&0x683].projectiles[&0].passes_cover);
+        assert!(c.objects[&0xa08].projectiles[&0].passes_cover);
+    }
+    #[test]
+    fn projectile_identity_includes_both_selected_dreadstump_attacks() {
+        let content = Content::load(Path::new("data")).unwrap();
+        let boss = &content.objects[&0x927];
+        assert_eq!(boss.projectiles.len(), 2);
+        let slow = &boss.projectiles[&0];
+        assert_eq!(
+            (slow.min, slow.max, slow.speed, slow.lifetime),
+            (17, 17, 75., 1500.)
+        );
+        let fast = &boss.projectiles[&1];
+        assert_eq!(
+            (fast.min, fast.max, fast.speed, fast.lifetime),
+            (25, 25, 130., 1100.)
+        );
+        assert_eq!(content.objects[&0xa97].projectiles.len(), 1);
+        assert!(content.objects[&0xa97].projectiles.contains_key(&0));
+    }
+    #[test]
+    fn class_growth_caps_and_unlocks_are_selected_xml() {
+        let content = Content::load(Path::new("data")).unwrap();
+        assert_eq!(content.classes.len(), 13);
+        let wizard = &content.classes[&WIZARD];
+        assert_eq!(wizard.base, [100, 100, 12, 0, 10, 15, 12, 12]);
+        assert_eq!(wizard.caps, [670, 385, 75, 25, 50, 75, 40, 60]);
+        assert_eq!(
+            wizard.growth,
+            [
+                (20, 30),
+                (5, 15),
+                (1, 2),
+                (0, 0),
+                (0, 2),
+                (1, 2),
+                (0, 1),
+                (0, 2)
+            ]
+        );
+        assert!(wizard.requires.is_empty());
+        assert_eq!(content.classes[&0x0310].requires, vec![(WIZARD, 5)]);
+        assert_eq!(
+            content.classes[&0x031f].requires,
+            vec![(0x031e, 20), (0x0310, 20)]
+        );
+    }
+    #[test]
+    fn sourced_world_maps_resolve_and_cave_spawn_reaches_boss() {
+        let content = Content::load(Path::new("data")).unwrap();
+        for name in [
+            "nexus",
+            "nexus-limbo",
+            "vault",
+            "realm-shore",
+            "pirate-cave",
+        ] {
+            let map = Map::load(&Path::new("data").join(format!("{name}.wmap")), &content).unwrap();
+            assert!(!map.spawns.is_empty());
+            assert_eq!(map.cells.len(), (map.width * map.height) as usize);
+            if name == "realm-shore" {
+                assert_eq!((map.width, map.height), (96, 96));
+                assert_eq!(map.cells.iter().filter(|c| c.terrain == 11).count(), 3460);
+                assert_eq!(map.cells.iter().filter(|c| c.terrain == 12).count(), 3200);
+            }
+        }
+        let cave = Map::load(Path::new("data/pirate-cave.wmap"), &content).unwrap();
+        assert_eq!((cave.width, cave.height), (94, 98));
+        assert_eq!(cave.spawns, vec![(20.5, 82.5)]);
+        let boss = cave
+            .cells
+            .iter()
+            .position(|c| c.object == Some(0x927))
+            .unwrap();
+        let spawn = 82 * cave.width as usize + 20;
+        let mut reached = std::collections::BTreeSet::from([spawn]);
+        let mut queue = std::collections::VecDeque::from([spawn]);
+        while let Some(i) = queue.pop_front() {
+            let (x, y) = (i as i32 % cave.width, i as i32 / cave.width);
+            for (x, y) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                if x < 0 || y < 0 || x >= cave.width || y >= cave.height {
+                    continue;
+                }
+                let next = (y * cave.width + x) as usize;
+                let cell = &cave.cells[next];
+                if content.grounds[&cell.ground] > 0.
+                    && cell
+                        .object
+                        .is_none_or(|kind| !content.objects[&kind].blocks)
+                    && reached.insert(next)
+                {
+                    queue.push_back(next);
+                }
+            }
+        }
+        assert!(
+            reached.contains(&boss),
+            "sourced cave boss is disconnected from spawn"
+        );
+        assert!(cave.cells.iter().any(|c| c.config.starts_with("conn:")));
     }
     #[test]
     fn candidate_map_is_lossless() {

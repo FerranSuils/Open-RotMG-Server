@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Play the development fixture through the authenticated normal-rule controller."""
+import argparse
 import collections
 import json
 import math
 import pathlib
 import sys
+import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-HEADERS = {"Authorization": "Bearer " + (ROOT / ".local/control.token").read_text(), "Content-Type": "application/json"}
-BASE = "http://127.0.0.1:18923"
 LIVE = set()
 
 
@@ -79,15 +80,17 @@ def wait(player, milliseconds):
 
 def play():
     identity = "self-play-" + uuid.uuid4().hex
-    player = request("join", {"guid": identity})["player"]
+    player = request("join", {"guid": identity, "world": -1})["player"]
     report("joined", observe(player))
-    companion = request("join", {"guid": "companion-" + uuid.uuid4().hex})["player"]
+    companion = request("join", {"guid": "companion-" + uuid.uuid4().hex, "world": -1})["player"]
     assert any(p["id"] == companion for p in observe(player)["players"])
     request("leave", {"player": companion})
     state = navigate(player, (12, 137))
     action(player, {'command': 'move', 'x': 12.2, 'y': 137.8})
     wait(player, 500)
-    state = wait(player, 9000)
+    deadline = time.monotonic() + 12
+    while state["character"]["hp"] == 100 and time.monotonic() < deadline:
+        state = wait(player, 100)
     assert state["character"]["hp"] < 100, "standing in the tutorial gun lane must cause damage"
     report("damaged", state)
     state = action(player, {"command": "use", "slot": 4, "x": state["pos"]["x"], "y": state["pos"]["y"]})
@@ -117,18 +120,21 @@ def play():
     report("ring equipped", state)
     character = state["character"]["id"]
     request("leave", {"player": player})
-    player = request("join", {"guid": identity})["player"]
+    player = request("join", {"guid": identity, "world": -1})["player"]
     state = observe(player)
     assert state["character"]["id"] == character and state["character"]["items"][3] == 0xa4f
     report("durable reconnect", state)
     action(player, {'command': 'swap', 'from': {'object': player, 'slot': 3, 'kind': 0xa4f}, 'to': {'object': player, 'slot': 5, 'kind': -1}})
     navigate(player, (12, 137))
-    action(player, {'command': 'move', 'x': 12.2, 'y': 137.8})
-    state = wait(player, 115000)
+    action(player, {'command': 'move', 'x': 12.2, 'y': 138.0})
+    deadline = time.monotonic() + 150
+    state = observe(player)
+    while state["character"]["alive"] and time.monotonic() < deadline:
+        state = wait(player, 1000)
     assert not state["character"]["alive"], "stationary player must eventually die in the crossfire"
     report("permanent death", state)
     request("leave", {"player": player})
-    player = request("join", {"guid": identity})["player"]
+    player = request("join", {"guid": identity, "world": -1})["player"]
     state = observe(player)
     assert state["character"]["id"] != character and state["character"]["items"][3] == -1
     report("replacement character", state)
@@ -137,6 +143,15 @@ def play():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", default="http://127.0.0.1:18923")
+    parser.add_argument("--state", type=pathlib.Path, default=ROOT / ".local")
+    args = parser.parse_args()
+    origin = urllib.parse.urlsplit(args.url)
+    if origin.scheme not in {"http", "https"} or origin.hostname not in {"127.0.0.1", "localhost", "::1"} or origin.path not in {"", "/"} or origin.query or origin.fragment or origin.username is not None:
+        parser.error("controller URL must be a loopback origin")
+    BASE = args.url.rstrip("/")
+    HEADERS = {"Authorization": "Bearer " + (args.state / "control.token").read_text().strip(), "Content-Type": "application/json"}
     try:
         play()
     finally:
