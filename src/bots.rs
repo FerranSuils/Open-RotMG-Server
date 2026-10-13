@@ -556,9 +556,10 @@ impl Brain {
                 self.last_encounter = v.time_ms;
             }
         }
+        let reachable = grid.reachable(v.position);
         if let Goal::Explore(x, y) = self.goal {
             let pos = center((x, y));
-            if pos.distance(v.position) > 0.7 {
+            if pos.distance(v.position) > 0.7 && reachable.contains(&(x, y)) {
                 choices.push((12., self.goal.clone(), pos));
             }
         }
@@ -566,8 +567,7 @@ impl Brain {
             .iter()
             .any(|(_, g, _)| matches!(g, Goal::Explore(..)))
         {
-            let next = grid
-                .walkable
+            let next = reachable
                 .iter()
                 .filter(|t| !self.blocked.contains_key(t))
                 .filter(|t| {
@@ -804,6 +804,19 @@ impl Grid {
             walkable,
             known: v.tiles.iter().map(|t| (t.x, t.y)).collect(),
         }
+    }
+    fn reachable(&self, from: Pos) -> BTreeSet<(i16, i16)> {
+        let start = tile(from);
+        let mut queue = VecDeque::from([start]);
+        let mut reached = BTreeSet::from([start]);
+        while let Some((x, y)) = queue.pop_front() {
+            for next in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)] {
+                if self.walkable.contains(&next) && reached.insert(next) {
+                    queue.push_back(next);
+                }
+            }
+        }
+        reached
     }
     fn frontier(&self, (x, y): (i16, i16), width: i32, height: i32) -> bool {
         [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]

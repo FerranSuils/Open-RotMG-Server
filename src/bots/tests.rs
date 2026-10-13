@@ -118,6 +118,29 @@ fn explores_known_frontiers_toward_an_observed_distant_encounter() {
 }
 
 #[test]
+fn exploration_does_not_wait_for_disconnected_known_frontiers() {
+    let content = content();
+    let mut v = view(&content);
+    for y in 0..30 {
+        let mut wall = object(100 + y, WIZARD, 16.5, y as f32 + 0.5);
+        wall.blocks = true;
+        v.objects.push(wall);
+    }
+    let enemy = content.objects.values().find(|o| o.enemy).unwrap().kind;
+    v.objects.push(object(2, enemy, 39.5, 11.5));
+    let mut brain = Brain::new(PROFILES[1], &v);
+    brain.goal = Goal::Explore(29, 11);
+    let decision = brain.decide(&v, &content).unwrap();
+    let Goal::Explore(x, y) = decision.goal else {
+        panic!("reachable exploration expected")
+    };
+    assert!(x < 16);
+    let grid = Grid::new(&v);
+    assert!(grid.reachable(v.position).contains(&(x, y)));
+    assert!(grid.segment(v.position, decision.movement.unwrap()));
+}
+
+#[test]
 fn busy_clock_lifecycle_and_session_do_not_fabricate_actions() {
     let content = content();
     let mut v = view(&content);
