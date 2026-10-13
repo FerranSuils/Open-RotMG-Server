@@ -69,7 +69,7 @@ pub struct App {
     pub shutdown: tokio::sync::watch::Sender<bool>,
 }
 fn error(e: anyhow::Error) -> Response {
-    tracing::error!(error=%e,"request failed");
+    tracing::error!(error=%format_args!("{e:#}"),"request failed");
     (
         StatusCode::BAD_REQUEST,
         [("content-type", "application/xml")],
@@ -656,7 +656,7 @@ async fn connection(socket: WebSocket, mut a: App) {
                         if session.reconnecting { break; }
                         let id=packet.id;
                         if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost).await {
-                            tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,error=%e,"game command rejected");
+                            tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,error=%format_args!("{e:#}"),"game command rejected");
                             if matches!(id,1|21|37|57) && let Some(player) = session.player {
                                 let reason = e.to_string();
                                 let closed = a.world.for_player(player).call(move |w| Ok(w.cancel_trade(player, &reason))).await;

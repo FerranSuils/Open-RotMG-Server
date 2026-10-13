@@ -19,6 +19,7 @@ impl Config {
         let mut port = None;
         let mut control = false;
         let mut client_dir = None;
+        let mut state_dir = None;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -43,8 +44,14 @@ impl Config {
                         args.next().context("--client requires a directory")?,
                     ));
                 }
+                "--state" => {
+                    ensure!(state_dir.is_none(), "duplicate --state");
+                    state_dir = Some(PathBuf::from(
+                        args.next().context("--state requires a directory")?,
+                    ));
+                }
                 _ => anyhow::bail!(
-                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--client DIR]"
+                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--client DIR] [--state DIR]"
                 ),
             }
         }
@@ -69,6 +76,9 @@ impl Config {
         };
         if let Some(client) = client_dir {
             config.client = client;
+        }
+        if let Some(state) = state_dir {
+            config.state = state;
         }
         if let Some(port) = port {
             config.bind.set_port(port);
@@ -164,6 +174,29 @@ mod tests {
             ])
             .is_err()
         );
+    }
+    #[test]
+    fn explicit_state_does_not_change_client_or_origin() {
+        let (original, _) = Config::load(&[]).unwrap();
+        let (isolated, _) = Config::load(&["--state".into(), "/tmp/qa-state".into()]).unwrap();
+        assert_eq!(
+            (isolated.state, isolated.client, isolated.origin),
+            (
+                PathBuf::from("/tmp/qa-state"),
+                original.client,
+                original.origin
+            )
+        );
+    }
+    #[test]
+    fn malformed_state_arguments_are_rejected() {
+        for args in [
+            vec!["--state"],
+            vec!["--state", "relative"],
+            vec!["--state", "/tmp/a", "--state", "/tmp/b"],
+        ] {
+            assert!(Config::load(&args.into_iter().map(String::from).collect::<Vec<_>>()).is_err());
+        }
     }
     #[test]
     fn local_launcher_remains_explicit() {
