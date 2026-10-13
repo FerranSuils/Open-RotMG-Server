@@ -92,9 +92,11 @@ pub async fn start(app: &App) -> Result<()> {
                     }
                     if view.lifecycle.busy || view.tick < brain.next_decision { continue; }
                     let decision = brain.decide(&view, &app.content)?;
-                    if let Some(text) = decision.chat
-                        && let Err(error) = app.world.directory(move |d| d.chat(id, text.into(), Instant::now())).await {
-                        tracing::warn!(player=id,%error,"autonomous outing announcement rejected");
+                    if let Some(text) = decision.chat {
+                        match app.world.directory(move |d| d.chat(id, text.into(), Instant::now())).await {
+                            Ok(()) => tracing::info!(player=id,text,"autonomous public call delivered"),
+                            Err(error) => tracing::warn!(player=id,text,%error,"autonomous public call rejected"),
+                        }
                     }
                     if decision.goal != brain.goal {
                         tracing::info!(player=id,name=profile.name,tick=view.tick,hp=view.character.hp,
