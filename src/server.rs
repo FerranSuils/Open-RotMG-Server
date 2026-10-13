@@ -333,23 +333,28 @@ fn slot(r: &mut Reader<'_>) -> Result<Slot> {
     })
 }
 pub(crate) async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
-    let result = a
-        .store
-        .exchange(
-            vec![InventoryWrite {
-                id: plan.character,
-                account: plan.account,
-                revision: plan.revision,
-                items: plan.items.clone(),
-            }],
-            plan.vault.clone(),
-        )
-        .await
-        .and_then(|mut revisions| {
-            revisions
-                .pop()
-                .context("inventory commit returned no revision")
-        });
+    let result = if let Some((snapshot, slot, index, amount)) = &plan.stat_growth {
+        a.store
+            .consume_stat(snapshot.clone(), slot.slot, *index, *amount)
+            .await
+    } else {
+        a.store
+            .exchange(
+                vec![InventoryWrite {
+                    id: plan.character,
+                    account: plan.account,
+                    revision: plan.revision,
+                    items: plan.items.clone(),
+                }],
+                plan.vault.clone(),
+            )
+            .await
+            .and_then(|mut revisions| {
+                revisions
+                    .pop()
+                    .context("inventory commit returned no revision")
+            })
+    };
     a.world
         .for_player(plan.player)
         .call(move |w| w.finish_inventory(plan, result))

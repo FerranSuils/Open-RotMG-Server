@@ -1,7 +1,9 @@
 mod bots;
+mod condition;
 mod config;
 mod content;
 mod crypto;
+mod dungeon;
 mod encounter;
 mod loot;
 #[cfg(test)]

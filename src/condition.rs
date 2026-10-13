@@ -1,0 +1,55 @@
+use anyhow::{Result, bail};
+use std::collections::BTreeMap;
+
+pub const QUIET: u8 = 2;
+pub const WEAK: u8 = 3;
+pub const SLOWED: u8 = 4;
+pub const SICK: u8 = 5;
+pub const DAZED: u8 = 6;
+pub const STUNNED: u8 = 7;
+pub const PARALYZED: u8 = 14;
+pub const BLEEDING: u8 = 16;
+pub const INVINCIBLE: u8 = 24;
+pub const INVULNERABLE: u8 = 25;
+pub const ARMORED: u8 = 26;
+pub const ARMOR_BROKEN: u8 = 27;
+pub fn bit(index: u8) -> i32 {
+    1 << (index - 1)
+}
+pub fn mask(timers: &BTreeMap<u8, u64>, now: u64) -> i32 {
+    timers
+        .iter()
+        .filter(|(_, deadline)| **deadline > now)
+        .fold(0, |mask, (index, _)| mask | bit(*index))
+}
+pub fn projectile_effect(name: &str) -> Result<u8> {
+    Ok(match name {
+        "Quiet" => QUIET,
+        "Weak" => WEAK,
+        "Slowed" => SLOWED,
+        "Sick" => SICK,
+        "Dazed" => DAZED,
+        "Stunned" => STUNNED,
+        "Blind" => 8,
+        "Hallucinating" => 9,
+        "Drunk" => 10,
+        "Confused" => 11,
+        "Paralyzed" => PARALYZED,
+        "Bleeding" => BLEEDING,
+        "Armor Broken" => ARMOR_BROKEN,
+        _ => bail!("unsupported selected projectile condition {name}"),
+    })
+}
+pub fn damage(raw: i32, defense: i32, flags: i32, piercing: bool) -> i32 {
+    if flags & (bit(INVINCIBLE) | bit(INVULNERABLE)) != 0 {
+        return 0;
+    }
+    let defense = if piercing || flags & bit(ARMOR_BROKEN) != 0 {
+        0
+    } else if flags & bit(ARMORED) != 0 {
+        defense * 2
+    } else {
+        defense
+    };
+    (raw - defense).max(raw * 15 / 100).max(1)
+}

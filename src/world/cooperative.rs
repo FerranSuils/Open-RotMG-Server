@@ -89,7 +89,10 @@ impl Directory {
 
 impl World {
     pub(super) fn allow_teleport(&self) -> bool {
-        matches!(self.name.as_str(), "Nexus" | "Realm" | "Pirate Cave")
+        matches!(
+            self.name.as_str(),
+            "Nexus" | "Realm" | "Pirate Cave" | "Snake Pit" | "Sprite World" | "Undead Lair"
+        )
     }
 
     fn teleport_destination(&self, id: i32, target: i32) -> Result<Pos> {
@@ -150,6 +153,10 @@ impl World {
                 && item.cooldown_ms > 0,
             "Invalid healing tome definition."
         );
+        ensure!(
+            p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET) == 0,
+            "Cannot heal while Quiet."
+        );
         ensure!(p.character.mp >= item.mana_cost, "Not enough mana to heal.");
         ensure!(
             self.now >= p.last_ability + item.cooldown_ms,
@@ -159,7 +166,11 @@ impl World {
         let healing = self
             .players
             .iter()
-            .filter(|(_, q)| ready(q) && q.pos.distance(position) < item.heal_range)
+            .filter(|(_, q)| {
+                ready(q)
+                    && q.pos.distance(position) < item.heal_range
+                    && q.conditions(self.now) & crate::condition::bit(crate::condition::SICK) == 0
+            })
             .map(|(id, q)| {
                 Ok((
                     *id,
