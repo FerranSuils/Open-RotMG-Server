@@ -37,7 +37,7 @@ impl Drop for Owner {
     }
 }
 impl App {
-    fn claim(&self, id: i32) -> Result<Owner> {
+    pub(crate) fn claim(&self, id: i32) -> Result<Owner> {
         let mut owners = self.owners.lock().expect("ownership registry poisoned");
         ensure!(owners.len() < self.max_players, "development world full");
         ensure!(owners.insert(id), "account already has an active session");
@@ -60,6 +60,7 @@ pub struct App {
     pub sfx: PathBuf,
     pub max_players: usize,
     pub behind_proxy: bool,
+    pub shore_bots: bool,
     pub requests: Arc<Mutex<HashMap<IpAddr, (std::time::Instant, u32)>>>,
     pub connections: Arc<tokio::sync::Semaphore>,
     pub control: Option<String>,
@@ -331,7 +332,7 @@ fn slot(r: &mut Reader<'_>) -> Result<Slot> {
         kind: r.i16()? as i32,
     })
 }
-async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
+pub(crate) async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
     let result = a
         .store
         .exchange(
@@ -835,7 +836,7 @@ async fn connection(socket: WebSocket, mut a: App) {
         }
     }
 }
-async fn depart(a: &App, id: i32) -> Result<()> {
+pub(crate) async fn depart(a: &App, id: i32) -> Result<()> {
     loop {
         if let Some(ch) = a
             .world
@@ -1163,6 +1164,9 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| {
         format!("cannot listen on {bind}; another server may already use this port. Stop it and rerun ./run.sh")
     })?;
+    if a.shore_bots {
+        crate::bots::start(&a).await?;
+    }
     let app = Router::new()
         .route("/legacy-api/char/list", post(chars))
         .route("/legacy-api/char/fame", post(fame))

@@ -12,6 +12,8 @@ pub struct Config {
     pub state: PathBuf,
     pub max_players: usize,
     pub behind_proxy: bool,
+    #[serde(default)]
+    pub shore_bots: bool,
     pub realm_seed: u64,
 }
 impl Config {
@@ -19,6 +21,7 @@ impl Config {
         let mut file = None;
         let mut port = None;
         let mut control = false;
+        let mut shore_bots = false;
         let mut client_dir = None;
         let mut state_dir = None;
         let mut args = args.iter();
@@ -39,6 +42,10 @@ impl Config {
                     ensure!(!control, "duplicate --dev-control");
                     control = true;
                 }
+                "--shore-bots" => {
+                    ensure!(!shore_bots, "duplicate --shore-bots");
+                    shore_bots = true;
+                }
                 "--client" => {
                     ensure!(client_dir.is_none(), "duplicate --client");
                     client_dir = Some(PathBuf::from(
@@ -52,7 +59,7 @@ impl Config {
                     ));
                 }
                 _ => anyhow::bail!(
-                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--client DIR] [--state DIR]"
+                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--shore-bots] [--client DIR] [--state DIR]"
                 ),
             }
         }
@@ -73,6 +80,7 @@ impl Config {
                 state: root.join(".local"),
                 max_players: 85,
                 behind_proxy: false,
+                shore_bots: false,
                 realm_seed: rand::random(),
             }
         };
@@ -88,6 +96,7 @@ impl Config {
                 config.origin = format!("http://{}", config.bind);
             }
         }
+        config.shore_bots |= shore_bots;
         config.validate(control)?;
         Ok((config, control))
     }
@@ -116,6 +125,10 @@ impl Config {
         ensure!(
             !control || (local && !self.behind_proxy),
             "development control cannot be enabled behind a public proxy"
+        );
+        ensure!(
+            !self.shore_bots || self.max_players >= 4,
+            "shore bots require capacity for three bots plus a human"
         );
         ensure!(
             (1..=85).contains(&self.max_players),
@@ -176,6 +189,20 @@ mod tests {
             ])
             .is_err()
         );
+    }
+    #[test]
+    fn shore_bots_are_opt_in_and_reserve_human_capacity() {
+        assert!(!Config::load(&[]).unwrap().0.shore_bots);
+        assert!(Config::load(&["--shore-bots".into()]).unwrap().0.shore_bots);
+        assert!(Config::load(&["--shore-bots".into(), "--shore-bots".into()]).is_err());
+        let mut production = config();
+        production.shore_bots = true;
+        production.validate(false).unwrap();
+        assert!(production.validate(true).is_err());
+        production.max_players = 3;
+        assert!(production.validate(false).is_err());
+        production.max_players = 4;
+        production.validate(false).unwrap();
     }
     #[test]
     fn explicit_state_does_not_change_client_or_origin() {

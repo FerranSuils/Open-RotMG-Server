@@ -39,7 +39,8 @@ impl World {
             self.players
                 .get(&id)
                 .context("script trader missing")?
-                .script_owned,
+                .controller
+                == Controller::Qa,
             "trade control requires a script-owned player"
         );
         if let Some(key) = self.trade_key(id) {
@@ -47,7 +48,7 @@ impl World {
                 self.trades[&key]
                     .players
                     .iter()
-                    .all(|id| self.players[id].script_owned),
+                    .all(|id| self.players[id].controller == Controller::Qa),
                 "trade control cannot change a browser player's trade"
             );
         }
@@ -56,7 +57,7 @@ impl World {
                 ensure!(
                     self.players
                         .values()
-                        .any(|p| p.character.name == name && p.script_owned),
+                        .any(|p| p.character.name == name && p.controller == Controller::Qa),
                     "script trade target must be script-owned"
                 );
                 self.request_trade(id, name)?;
@@ -472,7 +473,7 @@ mod tests {
             w.script_trade(ids[0], TradeAction::Request { name: name.clone() })
                 .is_err()
         );
-        w.players.get_mut(&ids[0]).unwrap().script_owned = true;
+        w.players.get_mut(&ids[0]).unwrap().controller = Controller::Qa;
         assert!(
             w.script_trade(ids[0], TradeAction::Request { name: name.clone() })
                 .is_err()
