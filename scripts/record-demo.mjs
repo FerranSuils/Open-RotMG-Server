@@ -73,6 +73,7 @@ function browser(command, value) {
   if (canvases.length !== 1) throw Error('Expected one original game canvas');
   const canvas = canvases[0];
   const geometry = () => {
+    if (document.hidden) throw Error('Owned canvas page is hidden');
     const b = canvas.getBoundingClientRect();
     if (!canvas.width || !canvas.height || b.width <= 0 || b.height <= 0 || b.x < 0 || b.y < 0 || b.right > innerWidth || b.bottom > innerHeight) throw Error('Canvas is empty or clipped outside the input viewport');
     return {x:b.x, y:b.y, width:b.width, height:b.height, pixels:[canvas.width,canvas.height]};
@@ -100,6 +101,7 @@ function browser(command, value) {
     };
     r.resize = new ResizeObserver(r.update); r.resize.observe(canvas);
     window.addEventListener('scroll', r.update, true);
+    document.addEventListener('visibilitychange', r.update);
     r.input = e => {
       if (document.activeElement?.type === 'password') { r.failure = 'Password input during capture is forbidden'; return; }
       const event = {type:e.type, time:performance.now()-r.start};
@@ -133,7 +135,7 @@ function browser(command, value) {
     r.recorder.onstop = () => {
       r.duration = (performance.now()-r.start)/1000;
       for (const name of r.events) window.removeEventListener(name, r.input, true);
-      r.resize.disconnect(); window.removeEventListener('scroll', r.update, true); cancelAnimationFrame(r.raf);
+      r.resize.disconnect(); window.removeEventListener('scroll', r.update, true); document.removeEventListener('visibilitychange', r.update); cancelAnimationFrame(r.raf);
       r.stream.getTracks().forEach(t => t.stop());
       const blob = new Blob(r.chunks, {type:'video/webm'}), reader = new FileReader();
       reader.onerror = () => reject(Error('Recorded Blob read failed'));
@@ -216,6 +218,16 @@ export async function transfer(c, directory, name) {
   await page(c,'clear'); requireValue(meta.failure === null, `Recorder failure: ${meta.failure}`);
   return meta;
 }
+export async function visible(c, target, {now = () => performance.now(), wait = pause} = {}) {
+  const deadline=now()+5000; let observed;
+  do {
+    const {bounds}=await c.call('Browser.getWindowForTarget',{targetId:target});
+    observed={windowState:bounds.windowState, hidden:await c.eval('document.hidden')};
+    if (['normal','maximized','fullscreen'].includes(observed.windowState) && observed.hidden===false) return observed;
+    await wait(100);
+  } while(now()<deadline);
+  throw Error('Owned window visibility deadline; restore the owned window before recording: '+JSON.stringify(observed));
+}
 export async function capture(options) {
   const {out, scenario, seconds} = options;
   requireValue(Number.isFinite(seconds) && seconds >= 16 && seconds <= 120, 'Explicit capture duration must be 16–120 seconds');
@@ -239,6 +251,7 @@ export async function capture(options) {
     busy = await c.eval('Boolean(window.__rotmgDemo)');
     requireValue(!busy, 'Another recorder is active; refuse overlapping controllers');
     await c.call('Page.bringToFront');
+    receipt.window=await visible(c,options.target,{wait:controls.wait});
     await controls.wait(2000);
     await page(c,'start'); active='probe'; await controls.wait(150);
     await controls.gesture([.35,.4],[.65,.6],1500); await controls.wait(300);
