@@ -1,6 +1,6 @@
 use crate::content::{Content, Object, WIZARD};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::mpsc};
 use tokio::sync::oneshot;
@@ -184,6 +184,7 @@ impl Store {
         let mut c = Connection::open(path)?;
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY,guid TEXT NOT NULL UNIQUE,name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS shore_bots(name TEXT PRIMARY KEY,account INTEGER NOT NULL UNIQUE REFERENCES accounts(id));
 CREATE TABLE IF NOT EXISTS characters(id INTEGER PRIMARY KEY,account INTEGER NOT NULL REFERENCES accounts(id),stats TEXT NOT NULL,items TEXT NOT NULL,revision INTEGER NOT NULL DEFAULT 0,alive INTEGER NOT NULL DEFAULT 1);
 CREATE UNIQUE INDEX IF NOT EXISTS one_living_character ON characters(account) WHERE alive=1;
 CREATE TABLE IF NOT EXISTS deaths(character INTEGER PRIMARY KEY REFERENCES characters(id),snapshot TEXT NOT NULL,killed_by TEXT NOT NULL,died_at INTEGER NOT NULL DEFAULT(unixepoch()));
@@ -281,6 +282,40 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             let next_id:i32=tx.query_row("SELECT coalesce(max(id),0)+1 FROM characters WHERE account=?1",[id],|r|r.get(0))?;let best_levels = { let mut q = tx.prepare("SELECT json_extract(stats,'$.class'),max(json_extract(stats,'$.level')) FROM characters WHERE account=?1 GROUP BY json_extract(stats,'$.class')")?; q.query_map([id], |r| Ok((r.get::<_,u16>(0)?, r.get::<_,i32>(1)?)))?.collect::<rusqlite::Result<std::collections::BTreeMap<_,_>>>()? };tx.commit()?;Ok(Account{id,name,next_id,best_levels,characters})}).await?;
         self.vault(account.id).await?;
         Ok(account)
+    }
+    pub async fn shore_character(
+        &self,
+        name: String,
+        wizard: &Object,
+    ) -> Result<Option<Character>> {
+        let guid = self.call(move |db| {
+            let tx = db.transaction()?;
+            let existing: Option<String> = tx.query_row(
+                "SELECT guid FROM accounts JOIN shore_bots ON accounts.id=shore_bots.account WHERE shore_bots.name=?1",
+                [&name], |r| r.get(0)).optional()
+                .context("read shore bot identity; credential-free restores require operator recovery")?;
+            let guid = match existing {
+                Some(guid) => guid,
+                None => {
+                    let guid = format!("shore-{:032x}", rand::random::<u128>());
+                    tx.execute("INSERT INTO accounts(guid,name) VALUES(?1,?2)", params![guid,name])?;
+                    tx.execute("INSERT INTO shore_bots(name,account) VALUES(?1,?2)", params![name,tx.last_insert_rowid()])?;
+                    guid
+                }
+            };
+            tx.commit()?;
+            Ok(guid)
+        }).await?;
+        let mut account = self.list(guid).await?;
+        ensure!(
+            account.characters.len() <= 1,
+            "shore account has multiple live characters"
+        );
+        if account.next_id == 1 {
+            Ok(Some(self.create(account.id, wizard).await?))
+        } else {
+            Ok(account.characters.pop())
+        }
     }
     pub async fn create(&self, account: i32, wizard: &Object) -> Result<Character> {
         ensure!(
@@ -739,6 +774,72 @@ mod tests {
         ch.items[3] = -1;
         ch.base[0] = content.classes[&WIZARD].caps[0] + 1;
         assert!(ch.effective(&content).is_err());
+    }
+    #[tokio::test]
+    async fn shore_accounts_resume_committed_characters_and_never_rebuild_the_dead() {
+        let content = Content::load(Path::new("data")).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "openrotmg-shore-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let store = Store::open(&path, &content).unwrap();
+        let wizard = content.get(WIZARD).unwrap();
+        let human = store.list("shore-human".into()).await.unwrap();
+        store.rename(human.id, "Bayleaf".into()).await.unwrap();
+        let mut bot = store
+            .shore_character("Bayleaf".into(), wizard)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(bot.account, human.id);
+        let identity = (bot.account, bot.id);
+        assert_eq!(bot.items, wizard.equipment);
+        bot.exp = 12;
+        bot.shots = 4;
+        bot.hp = 42;
+        store.progress(bot.clone()).await.unwrap();
+        let reopened = Store::open(&path, &content).unwrap();
+        let resumed = reopened
+            .shore_character("Bayleaf".into(), wizard)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((resumed.account, resumed.id), identity);
+        assert_eq!(resumed.exp, 12);
+        assert_eq!(resumed.hp, 42);
+        assert_eq!(resumed.shots, 4);
+        bot.hp = 0;
+        bot.alive = false;
+        store.death(bot, "test enemy".into()).await.unwrap();
+        assert!(
+            reopened
+                .shore_character("Bayleaf".into(), wizard)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .shore_character("Bayleaf".into(), wizard)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let records: i32 = store
+            .call(move |db| {
+                Ok(db.query_row(
+                    "SELECT count(*) FROM characters WHERE account=?1",
+                    [identity.0],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(records, 1);
+        drop(reopened);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
     #[tokio::test]
     async fn legacy_metadata_migration_preserves_immutable_death_bytes() {

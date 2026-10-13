@@ -1,8 +1,14 @@
 # Gameplay bots: vision and research
 
-Research and the isolated offline decision experiment are approved. No game-bot integration or deployment is authorized.
+The user approved the autonomous Wizard shore prototype, its gameplay PR and production deployment. Further population slices remain unselected.
 
-The north star is approved; architecture, in-game prototype scope and population seeding remain proposals. The server is still too early for bot integration. This document records the vision and technical discussion. The two video research reports record observations and limits; `research/decision-spike.md` records the completed offline experiment.
+The two video reports record observations and limits; `research/decision-spike.md` records the earlier offline experiment.
+
+## Local shore prototype
+
+Run `./run.sh 18923 --shore-bots --release`, then enter the Realm through its normal portal. Bayleaf prioritizes recovery, Mossy resources and Trellis companions. They start with ordinary Wizard equipment, use the restricted player view, earn XP and accessible loot, and save through ordinary inventory/progression rules. Native local chat `Trellis follow me` requests following while the sender is visible; it does not reveal a hidden position.
+
+This flag is default-off and separate from QA control. Hosting can explicitly set `shore_bots: true` with capacity for three bots plus humans; production QA controls remain prohibited. Human, QA and autonomous ownership/counts are distinct. Saved bot accounts resume their committed character; a dead character stays retired. There is no automatic replacement, trade negotiation, dungeon routing or language service. The candidate shore and passing mechanical tests do not establish historical authenticity or the complete community vision.
 
 ## Approved north star
 
@@ -94,4 +100,4 @@ Two bounded local checks passed: the ten existing world boundary tests, and a co
 1. Should the first proof emphasize believable combat, or include a small meaningful chat/group interaction immediately? Recommendation: combat plus one interaction, not sophisticated banter.
 2. Should the initial population start with mixed progression/gear or earn everything from starter characters? Recommendation: starter characters for the prototype; decide any one-time population seeding before trading is enabled.
 
-Do not create bot implementation phases yet. Revisit `/create-plan` once the relevant shared gameplay is verified and these deferred choices are settled. Research can proceed independently.
+The selected shore slice does not approve further population phases. Revisit the shared gameplay dependencies before expanding it.
