@@ -294,7 +294,7 @@ fn fresh_crewmate_meets_unseen_leader_in_nexus_through_expiring_public_chat() {
     assert!(follower.decide(&v, &content).unwrap().chat.is_none());
     for (name, actor, recipient) in [("Reed", 9, ""), ("Mossy", -1, ""), ("Mossy", 2, "Human")] {
         follower
-            .receive(packet(name, actor, recipient, "tp here"), &v)
+            .receive(packet(name, actor, recipient, "nexus"), &v)
             .unwrap();
         assert!(follower.regroup_call.is_none());
     }
@@ -332,7 +332,7 @@ fn fresh_crewmate_meets_unseen_leader_in_nexus_through_expiring_public_chat() {
     assert!(follower.decide(&v, &content).unwrap().journey.is_none());
     let mut unsolicited = Brain::new(PROFILES[2], &v);
     unsolicited
-        .receive(packet("Mossy", 2, "", "nexus"), &v)
+        .receive(packet("Mossy", 2, "", "tp here"), &v)
         .unwrap();
     assert!(unsolicited.regroup_call.is_none());
     let mut occupied = Brain::new(PROFILES[2], &v);
@@ -347,7 +347,10 @@ fn fresh_crewmate_meets_unseen_leader_in_nexus_through_expiring_public_chat() {
     occupied
         .receive(packet("Mossy", 2, "", "nexus"), &v)
         .unwrap();
-    assert!(occupied.regroup_call.is_none());
+    assert!(matches!(
+        occupied.decide(&v, &content).unwrap().journey,
+        Some(Journey::Nexus)
+    ));
     let mut expired = Brain::new(PROFILES[2], &v);
     expired.requested_until = v.time_ms + 5000;
     expired
@@ -360,10 +363,14 @@ fn fresh_crewmate_meets_unseen_leader_in_nexus_through_expiring_public_chat() {
     injured
         .receive(packet("Mossy", 2, "", "nexus"), &v)
         .unwrap();
-    v.character.hp = 70;
-    assert!(injured.decide(&v, &content).unwrap().journey.is_none());
+    v.character.hp = 30;
+    assert!(matches!(
+        injured.decide(&v, &content).unwrap().journey,
+        Some(Journey::Nexus)
+    ));
     v.character.hp = 100;
     let mut endangered = Brain::new(PROFILES[1], &leader_view);
+    endangered.next_call = leader_view.time_ms;
     endangered
         .receive(packet("Trellis", 1, "", "tp?"), &leader_view)
         .unwrap();
@@ -376,6 +383,36 @@ fn fresh_crewmate_meets_unseen_leader_in_nexus_through_expiring_public_chat() {
             .chat
             .is_none()
     );
+}
+
+#[test]
+fn nexus_call_reunites_the_whole_crew_not_only_the_requester() {
+    let content = content();
+    let v = view(&content);
+    for profile in [PROFILES[0], PROFILES[2]] {
+        let mut follower = Brain::new(profile, &v);
+        let mut w = crate::wire::Writer::new();
+        w.utf("Mossy")
+            .i32(2)
+            .i32(0)
+            .u8(5)
+            .utf("")
+            .utf("nexus")
+            .utf("");
+        follower
+            .receive(
+                Packet {
+                    id: wire::TEXT,
+                    body: w.0,
+                },
+                &v,
+            )
+            .unwrap();
+        assert!(matches!(
+            follower.decide(&v, &content).unwrap().journey,
+            Some(Journey::Nexus)
+        ));
+    }
 }
 
 #[test]

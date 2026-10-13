@@ -193,13 +193,14 @@ impl Brain {
             let leader = self.profile.name == self.profile.leader;
             if (!leader
                 && name == self.profile.leader
-                && (text == "nexus"
-                    || (text == "tp here" && view.objects.iter().any(|o| o.id == actor)))
-                && self.requested_until > view.time_ms
                 && self.companion.is_none()
-                && self
-                    .leader_seen
-                    .is_none_or(|(_, _, seen)| view.time_ms.saturating_sub(seen) >= 10000))
+                && (text == "nexus"
+                    || (text == "tp here"
+                        && view.objects.iter().any(|o| o.id == actor)
+                        && self.requested_until > view.time_ms
+                        && self.leader_seen.is_none_or(|(_, _, seen)| {
+                            view.time_ms.saturating_sub(seen) >= 10000
+                        }))))
                 || (leader
                     && text == "tp?"
                     && PROFILES
@@ -304,6 +305,15 @@ impl Brain {
             if peer.name == self.profile.leader {
                 self.leader_seen = Some((peer.id, peer.position, v.time_ms));
             }
+        }
+        if v.map.name == "Realm"
+            && self.regroup_call.as_ref().is_some_and(|(journey, until)| {
+                matches!(journey, Journey::Nexus) && *until > v.time_ms
+            })
+        {
+            self.regroup_call = None;
+            decision.journey = Some(Journey::Nexus);
+            return Ok(decision);
         }
         decision.item = social::healing(v, content)?;
         let enemies: Vec<_> = v
