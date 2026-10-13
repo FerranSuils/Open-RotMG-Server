@@ -17,10 +17,13 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 mod chat;
 pub(crate) use chat::chat_error;
+mod cooperative;
+#[cfg(test)]
+mod cooperative_tests;
+mod trade;
 pub(crate) mod view;
 #[cfg(test)]
 mod view_tests;
-mod trade;
 pub use trade::{TradeAction, TradePlan};
 #[derive(Clone)]
 pub struct Output {
@@ -135,7 +138,7 @@ impl Bullet {
         }
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Slot {
     pub object: i32,
     pub slot: usize,
@@ -234,6 +237,7 @@ pub struct Directory {
     grants: BTreeMap<Vec<u8>, Grant>,
     portals: BTreeMap<i32, Portal>,
     chat_budgets: BTreeMap<i32, chat::ChatBudget>,
+    teleports: BTreeMap<i32, Instant>,
     idle: BTreeMap<i32, u64>,
     next_world: i32,
     pub tick: u64,
@@ -281,6 +285,7 @@ impl Directory {
             grants: BTreeMap::new(),
             portals: BTreeMap::new(),
             chat_budgets: BTreeMap::new(),
+            teleports: BTreeMap::new(),
             idle: BTreeMap::new(),
             next_world: 1,
             tick: 0,
@@ -904,7 +909,7 @@ impl World {
             .utf(&self.name)
             .u32(1)
             .i32(0)
-            .u8(0)
+            .u8(u8::from(self.allow_teleport()))
             .u8(1)
             .i16(0)
             .i16(0);
@@ -1359,8 +1364,13 @@ impl World {
         self.cancel_trade(id, "Trade cancelled by inventory mutation.");
         let p = self.players.get(&id).context("player missing")?;
         ensure!(
-            !p.pending && !p.death_pending && !p.departing && p.character.alive,
-            "player is busy, departing or dead"
+            !p.pending
+                && !p.death_pending
+                && !p.departing
+                && p.character.alive
+                && p.character.hp > 0
+                && p.persistence_failure.is_none(),
+            "player is busy, departing, quarantined or dead"
         );
         ensure!(
             slot.object == id && slot.slot < 12 && p.character.items[slot.slot] == slot.kind,
@@ -1381,9 +1391,21 @@ impl World {
                 }
                 Ok(Some(plan))
             }
+            "HealNova" => {
+                self.heal_nova(id, slot, &item)?;
+                Ok(None)
+            }
             "BulletNova" => {
+                ensure!(
+                    slot.slot == 1
+                        && item.slot_type == self.content.get(p.character.class)?.slots[1],
+                    "ability must be equipped by a compatible class"
+                );
                 ensure!(p.character.mp >= item.mana_cost, "not enough mana");
-                ensure!(self.now >= p.last_ability + 500, "ability cooldown");
+                ensure!(
+                    self.now >= p.last_ability + item.cooldown_ms,
+                    "ability cooldown"
+                );
                 ensure!(p.pos.distance(pos) <= 15., "ability target too far");
                 let spec = item
                     .projectiles
@@ -1737,7 +1759,7 @@ impl World {
         p.last_move = time;
         let mut out = Writer::new();
         out.i32(id).f32(p.pos.x).f32(p.pos.y);
-        send(p, 52, out.0);
+        send(p, wire::GOTO, out.0);
         tracing::warn!(
             player = id,
             previous_time,
@@ -2992,10 +3014,7 @@ mod tests {
             slot: 4,
             kind: 0xa23,
         };
-        let plan = w
-            .use_item(id, slot.clone(), w.players[&id].pos)
-            .unwrap()
-            .unwrap();
+        let plan = w.use_item(id, slot, w.players[&id].pos).unwrap().unwrap();
         assert_eq!(w.players[&id].character.mp, 25);
         assert_eq!(w.players[&id].character.items[4], 0xa23);
         w.finish_inventory(plan, Ok(1)).unwrap();
@@ -3034,7 +3053,7 @@ mod tests {
         assert!(
             w.swap(
                 id,
-                from.clone(),
+                from,
                 Slot {
                     object: public,
                     slot: 1,
@@ -3371,7 +3390,7 @@ mod tests {
         assert!(
             w.swap(
                 other,
-                from.clone(),
+                from,
                 Slot {
                     object: other,
                     slot: 5,

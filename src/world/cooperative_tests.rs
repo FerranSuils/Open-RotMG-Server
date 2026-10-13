@@ -1,0 +1,233 @@
+use super::*;
+use crate::content::{PRIEST, WIZARD};
+use crate::wire::Reader;
+use std::time::Duration;
+
+use super::tests::receive;
+fn setup() -> (
+    Directory,
+    i32,
+    i32,
+    mpsc::Receiver<Packet>,
+    mpsc::Receiver<Packet>,
+) {
+    let mut d = super::tests::directory();
+    let (a, mut ar) = receive(&mut d, -2, 1, WIZARD);
+    let (b, mut br) = receive(&mut d, -2, 2, PRIEST);
+    let w = d.worlds.get_mut(&-2).unwrap();
+    w.now = 600;
+    w.updates(a, false).unwrap();
+    w.updates(b, false).unwrap();
+    while ar.try_recv().is_ok() {}
+    while br.try_recv().is_ok() {}
+    (d, a, b, ar, br)
+}
+#[test]
+fn selected_minimap_teleport_goto_effect_and_current_view() {
+    let (mut d, a, b, mut ar, mut br) = setup();
+    let info = d.worlds[&-2].map_info();
+    let mut r = Reader::new(&info);
+    r.i32().unwrap();
+    r.i32().unwrap();
+    r.utf().unwrap();
+    r.i32().unwrap();
+    r.i32().unwrap();
+    assert_eq!(r.u8().unwrap(), 1);
+    let before = d.player_view(a).unwrap();
+    let receipt = d.teleport(a, b, Instant::now()).unwrap();
+    let after = d.player_view(a).unwrap();
+    assert!(before.position.distance(after.position) > 0.);
+    assert_eq!(
+        (receipt.world, receipt.player, receipt.character),
+        (-2, a, 101)
+    );
+    assert_eq!(after.session.world, receipt.world);
+    assert_eq!(after.position.distance(receipt.position), 0.);
+    for rx in [&mut ar, &mut br] {
+        let packets: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let goto = packets.iter().find(|p| p.id == wire::GOTO).unwrap();
+        let mut r = Reader::new(&goto.body);
+        assert_eq!(r.i32().unwrap(), a);
+        assert_eq!(
+            (r.f32().unwrap(), r.f32().unwrap()),
+            (receipt.position.x, receipt.position.y)
+        );
+        r.done().unwrap();
+        let show = packets.iter().find(|p| p.id == wire::SHOW_EFFECT).unwrap();
+        assert_eq!(show.body[0], 2);
+    }
+}
+#[test]
+fn teleport_cooldown_survives_transfer_reconnect_and_refills_exactly() {
+    let (mut d, a, b, _ar, _br) = setup();
+    let now = Instant::now();
+    d.teleport(a, b, now).unwrap();
+    assert!(d.teleport(a, b, now + Duration::from_millis(9999)).is_err());
+    let c = d.worlds.get_mut(&-2).unwrap().leave(a).unwrap();
+    let realm = d.worlds.get_mut(&-3).unwrap();
+    let a2 = realm.enter(c, None).unwrap();
+    let (b2, _rx) = receive(&mut d, -3, 3, WIZARD);
+    d.worlds.get_mut(&-3).unwrap().updates(a2, false).unwrap();
+    assert!(
+        d.teleport(a2, b2, now + Duration::from_millis(9999))
+            .is_err()
+    );
+    assert!(d.teleport(a2, b2, now - Duration::from_millis(1)).is_err());
+    d.teleport(a2, b2, now + Duration::from_secs(10)).unwrap();
+    assert!(d.player_view(a).is_err());
+}
+#[test]
+fn teleport_rejects_wrong_world_unseen_self_blocked_and_lifecycle_targets_without_charging() {
+    let (mut d, a, b, _ar, _br) = setup();
+    let now = Instant::now();
+    let (other, _rx) = receive(&mut d, -3, 3, WIZARD);
+    assert!(d.teleport(a, a, now).is_err());
+    assert!(d.teleport(a, other, now).is_err());
+    assert!(d.teleport(a, -999, now).is_err());
+    d.worlds
+        .get_mut(&-2)
+        .unwrap()
+        .players
+        .get_mut(&a)
+        .unwrap()
+        .known
+        .remove(&b);
+    assert!(d.teleport(a, b, now).is_err());
+    d.worlds.get_mut(&-2).unwrap().updates(a, false).unwrap();
+    for mode in 0..6 {
+        let p = d.worlds.get_mut(&-2).unwrap().players.get_mut(&b).unwrap();
+        p.pending = mode == 0;
+        p.death_pending = mode == 1;
+        p.departing = mode == 2;
+        p.persistence_failure = (mode == 3).then(|| "uncertain commit".into());
+        p.character.alive = mode != 4;
+        p.character.hp = if mode == 5 { 0 } else { 100 };
+        assert!(d.teleport(a, b, now).is_err());
+        assert!(d.teleports.is_empty());
+    }
+    let w = d.worlds.get_mut(&-2).unwrap();
+    let p = w.players.get_mut(&b).unwrap();
+    p.character.hp = 100;
+    let previous = p.pos;
+    p.pos = Pos { x: -1., y: -1. };
+    assert!(d.teleport(a, b, now).is_err());
+    d.worlds
+        .get_mut(&-2)
+        .unwrap()
+        .players
+        .get_mut(&b)
+        .unwrap()
+        .pos = previous;
+    d.teleport(a, b, now).unwrap();
+    let (a, _ar) = receive(&mut d, -1, 4, WIZARD);
+    let (b, _br) = receive(&mut d, -1, 5, WIZARD);
+    assert!(d.teleport(a, b, now).is_err());
+}
+#[test]
+fn priest_heals_own_and_nearby_hp_caps_and_spends_xml_mana_with_native_effects() {
+    let (mut d, a, b, mut ar, mut br) = setup();
+    let w = d.worlds.get_mut(&-2).unwrap();
+    w.players.get_mut(&a).unwrap().character.hp = 17;
+    w.players.get_mut(&b).unwrap().character.hp = 35;
+    let item = w.content.get(0xa31).unwrap().clone();
+    w.heal_nova(
+        b,
+        Slot {
+            object: b,
+            slot: 1,
+            kind: 0xa31,
+        },
+        &item,
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            w.players[&a].character.hp,
+            w.players[&b].character.hp,
+            w.players[&b].character.mp
+        ),
+        (100, 100, 40)
+    );
+    assert_eq!(d.player_view(b).unwrap().character.mp, 40);
+    for rx in [&mut ar, &mut br] {
+        let packets: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            packets
+                .iter()
+                .filter(|p| p.id == wire::NOTIFICATION)
+                .count(),
+            2
+        );
+        let blast = packets
+            .iter()
+            .find(|p| p.id == wire::SHOW_EFFECT && p.body[0] == 5)
+            .unwrap();
+        let mut r = Reader::new(&blast.body);
+        assert_eq!(r.u8().unwrap(), 5);
+        assert_eq!(r.i32().unwrap(), b);
+        assert_eq!(r.f32().unwrap(), 5.);
+        assert_eq!(r.f32().unwrap(), 0.);
+        assert_eq!(r.f32().unwrap(), 0.);
+        assert_eq!(r.f32().unwrap(), 0.);
+        assert_eq!(r.i32().unwrap() as u32, 0xffffffff);
+        r.done().unwrap();
+    }
+}
+#[test]
+fn priest_range_world_lifecycle_mana_equipment_and_unsupported_tomes_are_strict() {
+    let (mut d, a, b, _ar, _br) = setup();
+    let (other, _rx) = receive(&mut d, -3, 3, WIZARD);
+    d.worlds
+        .get_mut(&-3)
+        .unwrap()
+        .players
+        .get_mut(&other)
+        .unwrap()
+        .character
+        .hp = 20;
+    let w = d.worlds.get_mut(&-2).unwrap();
+    let item = w.content.get(0xa31).unwrap().clone();
+    let slot = Slot {
+        object: b,
+        slot: 1,
+        kind: 0xa31,
+    };
+    let position = w.players[&b].pos;
+    let p = w.players.get_mut(&a).unwrap();
+    p.pos = Pos {
+        x: position.x + 5.,
+        y: position.y,
+    };
+    p.character.hp = 20;
+    w.heal_nova(b, slot, &item).unwrap();
+    assert_eq!(w.players[&a].character.hp, 20);
+    assert_eq!(d.worlds[&-3].players[&other].character.hp, 20);
+    let w = d.worlds.get_mut(&-2).unwrap();
+    w.players.get_mut(&b).unwrap().character.mp = 100;
+    assert!(w.heal_nova(b, slot, &item).is_err());
+    w.now += 500;
+    for mode in 0..4 {
+        let p = w.players.get_mut(&a).unwrap();
+        p.pos = position;
+        p.death_pending = mode == 0;
+        p.departing = mode == 1;
+        p.pending = mode == 2;
+        p.persistence_failure = (mode == 3).then(|| "failed".into());
+        w.heal_nova(b, slot, &item).unwrap();
+        assert_eq!(w.players[&a].character.hp, 20);
+        w.now += 500;
+        w.players.get_mut(&b).unwrap().character.mp = 100;
+    }
+    w.players.get_mut(&b).unwrap().character.mp = 59;
+    assert!(w.heal_nova(b, slot, &item).is_err());
+    w.players.get_mut(&b).unwrap().character.mp = 100;
+    assert!(w.heal_nova(a, slot, &item).is_err());
+    assert!(w.heal_nova(b, Slot { slot: 4, ..slot }, &item).is_err());
+    let mut invalid = item.clone();
+    invalid.activations = 2;
+    assert!(w.heal_nova(b, slot, &invalid).is_err());
+    invalid = item;
+    invalid.tier = None;
+    assert!(w.heal_nova(b, slot, &invalid).is_err());
+    assert_eq!(w.players[&b].character.mp, 100);
+}

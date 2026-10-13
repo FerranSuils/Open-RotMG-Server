@@ -393,9 +393,9 @@ async fn handle(
                     expected.is_none(),
                     "transfer requires LOAD of the existing character"
                 );
-                ensure!(r.i16()? as u16 == WIZARD, "only Wizard is implemented");
+                let kind = r.i16()? as u16;
                 r.done()?;
-                a.store.create(account, a.content.get(WIZARD)?).await?
+                a.store.create(account, a.content.get(kind)?).await?
             } else {
                 let id = r.i32()?;
                 r.done()?;
@@ -476,6 +476,21 @@ async fn handle(
                     .await?;
             }
         }
+        wire::TELEPORT => {
+            let target = r.i32()?;
+            r.done()?;
+            let id = player.context("teleport before character")?;
+            let received = std::time::Instant::now();
+            if let Err(error) = a
+                .world
+                .directory(move |d| d.teleport(id, target, received))
+                .await
+            {
+                tracing::warn!(player=id, target, error=%error, "teleport rejected");
+                tx.send(crate::world::chat_error(&error.to_string()))
+                    .await?;
+            }
+        }
         wire::PONG => {
             r.i32()?;
             r.i32()?;
@@ -507,8 +522,14 @@ async fn handle(
             };
             r.done()?;
             let id = player.context("item use before character")?;
-            if let Some(plan) = a.world.call(move |w| w.use_item(id, s, pos)).await? {
-                persist(a, plan).await?;
+            match a.world.call(move |w| w.use_item(id, s, pos)).await {
+                Ok(Some(plan)) => persist(a, plan).await?,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(player=id, item=s.kind, slot=s.slot, error=%error, "item use rejected");
+                    tx.send(crate::world::chat_error(&error.to_string()))
+                        .await?;
+                }
             }
         }
         21 => {
