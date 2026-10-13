@@ -748,6 +748,7 @@ async fn connection(socket: WebSocket, mut a: App) {
     tokio::pin!(deadline);
     let mut codec = Codec::server();
     let mut session = Session::default();
+    let mut reconnect_sent = false;
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut serial = 0;
     let mut packet_window = std::time::Instant::now();
@@ -789,12 +790,13 @@ async fn connection(socket: WebSocket, mut a: App) {
             },
             _=shutdown.changed()=>break,
             _=lost_rx.changed()=>{tracing::warn!(player=session.player,"closing slow game connection before its state diverges");break;},
-            _=&mut deadline,if session.player.is_none() && !session.reconnecting=>{tracing::warn!("game selection deadline exceeded");break;},
+            _=&mut deadline,if session.player.is_none() && (!session.reconnecting || reconnect_sent)=>{tracing::warn!(reconnecting=session.reconnecting,reconnect_sent,"game selection or reconnect-close deadline exceeded");break;},
             outgoing=rx.recv()=>{
                 let Some(packet)=outgoing else {break};
                 let reconnect=packet.id==39;
                 if wsout.send(Message::Binary(codec.frame(packet.id,packet.body).into())).await.is_err(){break;}
-                if reconnect {break;}
+                // Ruffle can discard unread TCP bytes when the proxy closes before its next frame.
+                if reconnect {reconnect_sent=true;deadline.as_mut().reset(tokio::time::Instant::now()+std::time::Duration::from_secs(10));}
             },
             _=ping.tick()=>{if session.account.is_some(){serial+=1;let mut o=Writer::new();o.i32(serial);
                 if wsout.send(Message::Binary(codec.frame(wire::PING,o.0).into())).await.is_err(){break;}}}
