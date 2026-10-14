@@ -197,7 +197,14 @@ fn slime_splits_are_selected_and_traps_burst_once_then_expire() {
     w.players.get_mut(&player).unwrap().pos = pos;
     let trap = w.spawn_entity(0xda2, pos, vec![]).unwrap();
     let shots = w.npc_step();
-    assert_eq!(shots.iter().filter(|(owner, _)| *owner == trap).count(), 12);
+    let trap_shots: Vec<_> = shots.iter().filter(|(owner, _)| *owner == trap).collect();
+    assert_eq!(trap_shots.len(), 1);
+    let mut r = wire::Reader::new(&trap_shots[0].1);
+    r.take(20).unwrap();
+    assert_eq!(r.u8().unwrap(), 12);
+    r.f32().unwrap();
+    r.done().unwrap();
+    assert_eq!(w.bullets.iter().filter(|b| b.owner == trap).count(), 12);
     w.now += 50;
     w.mechanic_expiry();
     assert!(!w.entities.contains_key(&trap));
