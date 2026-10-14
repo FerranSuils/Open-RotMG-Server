@@ -98,8 +98,8 @@ async function pauseAll() {
   return {...result,pause_scope:clients.length?'server_and_native':'server'};
 }
 async function resumeAll() {
-  for (const c of clients) await c.evaluate(`(${nativeClock.toString()})(null)`);
   mayProgress=true;
+  for (const c of clients) await c.evaluate(`(${nativeClock.toString()})(null)`);
   await api({op:'resume'});
   for (const c of clients) await c.evaluate(`(${nativeClock.toString()})(false)`);
 }

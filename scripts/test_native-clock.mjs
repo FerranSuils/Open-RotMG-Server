@@ -28,7 +28,13 @@ test('untracked prior native suspension fails closed before clock installation',
   const f=fixture(false);assert.throws(()=>f.call(null),/Untracked native pause/);
 });
 test('out of band native playback cannot silently resume a stopped clock',()=>{
-  const f=fixture();f.call(true);f.api.resume();assert.throws(()=>f.call(false),/outside the coordinated bridge/);
+  const f=fixture();f.call(true);f.api.resume();assert.throws(()=>f.call(false),/playback change/);
+});
+test('stopping after an untracked pause cannot silently clear clock invalidation',()=>{
+  const f=fixture(false);for(const op of [null,true])try{f.call(op);}catch{}f.api.resume();assert.throws(()=>f.call(false),/Native clock invalid/);
+});
+test('cleanup suspends out of band playback but still refuses native acceptance',()=>{
+  const f=fixture();f.call(true);f.api.resume();try{f.call(true);}catch{}assert.deepEqual([f.api.isPlaying,vm.runInContext('globalThis[Symbol.for("openrotmg.testing.native-clock.v1")].invalid',f.context)],[false,true]);
 });
 test('explicit Date construction, static methods and callable Date remain compatible',()=>{
   const f=fixture();f.call(null);
