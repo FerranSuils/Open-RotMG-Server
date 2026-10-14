@@ -93,9 +93,10 @@ impl Store {
             }
             for c in characters.values() {
                 if let Some(row)=records.get_mut(&c.account) {
+                    ensure!(c.fame >= 0, "negative persisted fame for character {}", c.id);
                     let best=row["base_fame"].as_i64().context("invalid best fame")?;
                     if i64::from(c.fame)>best {row["base_fame"]=c.fame.into();}
-                    if !c.alive {row["total_fame"]=(row["total_fame"].as_i64().context("invalid total fame")?+i64::from(c.fame)).into();}
+                    if !c.alive {row["total_fame"]=row["total_fame"].as_i64().context("invalid total fame")?.checked_add(i64::from(c.fame)).context("lifetime fame overflow")?.into();}
                 }
             }
             {
@@ -267,6 +268,9 @@ mod tests {
         );
         let mut live = c.clone();
         live.fame = 100;
+        let mut invalid = live.clone();
+        invalid.fame = -1;
+        assert!(s.hiscores(vec![invalid]).await.is_err());
         let scores = s.hiscores(vec![live.clone()]).await.unwrap();
         assert_eq!(scores["players"][0]["base_fame"], 100);
         assert_eq!(scores["players"][0]["total_fame"], 0);
