@@ -41,10 +41,6 @@ fn validate(text: &str) -> Result<()> {
                 || matches!(c, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')),
         "Chat message contains control characters."
     );
-    ensure!(
-        !text.trim_start().starts_with('/'),
-        "Chat commands are not supported; send a local message without '/'."
-    );
     Ok(())
 }
 
@@ -60,6 +56,38 @@ impl Directory {
                 && !sender.departing
                 && sender.persistence_failure.is_none(),
             "Dead, departing or quarantined players cannot chat."
+        );
+        if text.trim().eq_ignore_ascii_case("/pause") {
+            let paused = !sender.paused;
+            if paused {
+                // Historical reference-server policy; see docs/pause.md.
+                ensure!(
+                    !world.entities.values().any(|e| e.hp > 0
+                        && world.content.objects[&e.kind].enemy
+                        && sender.pos.distance(e.pos) <= 8.),
+                    "Not safe enough to pause!"
+                );
+            }
+            let p = world.players.get_mut(&id).unwrap();
+            p.paused = paused;
+            p.last_move_at = world.now;
+            let reply = text_packet(
+                "",
+                -1,
+                0,
+                if paused {
+                    "Game paused."
+                } else {
+                    "Game resumed."
+                },
+            );
+            send(p, reply.id, reply.body);
+            tracing::info!(player = id, paused, "player pause changed");
+            return Ok(());
+        }
+        ensure!(
+            !text.trim_start().starts_with('/'),
+            "Unknown chat command. Use /pause to pause or resume."
         );
         let account = sender.character.account;
         let packet = text_packet(&sender.character.name, id, 5, &text);
