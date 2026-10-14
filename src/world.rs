@@ -1172,7 +1172,9 @@ impl World {
             .collect()
     }
     pub fn updates(&mut self, id: i32, initial: bool) -> Result<()> {
-        let visible = self.visible(id);
+        let mut visible = self.visible(id);
+        // The native minimap tracks players across this world, including outside explored terrain.
+        visible.extend(self.players.keys().copied());
         let previous = &self.players[&id].known;
         let mut added: Vec<i32> = visible.difference(previous).copied().collect();
         // Private-container owner stats dereference the native map's self player.
@@ -3144,6 +3146,86 @@ mod tests {
         let id = w.enter(ch(&w), None).unwrap();
         assert!(w.players[&id].tiles.len() < w.map.cells.len());
         assert!(w.players[&id].known.contains(&id));
+    }
+    #[test]
+    fn native_minimap_keeps_distant_players_without_revealing_perception_or_fog() {
+        let mut d = directory();
+        let (observer, mut rx) = receive(&mut d, -3, 1, WIZARD);
+        let w = d.worlds.get_mut(&-3).unwrap();
+        let mut character = ch(w);
+        character.id = 2;
+        character.account = 2;
+        let (packets, _rx) = mpsc::channel(128);
+        let (lost, _) = watch::channel(false);
+        let peer = w
+            .enter_autonomous(character, Output { packets, lost })
+            .unwrap();
+        w.updates(observer, false).unwrap();
+        assert!(w.players[&observer].known.contains(&peer));
+        let origin = w.players[&observer].pos;
+        let distant = (0..w.map.height)
+            .flat_map(|y| {
+                (0..w.map.width).map(move |x| Pos {
+                    x: x as f32 + 0.5,
+                    y: y as f32 + 0.5,
+                })
+            })
+            .find(|pos| origin.distance(*pos) > 40. && w.walkable(*pos))
+            .unwrap();
+        w.players.get_mut(&peer).unwrap().pos = distant;
+        while rx.try_recv().is_ok() {}
+        w.updates(observer, false).unwrap();
+        assert!(w.players[&observer].known.contains(&peer));
+        assert!(!w.visible(observer).contains(&peer));
+        assert!(
+            !w.players[&observer]
+                .tiles
+                .contains(&(distant.x as i16, distant.y as i16))
+        );
+        assert!(w.entities.values().any(|e| origin.distance(e.pos) > 20.));
+        assert!(w.entities.values().all(|e| {
+            origin.distance(e.pos) < 20. || !w.players[&observer].known.contains(&e.id)
+        }));
+        let private = w.loot_bag(origin, Some(2), vec![0xa4f]).unwrap();
+        w.updates(observer, false).unwrap();
+        assert!(!w.players[&observer].known.contains(&private));
+        w.step();
+        w.step();
+        let expected = w.stats(peer).unwrap();
+        let mut tick = None;
+        while let Ok(packet) = rx.try_recv() {
+            if packet.id == wire::NEW_TICK {
+                tick = Some(packet);
+            }
+        }
+        assert!(
+            tick.unwrap()
+                .body
+                .windows(expected.len())
+                .any(|bytes| bytes == expected)
+        );
+        for (actor, hidden) in [(observer, peer), (peer, observer)] {
+            let view = d.player_view(actor).unwrap();
+            assert!(!view.objects.iter().any(|o| o.id == hidden));
+        }
+        let (newcomer, _) = receive(&mut d, -3, 3, WIZARD);
+        assert!(d.worlds[&-3].players[&newcomer].known.contains(&peer));
+        let (foreign, _) = receive(&mut d, -2, 4, WIZARD);
+        let w = d.worlds.get_mut(&-3).unwrap();
+        w.updates(observer, false).unwrap();
+        assert!(!w.players[&observer].known.contains(&foreign));
+        while rx.try_recv().is_ok() {}
+        w.leave(peer).unwrap();
+        w.updates(observer, false).unwrap();
+        assert!(!w.players[&observer].known.contains(&peer));
+        let update = rx.try_recv().unwrap();
+        assert_eq!(update.id, wire::UPDATE);
+        let mut r = crate::wire::Reader::new(&update.body);
+        assert_eq!(r.i16().unwrap(), 0);
+        assert_eq!(r.i16().unwrap(), 0);
+        assert_eq!(r.i16().unwrap(), 1);
+        assert_eq!(r.i32().unwrap(), peer);
+        r.done().unwrap();
     }
     #[test]
     fn initial_update_places_self_before_private_container_owner_stats() {
