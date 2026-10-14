@@ -1,14 +1,17 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
-fn json_result(result: Result<serde_json::Value>) -> Response {
+pub(super) fn json_result(result: Result<serde_json::Value>) -> Response {
     let body = match result {
         Ok(value) => Json(value).into_response(),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error":error.to_string()})),
-        )
-            .into_response(),
+        Err(error) => {
+            tracing::warn!(%error, "game API request rejected");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":error.to_string()})),
+            )
+                .into_response()
+        }
     };
     let mut response = body;
     response
@@ -41,11 +44,19 @@ pub(super) struct LinkRequest {
     code: String,
     discord_id: String,
 }
-fn authorize(a: &App, peer: SocketAddr, headers: &HeaderMap) -> Result<()> {
+pub(super) fn authorize(a: &App, peer: SocketAddr, headers: &HeaderMap) -> Result<()> {
     ensure!(
         peer.ip().is_loopback()
-            && !headers.contains_key("x-forwarded-for")
-            && !headers.contains_key("origin"),
+            && ![
+                "x-forwarded-for",
+                "x-forwarded-host",
+                "x-forwarded-proto",
+                "forwarded",
+                "x-real-ip",
+                "origin"
+            ]
+            .iter()
+            .any(|key| headers.contains_key(*key)),
         "link API is private and loopback-only"
     );
     let expected = a

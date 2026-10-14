@@ -118,6 +118,7 @@ impl World {
             !p.correcting()?,
             "Position correction awaits GOTO acknowledgement."
         );
+        ensure!(!p.paused, "Cannot teleport while paused.");
         ensure!(id != target, "You are already at yourself.");
         let q = self
             .players
@@ -127,6 +128,7 @@ impl World {
             ready(q),
             "Teleport target is busy, dead, departing or quarantined."
         );
+        ensure!(!q.paused, "Cannot teleport to a paused player.");
         ensure!(
             p.known.contains(&target),
             "Teleport target has not been observed."

@@ -110,6 +110,7 @@ pub struct Player {
     pub pos: Pos,
     pub tx: Option<Output>,
     pub departing: bool,
+    paused: bool,
     controller: Controller,
     pub known: BTreeSet<i32>,
     quest: Option<i32>,
@@ -1101,6 +1102,7 @@ impl World {
                 character: ch,
                 pos: Pos { x, y },
                 departing: false,
+                paused: false,
                 controller: if tx.is_none() {
                     Controller::Qa
                 } else {
@@ -1202,7 +1204,10 @@ impl World {
                 (26, values[6]),
                 (27, values[7]),
                 (28, values[5]),
-                (29, p.conditions(self.now)),
+                (
+                    29,
+                    p.conditions(self.now) | if p.paused { 1 << 20 } else { 0 },
+                ),
                 (30, 0),
             ] {
                 stat(&mut o, k, v);
@@ -1544,12 +1549,23 @@ impl World {
             p.last_move == 0 || i64::from(time) - i64::from(p.last_move) <= 1000,
             "movement time jump"
         );
+        // MOVE precedes condition updates; accept either form across a toggle.
+        let sentinel = pos.x == -1. && pos.y == -1.;
+        let correct = p.paused && !sentinel && p.pos.distance(pos) > 0.001;
+        let stationary = p.paused || sentinel;
+        ensure!(pos.x.is_finite() && pos.y.is_finite(), "invalid position");
+        let pos = if stationary { p.pos } else { pos };
         let remaining_credit = self.validate_move_at(id, pos, time, received)?;
         let p = self.players.get_mut(&id).unwrap();
-        p.movement_credit = remaining_credit;
+        if !stationary {
+            p.movement_credit = remaining_credit;
+        }
         p.pos = pos;
         p.last_move = time;
         p.last_move_at = received;
+        if correct {
+            self.correct_position(id, time, "paused movement")?;
+        }
         Ok(())
     }
     pub fn walkable(&self, pos: Pos) -> bool {
@@ -1686,7 +1702,7 @@ impl World {
             x: start.x - 0.3 * aim.cos(),
             y: start.y - 0.3 * aim.sin(),
         };
-        if p.pos.distance(center) > 0.001 {
+        if !p.paused && p.pos.distance(center) > 0.001 {
             self.validate_move_at(id, center, time, received)
                 .with_context(|| RejectedNativeShot(format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at)))?;
         }
@@ -1723,13 +1739,17 @@ impl World {
         }
         p.next_bullet = (bullet + 1) % 128;
         p.attack_count += 1;
-        p.character.shots += 1;
         let draw = if spec.min == spec.max {
             spec.min
         } else {
             p.seed = ((p.seed as u64 * 16807) % 2147483647) as u32;
             spec.min + (p.seed % (spec.max - spec.min) as u32) as i32
         };
+        // In-flight native SHOOT packets must still consume their counter/RNG draw.
+        if p.paused {
+            return Ok(());
+        }
+        p.character.shots += 1;
         let multiplier = if flags & crate::condition::bit(crate::condition::WEAK) != 0 {
             0.5
         } else {
@@ -1762,6 +1782,7 @@ impl World {
     pub fn use_item(&mut self, id: i32, slot: Slot, pos: Pos) -> Result<Option<InventoryPlan>> {
         self.cancel_trade(id, "Trade cancelled by inventory mutation.");
         let p = self.players.get(&id).context("player missing")?;
+        ensure!(!p.paused, "Cannot use items while paused.");
         ensure!(
             !p.pending
                 && !p.death_pending
@@ -2726,7 +2747,7 @@ impl World {
             let nearest = self
                 .players
                 .values()
-                .filter(|p| p.character.alive && !p.death_pending && !p.departing)
+                .filter(|p| p.character.alive && !p.death_pending && !p.departing && !p.paused)
                 .min_by(|a, b| pos.distance(a.pos).total_cmp(&pos.distance(b.pos)))
                 .map(|p| p.pos);
             let wake = match kind {
@@ -2971,6 +2992,7 @@ impl World {
             if !p.character.alive
                 || p.death_pending
                 || p.departing
+                || p.paused
                 || p.persistence_failure.is_some()
             {
                 continue;
@@ -3192,6 +3214,10 @@ impl World {
                             .distance(b.pos)
                             .total_cmp(&self.entities[b_id].pos.distance(b.pos))
                     }) {
+                        if self.players.get(&b.owner).is_some_and(|p| p.paused) {
+                            b.hit.insert(*target);
+                            break;
+                        }
                         let e = &self.entities[target];
                         let damage = crate::condition::damage(
                             b.damage,
@@ -3302,6 +3328,7 @@ impl World {
                     for id in &ids {
                         let p = &self.players[id];
                         if p.character.alive
+                            && !p.paused
                             && !p.departing
                             && !p.death_pending
                             && !b.hit.contains(id)
