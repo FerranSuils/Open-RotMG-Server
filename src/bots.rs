@@ -117,6 +117,7 @@ struct Brain {
     stationary: u64,
     destination: Option<Pos>,
     blocked: BTreeMap<(i16, i16), u64>,
+    cover: BTreeSet<(i16, i16)>,
     visits: BTreeMap<(i16, i16), u64>,
     companion: Option<i32>,
     invitation_until: u64,
@@ -154,6 +155,7 @@ impl Brain {
             stationary: view.tick,
             destination: None,
             blocked: BTreeMap::new(),
+            cover: BTreeSet::new(),
             visits: BTreeMap::new(),
             companion: None,
             invitation_until: 0,
@@ -239,6 +241,28 @@ impl Brain {
             return Ok(true);
         }
         Ok(false)
+    }
+    fn grid(&mut self, v: &PlayerView, content: &Content) -> Grid {
+        let observed: BTreeSet<_> = v
+            .objects
+            .iter()
+            .filter(|o| o.blocks && !content.objects[&o.kind].enemy)
+            .map(|o| tile(o.position))
+            .collect();
+        // Only nearby observed absence clears remembered cover, not an out-of-view removal.
+        self.cover
+            .retain(|point| center(*point).distance(v.position) >= 19. || observed.contains(point));
+        self.cover.extend(observed);
+        let mut grid = Grid::new(v);
+        for point in self
+            .cover
+            .iter()
+            .chain(self.blocked.keys())
+            .filter(|point| **point != tile(v.position))
+        {
+            grid.walkable.remove(point);
+        }
+        grid
     }
     fn decide(&mut self, v: &PlayerView, content: &Content) -> Result<Decision> {
         ensure!(
@@ -361,14 +385,7 @@ impl Brain {
         let retreat = v.tick < self.recover_until
             || (matches!(self.goal, Goal::Recover)
                 && health < (self.profile.recovery + 0.15).min(0.9));
-        let mut grid = Grid::new(v);
-        for point in self
-            .blocked
-            .keys()
-            .filter(|point| **point != tile(v.position))
-        {
-            grid.walkable.remove(point);
-        }
+        let grid = self.grid(v, content);
         if retreat || threatened {
             decision.goal = if retreat { Goal::Recover } else { Goal::Dodge };
             let held_heal = v

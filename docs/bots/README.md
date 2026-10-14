@@ -1,6 +1,6 @@
 # Gameplay bots: vision and research
 
-The user approved the autonomous Wizard shore prototype and its production deployment, then selected a combined combat and cooperative Priest-adventuring extension. That extension is being verified locally; it has no merge or deployment approval.
+The user approved the autonomous Wizard shore prototype and its production deployment, then selected a combined combat and cooperative Priest-adventuring extension. The extension remains unmerged pending ordinary gameplay and native-demo acceptance.
 
 The two video reports record observations and limits; `research/decision-spike.md` records the earlier offline experiment.
 
@@ -12,7 +12,7 @@ Wizards predict visible projectile paths, lead an observed target, kite within w
 
 The flag remains default-off and separate from QA control. Reserve at least seven slots for six bots and a human. Living saves resume unchanged. After committed permanent death, a fresh character receives normal starter gear; Bayleaf/Juniper choose Priest only if that same account earned its Wizard-level-five unlock. Dead inventory is never inherited. Trade negotiation and language services remain outside this slice.
 
-Verification remains incomplete. Combat/social/lifecycle tests and exact six-character restart checks pass; ordinary cave entry, clear and return have been verified across three seeds. An isolated shared-encounter campaign confirms both healer accounts' qualifying Wizard deaths, ordinary Priest starters, received teammate healing and later permanent death/rebuilding. Native footage shows a Priest restoring 100 HP to a crewmate during Nexus recovery; its selected source runs above 30 FPS. Recorded-observation regressions cover nonlinear projectile prediction and a disconnected-frontier exploration deadlock. A public Nexus call reunites all three separated crewmates through legal transfers, followed by ordinary Realm return. Comparative combat, final native combat footage, dependency publication and the demo remain unfinished. Prepared fixtures verify mechanics, not earned journeys; these results do not establish historical authenticity or the complete community vision.
+Current-main qualification and the demo/PR remain unfinished. Earlier endgame-backed campaigns verified earned Priests, peer healing, legal reunions, cave trips and permanent-death/restart continuity, not current-main readiness. This branch does not require unfinished endgame. Prepared fixtures prove mechanics, not earned journeys or historical fidelity.
 
 ## Approved north star
 

@@ -28,6 +28,42 @@ fn retained_exploration_can_outscore_a_clear_distant_enemy() {
 }
 
 #[test]
+fn observed_static_cover_survives_leaving_view_but_not_a_verified_clear_tile() {
+    let c = content();
+    let mut v = view(&c);
+    v.map.width = 60;
+    v.tiles = (0..30)
+        .flat_map(|y| {
+            (0..60).map(move |x| Tile {
+                x,
+                y,
+                ground: 0,
+                ground_speed: 1.,
+            })
+        })
+        .collect();
+    let mut wall = object(2, 0x1ce, 2.5, 11.5);
+    wall.blocks = true;
+    assert!(!c.objects[&wall.kind].enemy);
+    v.objects.push(wall);
+    let mut brain = Brain::new(PROFILES[1], &v);
+    assert!(!brain.grid(&v, &c).walkable.contains(&(2, 11)));
+    v.objects.clear();
+    v.position.x = 35.5;
+    let remembered = brain.grid(&v, &c);
+    assert!(!remembered.walkable.contains(&(2, 11)));
+    assert!(remembered.walkable.contains(&(2, 12)));
+    assert!(
+        Brain::new(PROFILES[1], &v)
+            .grid(&v, &c)
+            .walkable
+            .contains(&(2, 11))
+    );
+    v.position.x = 11.5;
+    assert!(brain.grid(&v, &c).walkable.contains(&(2, 11)));
+}
+
+#[test]
 fn remembered_routes_advance_nearby_before_revalidating_distant_cover() {
     let c = content();
     let mut v = view(&c);
