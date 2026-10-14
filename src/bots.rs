@@ -589,45 +589,53 @@ impl Brain {
                 self.last_encounter = v.time_ms;
             }
         }
-        let reachable = grid.reachable(v.position);
-        if let Goal::Explore(x, y) = self.goal {
-            let pos = center((x, y));
-            if pos.distance(v.position) > 0.7 && reachable.contains(&(x, y)) {
-                choices.push((12., self.goal.clone(), pos));
+        // Exploration's maximum score is 20; a clear higher-ranked route makes its full-map search irrelevant.
+        if !choices.iter().any(|(score, goal, position)| {
+            score + if *goal == self.goal { 8. } else { 0. } > 20.
+                && !self.blocked.contains_key(&tile(*position))
+                && grid.segment(v.position, *position)
+        }) {
+            let reachable = grid.reachable(v.position);
+            if let Goal::Explore(x, y) = self.goal {
+                let pos = center((x, y));
+                if pos.distance(v.position) > 0.7 && reachable.contains(&(x, y)) {
+                    choices.push((12., self.goal.clone(), pos));
+                }
             }
-        }
-        if !choices
-            .iter()
-            .any(|(_, g, _)| matches!(g, Goal::Explore(..)))
-        {
-            let next = reachable
+            if !choices
                 .iter()
-                .filter(|t| !self.blocked.contains_key(t))
-                .filter(|t| {
-                    center(**t).distance(v.position) > 3. && center(**t).distance(v.position) < 24.
-                })
-                .max_by(|a, b| {
-                    let frontier = |t| grid.frontier(t, v.map.width, v.map.height);
-                    let priority = frontier(**a)
-                        .cmp(&frontier(**b))
-                        .then_with(|| self.visits.get(*b).cmp(&self.visits.get(*a)));
-                    if !priority.is_eq() {
-                        return priority;
-                    }
-                    let value = |t| {
-                        let p = center(t);
-                        nearest.map_or_else(
-                            || {
-                                (p.x - v.position.x) * self.heading.cos()
-                                    + (p.y - v.position.y) * self.heading.sin()
-                            },
-                            |enemy| -p.distance(enemy.position),
-                        )
-                    };
-                    value(**a).total_cmp(&value(**b))
-                });
-            if let Some((x, y)) = next {
-                choices.push((12., Goal::Explore(*x, *y), center((*x, *y))));
+                .any(|(_, g, _)| matches!(g, Goal::Explore(..)))
+            {
+                let next = reachable
+                    .iter()
+                    .filter(|t| !self.blocked.contains_key(t))
+                    .filter(|t| {
+                        center(**t).distance(v.position) > 3.
+                            && center(**t).distance(v.position) < 24.
+                    })
+                    .max_by(|a, b| {
+                        let frontier = |t| grid.frontier(t, v.map.width, v.map.height);
+                        let priority = frontier(**a)
+                            .cmp(&frontier(**b))
+                            .then_with(|| self.visits.get(*b).cmp(&self.visits.get(*a)));
+                        if !priority.is_eq() {
+                            return priority;
+                        }
+                        let value = |t| {
+                            let p = center(t);
+                            nearest.map_or_else(
+                                || {
+                                    (p.x - v.position.x) * self.heading.cos()
+                                        + (p.y - v.position.y) * self.heading.sin()
+                                },
+                                |enemy| -p.distance(enemy.position),
+                            )
+                        };
+                        value(**a).total_cmp(&value(**b))
+                    });
+                if let Some((x, y)) = next {
+                    choices.push((12., Goal::Explore(*x, *y), center((*x, *y))));
+                }
             }
         }
         for (score, goal, _) in &mut choices {

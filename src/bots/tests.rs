@@ -1,4 +1,32 @@
 use super::*;
+#[test]
+fn exploration_remains_available_when_a_higher_ranked_route_is_blocked() {
+    let c = content();
+    let mut v = view(&c);
+    let mut ally = object(4, WIZARD, 22.5, 11.5);
+    ally.name = "Mossy".into();
+    ally.equipped = vec![0xa97];
+    v.objects.push(ally);
+    assert_eq!(
+        Brain::new(PROFILES[2], &v).decide(&v, &c).unwrap().goal,
+        Goal::Follow(4)
+    );
+    v.tiles.retain(|t| t.x != 15);
+    let d = Brain::new(PROFILES[2], &v).decide(&v, &c).unwrap();
+    assert!(matches!(d.goal, Goal::Explore(x, _) if x < 15));
+}
+
+#[test]
+fn retained_exploration_can_outscore_a_clear_distant_enemy() {
+    let c = content();
+    let mut v = view(&c);
+    let enemy = c.objects.values().find(|o| o.enemy).unwrap().kind;
+    v.objects.push(object(2, enemy, 26.5, 11.5));
+    let mut b = Brain::new(PROFILES[1], &v);
+    b.goal = Goal::Explore(8, 11);
+    assert_eq!(b.decide(&v, &c).unwrap().goal, Goal::Explore(8, 11));
+}
+
 use crate::content::WIZARD;
 use crate::world::view::{
     Lifecycle, MapInfo, OwnCharacter, Session, Tile, VisibleObject, VisibleProjectile,
