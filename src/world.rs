@@ -115,6 +115,7 @@ pub struct Player {
     pub known: BTreeSet<i32>,
     quest: Option<i32>,
     statuses: BTreeMap<u8, u64>,
+    native_motion_condition: i32,
     known_since: BTreeMap<i32, u64>,
     tiles: BTreeSet<(i16, i16)>,
     pub death_started: bool,
@@ -1112,6 +1113,7 @@ impl World {
                 known: BTreeSet::new(),
                 quest: None,
                 statuses: BTreeMap::new(),
+                native_motion_condition: 0,
                 known_since: BTreeMap::new(),
                 tiles: BTreeSet::new(),
                 death_started: false,
@@ -3413,7 +3415,34 @@ impl World {
                     o.0.extend(self.stats(entity).expect("visible entity must exist"));
                 }
                 send(p, wire::NEW_TICK, o.0);
-                self.players.get_mut(&id).unwrap().tick += 1;
+                let p = self.players.get_mut(&id).unwrap();
+                let slow = crate::condition::bit(crate::condition::SLOWED);
+                let paralyzed = crate::condition::bit(crate::condition::PARALYZED);
+                let motion_condition = p.conditions(self.now) & (slow | paralyzed);
+                let restricts_motion = (motion_condition & paralyzed != 0
+                    && p.native_motion_condition & paralyzed == 0)
+                    || (motion_condition & slow != 0
+                        && p.native_motion_condition & (slow | paralyzed) == 0);
+                if p.controller == Controller::Human
+                    && p.character.alive
+                    && !p.death_pending
+                    && !p.departing
+                    && p.persistence_failure.is_none()
+                    && restricts_motion
+                {
+                    // The client must consume its real stat29 before acknowledging the new motor baseline.
+                    let mut out = Writer::new();
+                    out.i32(id).f32(p.pos.x).f32(p.pos.y);
+                    reconciliation::goto(p, true, out.0);
+                    tracing::info!(
+                        player = id,
+                        previous = p.native_motion_condition,
+                        current = motion_condition,
+                        "native movement condition synchronized"
+                    );
+                }
+                p.native_motion_condition = motion_condition;
+                p.tick += 1;
             }
         }
     }
