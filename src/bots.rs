@@ -413,7 +413,10 @@ impl Brain {
                     }
                 }
             }
-            if !retreat && let Some(enemy) = nearest {
+            if !retreat
+                && v.character.conditions & crate::content::STUNNED == 0
+                && let Some(enemy) = nearest
+            {
                 let target = combat::lead(v, enemy, self.tracks[&enemy.id].2, projectile);
                 if v.position.distance(target) < range
                     && shot_clear(v, &grid, target, projectile.passes_cover)
@@ -731,7 +734,8 @@ impl Brain {
                     .find(|e| e.id == id)
                     .context("selected enemy missing")?;
                 let target = combat::lead(v, enemy, self.tracks[&id].2, projectile);
-                if v.position.distance(target) < range
+                if v.character.conditions & crate::content::STUNNED == 0
+                    && v.position.distance(target) < range
                     && shot_clear(v, &grid, target, projectile.passes_cover)
                 {
                     decision.aim = Some(angle(v.position, target));

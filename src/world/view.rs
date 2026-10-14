@@ -29,6 +29,7 @@ pub struct MapInfo {
 }
 #[derive(Serialize)]
 pub struct OwnCharacter {
+    pub conditions: i32,
     pub class: u16,
     pub level: i32,
     pub experience: i32,
@@ -179,6 +180,7 @@ impl Directory {
                 height: w.map.height,
             },
             character: OwnCharacter {
+                conditions: p.condition(w.now) | if p.paused { 1 << 20 } else { 0 },
                 class: p.character.class,
                 level: p.character.level,
                 experience: p.character.exp,

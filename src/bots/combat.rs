@@ -28,14 +28,31 @@ pub(super) fn predicted(b: &VisibleProjectile, seconds: f32) -> Option<Pos> {
     })
 }
 
-pub(super) fn clearance(v: &PlayerView, destination: Pos) -> f32 {
+pub(super) fn speed(v: &PlayerView) -> f32 {
     let ground = v
         .tiles
         .iter()
         .find(|t| (t.x, t.y) == tile(v.position))
         .expect("own tile missing from discovered terrain")
         .ground_speed;
-    let speed = (4. + 5.6 * v.character.stats[4] as f32 / 75.) * ground;
+    let flags = v.character.conditions;
+    let speed = if flags & crate::content::PARALYZED != 0 {
+        0.
+    } else if flags & crate::content::SLOWED != 0 {
+        4.
+    } else {
+        (4. + 5.6 * v.character.stats[4] as f32 / 75.)
+            * if flags & crate::content::SPEEDY != 0 {
+                1.5
+            } else {
+                1.
+            }
+    };
+    speed * ground
+}
+
+pub(super) fn clearance(v: &PlayerView, destination: Pos) -> f32 {
+    let speed = speed(v);
     let distance = v.position.distance(destination);
     let mut minimum = 20_f32;
     for step in 0..=24 {
@@ -84,6 +101,9 @@ pub(super) fn movement(
     range: f32,
     retreat: bool,
 ) -> Option<Pos> {
+    if v.character.conditions & crate::content::PARALYZED != 0 {
+        return None;
+    }
     let mut best = None;
     for index in 0..16 {
         let direction = index as f32 * std::f32::consts::TAU / 16.;
@@ -120,6 +140,7 @@ mod tests {
         for id in [0, 1] {
             for age in [0_u64, 125, 550, 1200] {
                 let spec = crate::content::Projectile {
+                    conditions: vec![],
                     speed: 60.,
                     lifetime: 1800.,
                     min: 1,

@@ -27,6 +27,44 @@ fn retained_exploration_can_outscore_a_clear_distant_enemy() {
     assert_eq!(b.decide(&v, &c).unwrap().goal, Goal::Explore(8, 11));
 }
 
+#[test]
+fn dodge_predictions_use_actual_movement_conditions_and_ground() {
+    use crate::content::{PARALYZED, SLOWED, SPEEDY};
+    let c = content();
+    let mut v = view(&c);
+    v.character.stats[4] = 75;
+    for t in &mut v.tiles {
+        t.ground_speed = 0.6;
+    }
+    for (flags, expected) in [
+        (0, 5.76),
+        (SLOWED, 2.4),
+        (SPEEDY, 8.64),
+        (SLOWED | SPEEDY, 2.4),
+        (PARALYZED | SPEEDY, 0.),
+    ] {
+        v.character.conditions = flags;
+        assert!((combat::speed(&v) - expected).abs() < 0.001);
+    }
+    let grid = Grid::new(&v);
+    assert!(combat::movement(&v, &grid, &[], Some(Pos { x: 15.5, y: 11.5 }), 7., false).is_none());
+}
+
+#[test]
+fn stunned_wizard_keeps_target_but_does_not_request_normal_fire() {
+    let c = content();
+    let mut v = view(&c);
+    let enemy = c.objects.values().find(|o| o.enemy).unwrap().kind;
+    v.objects.push(object(2, enemy, 15.5, 11.5));
+    let ready = Brain::new(PROFILES[1], &v).decide(&v, &c).unwrap();
+    assert!(matches!(ready.goal, Goal::Fight(2)));
+    assert!(ready.aim.is_some());
+    v.character.conditions = crate::content::STUNNED;
+    let stunned = Brain::new(PROFILES[1], &v).decide(&v, &c).unwrap();
+    assert!(matches!(stunned.goal, Goal::Fight(2)));
+    assert!(stunned.aim.is_none());
+}
+
 use crate::content::WIZARD;
 use crate::world::view::{
     Lifecycle, MapInfo, OwnCharacter, Session, Tile, VisibleObject, VisibleProjectile,
@@ -57,6 +95,7 @@ fn view(content: &Content) -> PlayerView {
             height: 40,
         },
         character: OwnCharacter {
+            conditions: 0,
             class: WIZARD,
             level: 1,
             experience: 0,
