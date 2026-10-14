@@ -1,0 +1,185 @@
+use super::*;
+use crate::world::view::{VisibleObject, VisibleProjectile};
+
+pub(super) fn predicted(b: &VisibleProjectile, seconds: f32) -> Option<Pos> {
+    let direction = Pos {
+        x: b.angle.cos(),
+        y: b.angle.sin(),
+    };
+    // Wave displacement is perpendicular, so projection recovers age without the private birth clock.
+    let age = ((b.position.x - b.start.x) * direction.x + (b.position.y - b.start.y) * direction.y)
+        * 10000.
+        / b.speed;
+    let age = age.max(0.) + seconds * 1000.;
+    if age >= b.lifetime_ms {
+        return None;
+    }
+    let phase = if b.id.is_multiple_of(2) {
+        0.
+    } else {
+        std::f32::consts::PI
+    };
+    let wave =
+        b.amplitude * (phase + age / b.lifetime_ms * b.frequency * std::f32::consts::TAU).sin();
+    let distance = age * b.speed / 10000.;
+    Some(Pos {
+        x: b.start.x + distance * direction.x - wave * direction.y,
+        y: b.start.y + distance * direction.y + wave * direction.x,
+    })
+}
+
+pub(super) fn speed(v: &PlayerView) -> f32 {
+    let ground = v
+        .tiles
+        .iter()
+        .find(|t| (t.x, t.y) == tile(v.position))
+        .expect("own tile missing from discovered terrain")
+        .ground_speed;
+    let flags = v.character.conditions;
+    let speed = if flags & crate::content::PARALYZED != 0 {
+        0.
+    } else if flags & crate::content::SLOWED != 0 {
+        4.
+    } else {
+        (4. + 5.6 * v.character.stats[4] as f32 / 75.)
+            * if flags & crate::content::SPEEDY != 0 {
+                1.5
+            } else {
+                1.
+            }
+    };
+    speed * ground
+}
+
+pub(super) fn clearance(v: &PlayerView, destination: Pos) -> f32 {
+    let speed = speed(v);
+    let distance = v.position.distance(destination);
+    let mut minimum = 20_f32;
+    for step in 0..=24 {
+        let seconds = step as f32 * 0.025;
+        let fraction = if distance > 0. {
+            (seconds * speed / distance).min(1.)
+        } else {
+            0.
+        };
+        let player = Pos {
+            x: v.position.x + (destination.x - v.position.x) * fraction,
+            y: v.position.y + (destination.y - v.position.y) * fraction,
+        };
+        for bullet in v.projectiles.iter().filter(|b| hostile(v, b.owner)) {
+            if let Some(pos) = predicted(bullet, seconds) {
+                minimum = minimum.min(player.distance(pos));
+            }
+        }
+    }
+    minimum
+}
+
+pub(super) fn lead(
+    v: &PlayerView,
+    target: &VisibleObject,
+    velocity: Pos,
+    projectile: &crate::content::Projectile,
+) -> Pos {
+    let mut point = target.position;
+    for _ in 0..3 {
+        let seconds =
+            (v.position.distance(point) * 10. / projectile.speed).min(projectile.lifetime / 1000.);
+        point = Pos {
+            x: target.position.x + velocity.x * seconds,
+            y: target.position.y + velocity.y * seconds,
+        };
+    }
+    point
+}
+
+pub(super) fn movement(
+    v: &PlayerView,
+    grid: &Grid,
+    enemies: &[&VisibleObject],
+    target: Option<Pos>,
+    range: f32,
+    retreat: bool,
+) -> Option<Pos> {
+    if v.character.conditions & crate::content::PARALYZED != 0 {
+        return None;
+    }
+    let mut best = None;
+    for index in 0..16 {
+        let direction = index as f32 * std::f32::consts::TAU / 16.;
+        let point = Pos {
+            x: v.position.x + direction.cos() * 1.25,
+            y: v.position.y + direction.sin() * 1.25,
+        };
+        if !grid.segment(v.position, point) {
+            continue;
+        }
+        let safety = clearance(v, point);
+        let separation = enemies
+            .iter()
+            .map(|e| point.distance(e.position))
+            .fold(20., f32::min);
+        let spacing = if retreat {
+            separation.min(12.) * 3.
+        } else {
+            target.map_or(0., |p| -(point.distance(p) - range * 0.8).abs() * 3.)
+        };
+        let score = safety.min(4.) * 12. + separation.min(2.) * 5. + spacing;
+        if best.is_none_or(|(prior, _)| score > prior) {
+            best = Some((score, point));
+        }
+    }
+    best.map(|(_, point)| point)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn prediction_matches_wave_physics_without_birth_time() {
+        for id in [0, 1] {
+            for age in [0_u64, 125, 550, 1200] {
+                let spec = crate::content::Projectile {
+                    conditions: vec![],
+                    speed: 60.,
+                    lifetime: 1800.,
+                    min: 1,
+                    max: 1,
+                    amplitude: 2.,
+                    frequency: 3.,
+                    passes_cover: false,
+                };
+                let bullet = crate::world::Bullet {
+                    owner: 8,
+                    source_kind: 0,
+                    id,
+                    friendly: false,
+                    start: Pos { x: 9., y: 9. },
+                    pos: Pos { x: 0., y: 0. },
+                    angle: 0.7,
+                    born: 100,
+                    damage: 1,
+                    spec: spec.clone(),
+                    hit: BTreeSet::new(),
+                };
+                let observed = VisibleProjectile {
+                    owner: 8,
+                    id,
+                    start: bullet.start,
+                    position: bullet.position(100 + age),
+                    angle: bullet.angle,
+                    speed: spec.speed,
+                    lifetime_ms: spec.lifetime,
+                    amplitude: spec.amplitude,
+                    frequency: spec.frequency,
+                    passes_cover: false,
+                };
+                for future in [0., 0.05, 0.25] {
+                    let expected = bullet.position(100 + age + (future * 1000.) as u64);
+                    assert!(predicted(&observed, future).unwrap().distance(expected) < 0.0001);
+                }
+                assert!(predicted(&observed, 2.).is_none());
+            }
+        }
+    }
+}

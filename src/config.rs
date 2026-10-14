@@ -132,8 +132,8 @@ impl Config {
             "development control cannot be enabled behind a public proxy"
         );
         ensure!(
-            !self.shore_bots || self.max_players >= 4,
-            "shore bots require capacity for three bots plus a human"
+            !self.shore_bots || self.max_players >= 7,
+            "adventuring bots require capacity for six bots plus a human"
         );
         ensure!(
             (1..=85).contains(&self.max_players),
@@ -221,9 +221,9 @@ mod tests {
         production.shore_bots = true;
         production.validate(false).unwrap();
         assert!(production.validate(true).is_err());
-        production.max_players = 3;
+        production.max_players = 6;
         assert!(production.validate(false).is_err());
-        production.max_players = 4;
+        production.max_players = 7;
         production.validate(false).unwrap();
     }
     #[test]

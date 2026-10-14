@@ -1,14 +1,18 @@
 # Gameplay bots: vision and research
 
-The user approved the autonomous Wizard shore prototype, its gameplay PR and production deployment. Further population slices remain unselected.
+The three-Wizard shore prototype is deployed. The selected combat and cooperative Priest-adventuring extension below is an unmerged candidate, not the production population.
 
 The two video reports record observations and limits; `research/decision-spike.md` records the earlier offline experiment.
 
-## Local shore prototype
+## Local autonomous crews
 
-Run `./run.sh 18923 --release`, then enter the Realm through its normal portal. Bayleaf prioritizes recovery, Mossy resources and Trellis companions. They start with ordinary Wizard equipment, use the restricted player view, earn XP and accessible loot, and save through ordinary inventory/progression rules. Native local chat `Trellis follow me` requests following while the sender is visible; it does not reveal a hidden position.
+Run `./run.sh 18923 --release`, then enter the Realm normally. Mossy leads Bayleaf/Trellis; Reed leads Juniper/Bramble. Profiles weigh recovery, resources and companions differently. They use restricted observations and ordinary movement, combat, inventory, XP, teleport and transfer rules. Uninvited humans are not permanent anchors. Native local chat `Trellis follow me` requests a temporary follow while the sender is visible.
 
-The three Wizards run by default, separately from QA control. Isolated tests can use `--no-shore-bots` or explicit `"shore_bots": false`; production QA controls remain prohibited. Human, QA and autonomous ownership/counts are distinct. Saved bot accounts resume their committed character; a dead character stays retired. There is no automatic replacement, trade negotiation, dungeon routing or language service. The candidate shore and passing mechanical tests do not establish historical authenticity or the complete community vision.
+Wizards predict visible projectile paths, lead an observed target, kite within weapon range, cast equipped spells and commit to recovery. Crews remember recent contacts, explore reachable known terrain, revisit observed Realm hunting grounds and respond to Pirate Cave calls. Visible crewmates regroup through normal teleports; separated crews can arrange a Nexus meeting through public chat. Priests cast equipped tomes for actual nearby injury, MP and accepted cooldowns.
+
+This candidate inherits main's default-on startup; `--no-shore-bots` or explicit `"shore_bots": false` disables it. Reserve seven slots for six bots and a human; QA control remains separate. Living saves resume unchanged. After committed permanent death, a fresh character receives normal starter gear; Bayleaf/Juniper choose Priest only if that same account earned its Wizard-level-five unlock. Dead inventory is never inherited. Trade negotiation and language services remain outside this slice.
+
+Main-based campaigns verify separate crews and a whole-crew Cave clear/ordinary return. Earlier campaigns earned both Priests, received peer healing and preserved permanent-death/restart continuity. Native footage shows combat, healing and recovery. Fixtures and one paired combat run do not establish causal survival/accuracy superiority or historical fidelity.
 
 ## Approved north star
 
@@ -100,4 +104,4 @@ Two bounded local checks passed: the ten existing world boundary tests, and a co
 1. Should the first proof emphasize believable combat, or include a small meaningful chat/group interaction immediately? Recommendation: combat plus one interaction, not sophisticated banter.
 2. Should the initial population start with mixed progression/gear or earn everything from starter characters? Recommendation: starter characters for the prototype; decide any one-time population seeding before trading is enabled.
 
-The selected shore slice does not approve further population phases. Revisit the shared gameplay dependencies before expanding it.
+The selected cooperative extension does not approve the remaining population phases. Revisit shared gameplay dependencies before expanding it.

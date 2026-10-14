@@ -95,4 +95,108 @@ fn autonomous_actions_use_normal_inventory_death_and_quarantine_guards() {
             .is_err()
     );
     assert_eq!(w.players[&bot].character.items, items);
+    let player = &w.players[&bot];
+    let before = (
+        (player.pos.x, player.pos.y),
+        player.last_move,
+        player.character.hp,
+        player.character.mp,
+    );
+    w.step();
+    let player = &w.players[&bot];
+    assert_eq!(
+        before,
+        (
+            (player.pos.x, player.pos.y),
+            player.last_move,
+            player.character.hp,
+            player.character.mp
+        )
+    );
+}
+
+#[test]
+fn autonomous_motor_obeys_the_same_observed_ground_speed_as_native_moves() {
+    let mut w = world();
+    let (packets, _rx) = mpsc::channel(64);
+    let (lost, _) = watch::channel(false);
+    let bot = w
+        .enter_autonomous(ch(&w), Output { packets, lost })
+        .unwrap();
+    let initial = w.players[&bot].pos;
+    let (ground, multiplier) = w
+        .content
+        .grounds
+        .iter()
+        .find(|(_, speed)| **speed > 0. && **speed < 1.)
+        .unwrap();
+    let (ground, multiplier) = (*ground, *multiplier);
+    let index = initial.y as usize * w.map.width as usize + initial.x as usize;
+    Arc::make_mut(&mut w.map).cells[index].ground = ground;
+    let speed = 0.004
+        + (0.0096 - 0.004) * w.players[&bot].character.effective(&w.content).unwrap()[4] as f32
+            / 75.;
+    w.autonomous_action(
+        bot,
+        Action::Move {
+            x: initial.x + 2.,
+            y: initial.y,
+        },
+    )
+    .unwrap();
+    w.step();
+    assert!((w.players[&bot].pos.distance(initial) - speed * multiplier * 50.).abs() < 0.0001);
+}
+
+#[test]
+fn bounded_bot_output_holds_a_full_six_wizard_nova_burst() {
+    let mut w = world();
+    let mut actors = Vec::new();
+    for account in 1..=6 {
+        let mut character = ch(&w);
+        character.id = account;
+        character.account = account;
+        character.class = 0x30e;
+        character.items[0] = 2711;
+        character.items[1] = 2606;
+        character.mp = 100;
+        let (packets, rx) = mpsc::channel(crate::bots::OUTPUT_CAPACITY);
+        let (lost, _) = watch::channel(false);
+        let id = w
+            .enter_autonomous(character, Output { packets, lost })
+            .unwrap();
+        actors.push((id, rx));
+    }
+    w.now = 1000;
+    w.step();
+    for (_, rx) in &mut actors {
+        while rx.try_recv().is_ok() {}
+    }
+    for (id, _) in &actors {
+        let position = w.players[id].pos;
+        w.autonomous_action(
+            *id,
+            Action::Use {
+                slot: 1,
+                x: position.x,
+                y: position.y,
+            },
+        )
+        .unwrap();
+    }
+    for (id, rx) in &mut actors {
+        assert!(!*w.players[id].tx.as_ref().unwrap().lost.borrow());
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert!(received >= 120, "nova burst receipt count: {received}");
+    }
+    let ready = w.now + w.content.get(2606).unwrap().cooldown_ms;
+    let mut d = tests::directory();
+    d.worlds.clear();
+    d.worlds.insert(-2, w);
+    for (id, _) in actors {
+        assert_eq!(d.player_view(id).unwrap().character.ability_ready_ms, ready);
+    }
 }

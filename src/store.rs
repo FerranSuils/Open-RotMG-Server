@@ -364,8 +364,9 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
     pub async fn shore_character(
         &self,
         name: String,
-        wizard: &Object,
-    ) -> Result<Option<Character>> {
+        content: &Content,
+        prefer_priest: bool,
+    ) -> Result<Character> {
         let guid = self.call(move |db| {
             let tx = db.transaction()?;
             let existing: Option<String> = tx.query_row(
@@ -391,11 +392,15 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             account.characters.len() <= 1,
             "shore account has multiple live characters"
         );
-        if account.next_id == 1 {
-            Ok(Some(self.create(account.id, wizard).await?))
-        } else {
-            Ok(account.characters.pop())
+        if let Some(character) = account.characters.pop() {
+            return Ok(character);
         }
+        let class = if prefer_priest && content.unlocked(PRIEST, &account.best_levels)? {
+            PRIEST
+        } else {
+            WIZARD
+        };
+        self.create(account.id, content.get(class)?).await
     }
     pub async fn create(&self, account: i32, class: &Object) -> Result<Character> {
         ensure!(
@@ -935,7 +940,59 @@ mod tests {
         assert!(ch.effective(&content).is_err());
     }
     #[tokio::test]
-    async fn shore_accounts_resume_committed_characters_and_never_rebuild_the_dead() {
+    async fn prepared_unlock_record_selects_priest_only_after_permanent_death() {
+        let content = Content::load(Path::new("data")).unwrap();
+        let store = Store::open(Path::new(":memory:"), &content).unwrap();
+        let mut wizard = store
+            .shore_character("Bayleaf".into(), &content, true)
+            .await
+            .unwrap();
+        assert_eq!(wizard.class, WIZARD);
+        wizard.level = 5;
+        wizard.exp = level_start(5).unwrap();
+        store.progress(wizard.clone()).await.unwrap();
+        let living = store
+            .shore_character("Bayleaf".into(), &content, true)
+            .await
+            .unwrap();
+        assert_eq!(living.id, wizard.id);
+        assert_eq!(living.class, WIZARD);
+        let dead_id = wizard.id;
+        wizard.hp = 0;
+        wizard.alive = false;
+        store
+            .death(wizard.clone(), "prepared lifecycle fixture".into())
+            .await
+            .unwrap();
+        let replacement = store
+            .shore_character("Bayleaf".into(), &content, true)
+            .await
+            .unwrap();
+        assert_eq!(replacement.account, wizard.account);
+        assert_ne!(replacement.id, dead_id);
+        assert_eq!(replacement.class, PRIEST);
+        assert_eq!(replacement.level, 1);
+        assert_eq!(replacement.exp, 0);
+        assert_eq!(replacement.items, content.get(PRIEST).unwrap().equipment);
+        assert!(store.load(wizard.account, dead_id).await.is_err());
+        let snapshot: String = store
+            .call(move |db| {
+                Ok(db.query_row(
+                    "SELECT snapshot FROM deaths WHERE character=?1",
+                    [dead_id],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        let dead: Character = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(dead.id, dead_id);
+        assert!(!dead.alive);
+        assert_eq!(dead.items, wizard.items);
+    }
+
+    #[tokio::test]
+    async fn bot_accounts_resume_saves_and_replace_without_reviving_the_dead() {
         let content = Content::load(Path::new("data")).unwrap();
         let path = std::env::temp_dir().join(format!(
             "openrotmg-shore-{}-{}.db",
@@ -947,9 +1004,8 @@ mod tests {
         let human = store.list("shore-human".into()).await.unwrap();
         store.rename(human.id, "Bayleaf".into()).await.unwrap();
         let mut bot = store
-            .shore_character("Bayleaf".into(), wizard)
+            .shore_character("Bayleaf".into(), &content, true)
             .await
-            .unwrap()
             .unwrap();
         assert_ne!(bot.account, human.id);
         let identity = (bot.account, bot.id);
@@ -960,9 +1016,8 @@ mod tests {
         store.progress(bot.clone()).await.unwrap();
         let reopened = Store::open(&path, &content).unwrap();
         let resumed = reopened
-            .shore_character("Bayleaf".into(), wizard)
+            .shore_character("Bayleaf".into(), &content, true)
             .await
-            .unwrap()
             .unwrap();
         assert_eq!((resumed.account, resumed.id), identity);
         assert_eq!(resumed.exp, 12);
@@ -971,20 +1026,22 @@ mod tests {
         bot.hp = 0;
         bot.alive = false;
         store.death(bot, "test enemy".into()).await.unwrap();
-        assert!(
-            reopened
-                .shore_character("Bayleaf".into(), wizard)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .shore_character("Bayleaf".into(), wizard)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let replacement = reopened
+            .shore_character("Bayleaf".into(), &content, true)
+            .await
+            .unwrap();
+        assert_eq!(replacement.account, identity.0);
+        assert_ne!(replacement.id, identity.1);
+        assert_eq!(replacement.class, WIZARD);
+        assert_eq!(replacement.level, 1);
+        assert_eq!(replacement.exp, 0);
+        assert_eq!(replacement.items, wizard.equipment);
+        let resumed = store
+            .shore_character("Bayleaf".into(), &content, true)
+            .await
+            .unwrap();
+        assert_eq!(resumed.id, replacement.id);
+        assert!(store.load(identity.0, identity.1).await.is_err());
         let records: i32 = store
             .call(move |db| {
                 Ok(db.query_row(
@@ -995,7 +1052,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(records, 1);
+        assert_eq!(records, 2);
         drop(reopened);
         drop(store);
         std::fs::remove_file(path).unwrap();

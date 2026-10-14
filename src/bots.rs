@@ -1,19 +1,17 @@
 use crate::{
-    content::{Content, WIZARD},
-    server::{self, App},
+    content::Content,
     wire::{self, Packet, Reader},
     world::{
-        Action, Output, Pos, Slot,
+        Action, Pos, Slot,
         view::{OutputState, PlayerView},
     },
 };
 use anyhow::{Context, Result, ensure};
 use rand::{Rng, SeedableRng};
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    time::{Duration, Instant},
-};
-use tokio::sync::{mpsc, watch};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+
+mod combat;
+mod social;
 
 #[derive(Clone, Copy)]
 struct Profile {
@@ -22,14 +20,18 @@ struct Profile {
     resources: f32,
     companions: f32,
     reaction: u64,
+    leader: &'static str,
+    healer: bool,
 }
-const PROFILES: [Profile; 3] = [
+const PROFILES: [Profile; 6] = [
     Profile {
         name: "Bayleaf",
         recovery: 0.62,
         resources: 4.,
         companions: 3.,
         reaction: 6,
+        leader: "Mossy",
+        healer: true,
     },
     Profile {
         name: "Mossy",
@@ -37,6 +39,8 @@ const PROFILES: [Profile; 3] = [
         resources: 8.,
         companions: 3.,
         reaction: 4,
+        leader: "Mossy",
+        healer: false,
     },
     Profile {
         name: "Trellis",
@@ -44,6 +48,35 @@ const PROFILES: [Profile; 3] = [
         resources: 3.,
         companions: 8.,
         reaction: 5,
+        leader: "Mossy",
+        healer: false,
+    },
+    Profile {
+        name: "Juniper",
+        recovery: 0.55,
+        resources: 3.,
+        companions: 7.,
+        reaction: 5,
+        leader: "Reed",
+        healer: true,
+    },
+    Profile {
+        name: "Reed",
+        recovery: 0.42,
+        resources: 4.,
+        companions: 5.,
+        reaction: 6,
+        leader: "Reed",
+        healer: false,
+    },
+    Profile {
+        name: "Bramble",
+        recovery: 0.38,
+        resources: 6.,
+        companions: 6.,
+        reaction: 4,
+        leader: "Reed",
+        healer: false,
     },
 ];
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,14 +86,25 @@ enum Goal {
     Fight(i32),
     Loot(i32),
     Follow(i32),
+    Gather(i32),
+    Portal(i32),
+    Revisit(i16, i16),
     Explore(i16, i16),
     Wait,
+}
+#[derive(Debug)]
+enum Journey {
+    Portal(i32),
+    Nexus,
+    Regroup(i32),
 }
 struct Decision {
     goal: Goal,
     movement: Option<Pos>,
     aim: Option<f32>,
     item: Option<Action>,
+    journey: Option<Journey>,
+    chat: Option<&'static str>,
 }
 struct Brain {
     profile: Profile,
@@ -73,9 +117,23 @@ struct Brain {
     stationary: u64,
     destination: Option<Pos>,
     blocked: BTreeMap<(i16, i16), u64>,
+    cover: BTreeSet<(i16, i16)>,
     visits: BTreeMap<(i16, i16), u64>,
     companion: Option<i32>,
+    invitation_until: u64,
     next_decision: u64,
+    recover_until: u64,
+    tracks: BTreeMap<i32, (Pos, u64, Pos)>,
+    next_teleport: u64,
+    regroup_call: Option<(Journey, u64)>,
+    nexus_until: u64,
+    next_call: u64,
+    requested_until: u64,
+    portal: Option<(i32, u64)>,
+    leader_seen: Option<(i32, Pos, u64)>,
+    contacts: BTreeMap<i32, (Pos, u64)>,
+    hunting: Option<Pos>,
+    last_encounter: u64,
 }
 impl Brain {
     fn new(profile: Profile, view: &PlayerView) -> Self {
@@ -97,9 +155,27 @@ impl Brain {
             stationary: view.tick,
             destination: None,
             blocked: BTreeMap::new(),
+            cover: BTreeSet::new(),
             visits: BTreeMap::new(),
             companion: None,
+            invitation_until: 0,
             next_decision: view.tick + seed % profile.reaction,
+            recover_until: 0,
+            tracks: BTreeMap::new(),
+            next_teleport: 0,
+            regroup_call: None,
+            nexus_until: if view.map.name == "Nexus" {
+                view.time_ms + 10000
+            } else {
+                0
+            },
+            next_call: view.time_ms + 10000,
+            requested_until: 0,
+            portal: None,
+            leader_seen: None,
+            contacts: BTreeMap::new(),
+            hunting: None,
+            last_encounter: view.time_ms,
         }
     }
     fn receive(&mut self, packet: Packet, view: &PlayerView) -> Result<bool> {
@@ -107,7 +183,7 @@ impl Brain {
             return Ok(false);
         }
         let mut r = Reader::new(&packet.body);
-        let _name = r.utf()?;
+        let name = r.utf()?;
         let actor = r.i32()?;
         r.i32()?;
         r.u8()?;
@@ -115,6 +191,42 @@ impl Brain {
         let text = r.utf()?;
         r.utf()?;
         r.done()?;
+        if actor > 0 && actor != self.session.1 && recipient.is_empty() {
+            let leader = self.profile.name == self.profile.leader;
+            if (!leader
+                && name == self.profile.leader
+                && self.companion.is_none()
+                && (text == "nexus"
+                    || (text == "tp here"
+                        && view.objects.iter().any(|o| o.id == actor)
+                        && self.requested_until > view.time_ms
+                        && self.leader_seen.is_none_or(|(_, _, seen)| {
+                            view.time_ms.saturating_sub(seen) >= 10000
+                        }))))
+                || (leader
+                    && text == "tp?"
+                    && PROFILES
+                        .iter()
+                        .any(|p| p.leader == self.profile.name && p.name == name))
+            {
+                let journey = if text == "nexus" {
+                    Journey::Nexus
+                } else {
+                    Journey::Regroup(actor)
+                };
+                self.regroup_call = Some((journey, view.time_ms + 5000));
+            }
+        }
+        if recipient.is_empty()
+            && name == self.profile.leader
+            && text == "pc here"
+            && self.leader_seen.is_some_and(|(id, _, seen)| {
+                id == actor && view.time_ms.saturating_sub(seen) < 2000
+            })
+            && let Some(portal) = view.objects.iter().find(|o| o.kind == 0x717)
+        {
+            self.portal = Some((portal.id, view.time_ms + 30000));
+        }
         if actor > 0
             && actor != self.session.1
             && recipient.is_empty()
@@ -125,9 +237,32 @@ impl Brain {
             && text.eq_ignore_ascii_case(&format!("{} follow me", self.profile.name))
         {
             self.companion = Some(actor);
+            self.invitation_until = view.time_ms + 60000;
             return Ok(true);
         }
         Ok(false)
+    }
+    fn grid(&mut self, v: &PlayerView, content: &Content) -> Grid {
+        let observed: BTreeSet<_> = v
+            .objects
+            .iter()
+            .filter(|o| o.blocks && !content.objects[&o.kind].enemy)
+            .map(|o| tile(o.position))
+            .collect();
+        // Only nearby observed absence clears remembered cover, not an out-of-view removal.
+        self.cover
+            .retain(|point| center(*point).distance(v.position) >= 19. || observed.contains(point));
+        self.cover.extend(observed);
+        let mut grid = Grid::new(v);
+        for point in self
+            .cover
+            .iter()
+            .chain(self.blocked.keys())
+            .filter(|point| **point != tile(v.position))
+        {
+            grid.walkable.remove(point);
+        }
+        grid
     }
     fn decide(&mut self, v: &PlayerView, content: &Content) -> Result<Decision> {
         ensure!(
@@ -146,9 +281,22 @@ impl Brain {
                 && matches!(v.lifecycle.output, OutputState::Live),
             "controller is not live"
         );
+        ensure!(
+            v.tiles.iter().any(|t| (t.x, t.y) == tile(v.position)),
+            "controller own terrain missing"
+        );
+        ensure!(
+            v.projectiles
+                .iter()
+                .all(|b| b.speed > 0. && b.lifetime_ms > 0.),
+            "projectile trajectory cannot be inferred from observation"
+        );
         self.last_tick = Some(v.tick);
         self.next_decision = v.tick + self.profile.reaction;
         self.blocked.retain(|_, until| *until > v.tick);
+        if v.time_ms >= self.invitation_until {
+            self.companion = None;
+        }
         if self.previous.distance(v.position) > 0.15 {
             self.stationary = v.tick;
         }
@@ -167,10 +315,31 @@ impl Brain {
             movement: None,
             aim: None,
             item: None,
+            journey: None,
+            chat: None,
         };
         if v.lifecycle.busy {
             return Ok(decision);
         }
+        let party = social::companions(v, self.profile);
+        self.contacts
+            .retain(|_, (_, seen)| v.time_ms.saturating_sub(*seen) < 10000);
+        for peer in &party {
+            self.contacts.insert(peer.id, (peer.position, v.time_ms));
+            if peer.name == self.profile.leader {
+                self.leader_seen = Some((peer.id, peer.position, v.time_ms));
+            }
+        }
+        if v.map.name == "Realm"
+            && self.regroup_call.as_ref().is_some_and(|(journey, until)| {
+                matches!(journey, Journey::Nexus) && *until > v.time_ms
+            })
+        {
+            self.regroup_call = None;
+            decision.journey = Some(Journey::Nexus);
+            return Ok(decision);
+        }
+        decision.item = social::healing(v, content)?;
         let enemies: Vec<_> = v
             .objects
             .iter()
@@ -181,49 +350,63 @@ impl Brain {
                 .distance(v.position)
                 .total_cmp(&b.position.distance(v.position))
         });
-        let health = v.character.hp as f32 / v.character.stats[0] as f32;
-        let threatened = v.projectiles.iter().any(|b| {
-            hostile(v, b.owner)
-                && (0..=4).any(|i| predicted(b, i as f32 * 0.1).distance(v.position) < 1.05)
-        });
-        let retreat = health < self.profile.recovery;
-        let mut grid = Grid::new(v);
-        for point in self
-            .blocked
-            .keys()
-            .filter(|point| **point != tile(v.position))
-        {
-            grid.walkable.remove(point);
+        if let Some(enemy) = nearest {
+            self.hunting = Some(enemy.position);
+            self.last_encounter = v.time_ms;
         }
-        if retreat || threatened {
-            decision.goal = if retreat { Goal::Recover } else { Goal::Dodge };
-            let mut safest = None;
-            for i in 0..16 {
-                let angle = i as f32 * std::f32::consts::TAU / 16.;
-                let pos = Pos {
-                    x: v.position.x + angle.cos() * 1.25,
-                    y: v.position.y + angle.sin() * 1.25,
-                };
-                if !grid.segment(v.position, pos) {
-                    continue;
-                }
-                let clearance = v
-                    .projectiles
-                    .iter()
-                    .filter(|b| hostile(v, b.owner))
-                    .map(|b| {
-                        (0..=4)
-                            .map(|i| predicted(b, i as f32 * 0.1).distance(pos))
-                            .fold(20., f32::min)
-                    })
-                    .fold(20., f32::min);
-                let distance = nearest.map_or(20., |e| e.position.distance(pos));
-                let score = clearance.min(4.) * 4. + distance.min(12.);
-                if safest.as_ref().is_none_or(|(old, _)| score > *old) {
-                    safest = Some((score, pos));
+        self.tracks
+            .retain(|id, _| enemies.iter().any(|e| e.id == *id));
+        for enemy in &enemies {
+            let mut velocity = Pos { x: 0., y: 0. };
+            if let Some((previous, time, _)) = self.tracks.get(&enemy.id) {
+                let elapsed = v.time_ms.saturating_sub(*time) as f32 / 1000.;
+                if elapsed > 0. && elapsed < 1. && previous.distance(enemy.position) < elapsed * 8.
+                {
+                    velocity = Pos {
+                        x: (enemy.position.x - previous.x) / elapsed,
+                        y: (enemy.position.y - previous.y) / elapsed,
+                    };
                 }
             }
-            decision.movement = safest.map(|(_, pos)| pos);
+            self.tracks
+                .insert(enemy.id, (enemy.position, v.time_ms, velocity));
+        }
+        let weapon = content.get(v.character.items[0] as u16)?;
+        let projectile = weapon
+            .projectiles
+            .get(&0)
+            .context("weapon projectile missing")?;
+        let range = projectile.speed * projectile.lifetime / 10000.;
+        let health = v.character.hp as f32 / v.character.stats[0] as f32;
+        let threatened = combat::clearance(v, v.position) < 1.05;
+        if health < self.profile.recovery {
+            self.recover_until = v.tick + 60;
+        }
+        let retreat = v.tick < self.recover_until
+            || (matches!(self.goal, Goal::Recover)
+                && health < (self.profile.recovery + 0.15).min(0.9));
+        let grid = self.grid(v, content);
+        if retreat || threatened {
+            decision.goal = if retreat { Goal::Recover } else { Goal::Dodge };
+            let held_heal = v
+                .character
+                .items
+                .iter()
+                .filter(|kind| **kind >= 0)
+                .any(|kind| content.objects[&(*kind as u16)].activate == "Heal");
+            if health < (self.profile.recovery * 0.6).max(0.25)
+                && !held_heal
+                && decision.item.is_none()
+                && v.map.name != "Nexus"
+            {
+                decision.journey = Some(Journey::Nexus);
+                return Ok(decision);
+            }
+            if threatened || nearest.is_some_and(|e| e.position.distance(v.position) < range * 1.3)
+            {
+                decision.movement =
+                    combat::movement(v, &grid, &enemies, nearest.map(|e| e.position), range, true);
+            }
             if retreat {
                 for (slot, kind) in v
                     .character
@@ -234,7 +417,8 @@ impl Brain {
                     .filter(|(_, k)| **k >= 0)
                 {
                     let item = content.get(*kind as u16)?;
-                    if item.activate == "Heal"
+                    if decision.item.is_none()
+                        && item.activate == "Heal"
                         && v.character.stats[0] - v.character.hp >= (item.heal as f32 * 0.35) as i32
                     {
                         decision.item = Some(Action::Use {
@@ -246,8 +430,16 @@ impl Brain {
                     }
                 }
             }
-            if let Some(enemy) = nearest {
-                decision.aim = Some(angle(v.position, enemy.position));
+            if !retreat
+                && v.character.conditions & crate::content::STUNNED == 0
+                && let Some(enemy) = nearest
+            {
+                let target = combat::lead(v, enemy, self.tracks[&enemy.id].2, projectile);
+                if v.position.distance(target) < range
+                    && shot_clear(v, &grid, target, projectile.passes_cover)
+                {
+                    decision.aim = Some(angle(v.position, target));
+                }
             }
             return Ok(decision);
         }
@@ -261,11 +453,12 @@ impl Brain {
             .filter(|(_, k)| **k >= 0)
         {
             let item = content.get(*kind as u16)?;
-            if let Some(to) = class
-                .slots
-                .iter()
-                .take(4)
-                .position(|slot| *slot == item.slot_type)
+            if decision.item.is_none()
+                && let Some(to) = class
+                    .slots
+                    .iter()
+                    .take(4)
+                    .position(|slot| *slot == item.slot_type)
                 && upgrade(content, *kind, v.character.items[to])?
             {
                 decision.item = Some(Action::Swap {
@@ -275,13 +468,47 @@ impl Brain {
                 return Ok(decision);
             }
         }
+        if v.map.name == "Nexus" && v.time_ms < self.nexus_until {
+            return Ok(decision);
+        }
+        if v.map.name == "Realm"
+            && health >= 0.75
+            && decision.item.is_none()
+            && nearest.is_none_or(|e| e.position.distance(v.position) > 5.)
+        {
+            if let Some((journey, _)) = self.regroup_call.take().filter(|(_, t)| *t > v.time_ms) {
+                if self.profile.name == self.profile.leader {
+                    if v.time_ms >= self.next_call {
+                        let Journey::Regroup(actor) = journey else {
+                            anyhow::bail!("leader received an invalid reunion request");
+                        };
+                        if v.objects.iter().any(|o| o.id == actor) {
+                            decision.chat = Some("tp here");
+                        } else {
+                            decision.chat = Some("nexus");
+                            decision.journey = Some(Journey::Nexus);
+                        }
+                        self.next_call = v.time_ms + 10000;
+                    }
+                } else if v.time_ms >= self.next_teleport {
+                    decision.journey = Some(journey);
+                    self.next_teleport = v.time_ms + 10000;
+                }
+                if decision.journey.is_some() {
+                    return Ok(decision);
+                }
+            } else if self.profile.name != self.profile.leader
+                && self
+                    .leader_seen
+                    .is_none_or(|(_, _, seen)| v.time_ms.saturating_sub(seen) >= 10000)
+                && v.time_ms >= self.next_call
+            {
+                decision.chat = Some("tp?");
+                self.requested_until = v.time_ms + 5000;
+                self.next_call = v.time_ms + 30000;
+            }
+        }
         let mut choices = Vec::new();
-        let weapon = content.get(v.character.items[0] as u16)?;
-        let projectile = weapon
-            .projectiles
-            .get(&0)
-            .context("weapon projectile missing")?;
-        let range = projectile.speed * projectile.lifetime / 10000.;
         for enemy in &enemies {
             let d = enemy.position.distance(v.position);
             let score = 45. - d * 2.;
@@ -306,6 +533,39 @@ impl Brain {
                 }
             }
         }
+        let peaceful = nearest.is_none_or(|e| e.position.distance(v.position) > 5.);
+        for portal in v.objects.iter().filter(|p| match v.map.name.as_str() {
+            "Nexus" => matches!(p.kind, 0x704 | 0x70e | 0x71c),
+            // The committed exit is public even when a straggler missed personal clear credit.
+            "Pirate Cave" => p.kind == 0x71d,
+            "Realm" => {
+                p.kind == 0x717
+                    && v.character.level >= 2
+                    && (self
+                        .portal
+                        .is_some_and(|(id, until)| id == p.id && until > v.time_ms)
+                        || (self.profile.name == self.profile.leader
+                            && party.len() >= 2
+                            && party.iter().all(|q| q.position.distance(p.position) < 8.)))
+            }
+            _ => false,
+        }) {
+            if peaceful && health >= 0.75 {
+                choices.push((80., Goal::Portal(portal.id), portal.position));
+            }
+        }
+        if self.profile.name == self.profile.leader
+            && let Some(straggler) = party
+                .iter()
+                .filter(|p| p.position.distance(v.position) > 10. || p.hp * 10 < p.max_hp * 7)
+                .max_by(|a, b| {
+                    a.position
+                        .distance(v.position)
+                        .total_cmp(&b.position.distance(v.position))
+                })
+        {
+            choices.push((35., Goal::Gather(straggler.id), v.position));
+        }
         for player in v
             .objects
             .iter()
@@ -314,50 +574,91 @@ impl Brain {
             let d = player.position.distance(v.position);
             if d > 4.
                 && (self.companion == Some(player.id)
-                    || PROFILES.iter().any(|p| p.name == player.name))
+                    || (self.profile.name != self.profile.leader
+                        && player.name == self.profile.leader))
             {
                 let score = if self.companion == Some(player.id) {
-                    70.
+                    // An accepted invitation must outrank an existing crew-follow commitment.
+                    100.
                 } else {
-                    self.profile.companions * (d - 4.).min(4.)
+                    45. + self.profile.companions * (d - 4.).min(4.)
                 };
                 choices.push((score, Goal::Follow(player.id), player.position));
             }
         }
-        if let Goal::Explore(x, y) = self.goal {
-            let pos = center((x, y));
-            if pos.distance(v.position) > 0.7 {
-                choices.push((12., self.goal.clone(), pos));
+        if self.profile.name == self.profile.leader {
+            for (id, (position, _)) in &self.contacts {
+                if !party.iter().any(|p| p.id == *id) && v.position.distance(*position) > 3. {
+                    choices.push((35., Goal::Gather(*id), *position));
+                }
+            }
+        } else if let Some((id, position, seen)) = self.leader_seen
+            && v.time_ms.saturating_sub(seen) < 10000
+            && !party.iter().any(|p| p.id == id)
+            && v.position.distance(position) > 1.
+        {
+            choices.push((70., Goal::Follow(id), position));
+        }
+        // Dungeon encounters do not respawn; revisiting cleared rooms interrupts exploration.
+        if v.map.name == "Realm"
+            && let Some(place) = self.hunting
+            && v.time_ms.saturating_sub(self.last_encounter)
+                > (240000. / self.profile.resources) as u64
+        {
+            if v.position.distance(place) > 3. {
+                let (x, y) = tile(place);
+                choices.push((30., Goal::Revisit(x, y), center((x, y))));
+            } else {
+                self.last_encounter = v.time_ms;
             }
         }
-        if !choices
-            .iter()
-            .any(|(_, g, _)| matches!(g, Goal::Explore(..)))
-        {
-            let next = grid
-                .walkable
+        // Exploration's maximum score is 20; a clear higher-ranked route makes its full-map search irrelevant.
+        if !choices.iter().any(|(score, goal, position)| {
+            score + if *goal == self.goal { 8. } else { 0. } > 20.
+                && !self.blocked.contains_key(&tile(*position))
+                && grid.segment(v.position, *position)
+        }) {
+            let reachable = grid.reachable(v.position);
+            if let Goal::Explore(x, y) = self.goal {
+                let pos = center((x, y));
+                if pos.distance(v.position) > 0.7 && reachable.contains(&(x, y)) {
+                    choices.push((12., self.goal.clone(), pos));
+                }
+            }
+            if !choices
                 .iter()
-                .filter(|t| !self.blocked.contains_key(t))
-                .filter(|t| {
-                    center(**t).distance(v.position) > 3. && center(**t).distance(v.position) < 24.
-                })
-                .max_by(|a, b| {
-                    let frontier = |t| grid.frontier(t, v.map.width, v.map.height);
-                    let priority = frontier(**a)
-                        .cmp(&frontier(**b))
-                        .then_with(|| self.visits.get(*b).cmp(&self.visits.get(*a)));
-                    if !priority.is_eq() {
-                        return priority;
-                    }
-                    let value = |t| {
-                        let p = center(t);
-                        (p.x - v.position.x) * self.heading.cos()
-                            + (p.y - v.position.y) * self.heading.sin()
-                    };
-                    value(**a).total_cmp(&value(**b))
-                });
-            if let Some((x, y)) = next {
-                choices.push((12., Goal::Explore(*x, *y), center((*x, *y))));
+                .any(|(_, g, _)| matches!(g, Goal::Explore(..)))
+            {
+                let next = reachable
+                    .iter()
+                    .filter(|t| !self.blocked.contains_key(t))
+                    .filter(|t| {
+                        center(**t).distance(v.position) > 3.
+                            && center(**t).distance(v.position) < 24.
+                    })
+                    .max_by(|a, b| {
+                        let frontier = |t| grid.frontier(t, v.map.width, v.map.height);
+                        let priority = frontier(**a)
+                            .cmp(&frontier(**b))
+                            .then_with(|| self.visits.get(*b).cmp(&self.visits.get(*a)));
+                        if !priority.is_eq() {
+                            return priority;
+                        }
+                        let value = |t| {
+                            let p = center(t);
+                            nearest.map_or_else(
+                                || {
+                                    (p.x - v.position.x) * self.heading.cos()
+                                        + (p.y - v.position.y) * self.heading.sin()
+                                },
+                                |enemy| -p.distance(enemy.position),
+                            )
+                        };
+                        value(**a).total_cmp(&value(**b))
+                    });
+                if let Some((x, y)) = next {
+                    choices.push((12., Goal::Explore(*x, *y), center((*x, *y))));
+                }
             }
         }
         for (score, goal, _) in &mut choices {
@@ -371,7 +672,17 @@ impl Brain {
                 continue;
             }
             let movement = match goal {
-                Goal::Fight(_) if v.position.distance(destination) < range * 0.7 => None,
+                Goal::Gather(_) if v.position.distance(destination) < 0.7 => None,
+                Goal::Portal(id) if v.position.distance(destination) <= 2. => {
+                    decision.journey = Some(Journey::Portal(id));
+                    None
+                }
+                Goal::Fight(_)
+                    if v.position.distance(destination) < range
+                        && shot_clear(v, &grid, destination, projectile.passes_cover) =>
+                {
+                    combat::movement(v, &grid, &enemies, Some(destination), range, false)
+                }
                 Goal::Follow(_) if v.position.distance(destination) < 4.5 => None,
                 Goal::Loot(id) if v.position.distance(destination) < 1.4 => {
                     let bag = v
@@ -414,12 +725,56 @@ impl Brain {
                     }
                 },
             };
+            if matches!(goal, Goal::Portal(_))
+                && self.goal != goal
+                && v.map.name == "Realm"
+                && self.profile.name == self.profile.leader
+            {
+                decision.chat = Some("pc here");
+            }
+            if let Goal::Follow(id) = goal
+                && v.position.distance(destination) > 8.
+                && v.time_ms >= self.next_teleport
+                && decision.item.is_none()
+                && v.objects
+                    .iter()
+                    .any(|p| p.id == id && p.hp * 4 >= p.max_hp * 3)
+                && enemies
+                    .iter()
+                    .all(|e| e.position.distance(destination) > 3.)
+            {
+                decision.journey = Some(Journey::Regroup(id));
+                self.next_teleport = v.time_ms + 10000;
+            }
             decision.goal = goal;
             decision.movement = movement;
-            if let Some(enemy) = nearest
-                && v.position.distance(enemy.position) < range
-            {
-                decision.aim = Some(angle(v.position, enemy.position));
+            if let Goal::Fight(id) = decision.goal {
+                let enemy = enemies
+                    .iter()
+                    .find(|e| e.id == id)
+                    .context("selected enemy missing")?;
+                let target = combat::lead(v, enemy, self.tracks[&id].2, projectile);
+                if v.character.conditions & crate::content::STUNNED == 0
+                    && v.position.distance(target) < range
+                    && shot_clear(v, &grid, target, projectile.passes_cover)
+                {
+                    decision.aim = Some(angle(v.position, target));
+                }
+                if v.character.items[1] >= 0 && v.time_ms >= v.character.ability_ready_ms {
+                    let ability = content.get(v.character.items[1] as u16)?;
+                    if ability.activate == "BulletNova"
+                        && v.character.mp >= ability.mana_cost
+                        && enemy.hp > projectile.max * 2
+                        && v.position.distance(target) <= 15.
+                        && shot_clear(v, &grid, target, false)
+                    {
+                        decision.item = Some(Action::Use {
+                            slot: 1,
+                            x: target.x,
+                            y: target.y,
+                        });
+                    }
+                }
             }
             return Ok(decision);
         }
@@ -446,11 +801,21 @@ fn hostile(v: &PlayerView, owner: i32) -> bool {
             .iter()
             .any(|o| o.id == owner && !o.equipped.is_empty())
 }
-fn predicted(b: &crate::world::view::VisibleProjectile, t: f32) -> Pos {
-    Pos {
-        x: b.position.x + b.angle.cos() * b.speed / 10. * t,
-        y: b.position.y + b.angle.sin() * b.speed / 10. * t,
-    }
+fn shot_clear(v: &PlayerView, grid: &Grid, target: Pos, passes_cover: bool) -> bool {
+    let steps = (v.position.distance(target) * 8.).ceil().max(1.) as u32;
+    (0..=steps).all(|step| {
+        let f = step as f32 / steps as f32;
+        let point = tile(Pos {
+            x: v.position.x + (target.x - v.position.x) * f,
+            y: v.position.y + (target.y - v.position.y) * f,
+        });
+        grid.known.contains(&point)
+            && (passes_cover
+                || !v
+                    .objects
+                    .iter()
+                    .any(|o| o.blocks && tile(o.position) == point))
+    })
 }
 fn own(v: &PlayerView, slot: usize) -> Slot {
     Slot {
@@ -505,6 +870,19 @@ impl Grid {
             known: v.tiles.iter().map(|t| (t.x, t.y)).collect(),
         }
     }
+    fn reachable(&self, from: Pos) -> BTreeSet<(i16, i16)> {
+        let start = tile(from);
+        let mut queue = VecDeque::from([start]);
+        let mut reached = BTreeSet::from([start]);
+        while let Some((x, y)) = queue.pop_front() {
+            for next in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)] {
+                if self.walkable.contains(&next) && reached.insert(next) {
+                    queue.push_back(next);
+                }
+            }
+        }
+        reached
+    }
     fn frontier(&self, (x, y): (i16, i16), width: i32, height: i32) -> bool {
         [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
             .iter()
@@ -518,13 +896,14 @@ impl Grid {
     }
     fn segment(&self, from: Pos, to: Pos) -> bool {
         let steps = (from.distance(to) * 4.).ceil().max(1.) as i32;
-        (0..=steps).all(|i| {
-            let f = i as f32 / steps as f32;
-            self.walkable.contains(&tile(Pos {
-                x: from.x + (to.x - from.x) * f,
-                y: from.y + (to.y - from.y) * f,
-            }))
-        })
+        self.walkable.contains(&tile(to))
+            && (0..=steps).all(|i| {
+                let f = i as f32 / steps as f32;
+                self.walkable.contains(&tile(Pos {
+                    x: from.x + (to.x - from.x) * f,
+                    y: from.y + (to.y - from.y) * f,
+                }))
+            })
     }
     fn next(&self, from: Pos, to: Pos) -> Option<Pos> {
         let start = tile(from);
@@ -532,8 +911,14 @@ impl Grid {
         if !self.walkable.contains(&finish) {
             return None;
         }
-        if self.segment(from, to) {
-            return Some(to);
+        // A distant sampling grid can miss the nearby waypoint's blocked cell.
+        let fraction = 4. / from.distance(to).max(4.);
+        let waypoint = Pos {
+            x: from.x + (to.x - from.x) * fraction,
+            y: from.y + (to.y - from.y) * fraction,
+        };
+        if self.segment(from, to) && self.segment(from, waypoint) {
+            return Some(waypoint);
         }
         if start == finish {
             return None;
@@ -567,93 +952,6 @@ impl Grid {
 #[cfg(test)]
 mod tests;
 
-pub async fn start(app: &App) -> Result<()> {
-    for profile in PROFILES {
-        let Some(ch) = app
-            .store
-            .shore_character(profile.name.into(), app.content.get(WIZARD)?)
-            .await?
-        else {
-            tracing::info!(
-                name = profile.name,
-                "permanently dead shore bot remains retired"
-            );
-            continue;
-        };
-        let owner = app.claim(ch.account)?;
-        let (packets, mut output) = mpsc::channel(64);
-        let (lost, _) = watch::channel(false);
-        let id = app
-            .world
-            .in_world(-3)
-            .call(move |w| w.enter_autonomous(ch, Output { packets, lost }))
-            .await?;
-        let view = app.world.directory(move |d| d.player_view(id)).await?;
-        let mut brain = Brain::new(profile, &view);
-        let app = app.clone();
-        tokio::spawn(async move {
-            let mut shutdown = app.shutdown.subscribe();
-            let result:Result<()> = async {
-                loop {
-                    tokio::select! { _=tokio::time::sleep(Duration::from_millis(50))=>{},_=shutdown.changed()=>break }
-                    let view=app.world.directory(move |d|d.player_view(id)).await?;
-                    if view.lifecycle.death_pending || !view.lifecycle.alive {
-                        if !view.lifecycle.alive && !view.lifecycle.death_pending { break; }
-                        while output.try_recv().is_ok() {}
-                        continue;
-                    }
-                    ensure!(matches!(view.lifecycle.output,OutputState::Live) && !view.lifecycle.departing && !view.lifecycle.quarantined,"controller is not live");
-                    while let Ok(packet)=output.try_recv() {
-                        if brain.receive(packet,&view)? {
-                            if let Err(error)=app.world.directory(move |d|d.chat(id,"omw".into(),Instant::now())).await {
-                                tracing::warn!(player=id,%error,"invitation acknowledgement rejected");
-                            }
-                            tracing::info!(player=id,companion=brain.companion,"visible invitation accepted");
-                        }
-                    }
-                    if view.tick<brain.next_decision { continue; }
-                    let decision=brain.decide(&view,&app.content)?;
-                    if decision.goal!=brain.goal {
-                        tracing::info!(player=id,name=profile.name,tick=view.tick,hp=view.character.hp,
-                            experience=view.character.experience,x=view.position.x,y=view.position.y,
-                            goal=?decision.goal,"autonomous decision");
-                    }
-                    brain.goal=decision.goal;
-                    brain.destination=decision.movement;
-                    let mut actions=vec![Action::Stop];
-                    if let Some(pos)=decision.movement { actions.push(Action::Move{x:pos.x,y:pos.y}); }
-                    if let Some(angle)=decision.aim { actions.push(Action::Shoot{angle}); }
-                    if let Some(action)=decision.item { actions.push(action); }
-                    let diagnostic=format!("{actions:?}");
-                    match app.world.for_player(id).call(move |w| {
-                        let mut plan=None;
-                        for action in actions { if let Some(item)=w.autonomous_action(id,action)? { plan=Some(item); } }
-                        Ok(plan)
-                    }).await {
-                        Ok(Some(plan))=>server::persist(&app,plan).await?,
-                        Ok(None)=>{},
-                        Err(error)=>tracing::warn!(player=id,%error,actions=diagnostic,"autonomous commands rejected; will reassess"),
-                    }
-                }
-                server::depart(&app,id).await
-            }.await;
-            if let Err(error) = result {
-                tracing::error!(player=id,name=profile.name,%error,"autonomous controller stopped; account retained for diagnosis");
-                let reason = error.to_string();
-                if let Err(error) = app
-                    .world
-                    .for_player(id)
-                    .call(move |w| w.poison(id, reason))
-                    .await
-                {
-                    tracing::error!(player=id,%error,"autonomous quarantine failed");
-                }
-                app.quarantined
-                    .lock()
-                    .expect("quarantine registry poisoned")
-                    .push(owner);
-            }
-        });
-    }
-    Ok(())
-}
+mod runtime;
+pub(crate) const OUTPUT_CAPACITY: usize = 512;
+pub use runtime::start;

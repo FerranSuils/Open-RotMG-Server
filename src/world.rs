@@ -2473,7 +2473,12 @@ impl World {
         let ids: Vec<_> = self.players.keys().copied().collect();
         for id in &ids {
             let p = &self.players[id];
-            if !p.character.alive || p.death_pending || p.departing || p.paused {
+            if !p.character.alive
+                || p.death_pending
+                || p.departing
+                || p.paused
+                || p.persistence_failure.is_some()
+            {
                 continue;
             }
             let p = self.players.get_mut(id).unwrap();

@@ -4,6 +4,27 @@ use crate::content::WIZARD;
 use crate::wire::Reader;
 
 #[test]
+fn own_condition_mask_matches_timed_native_state_without_private_deadlines() {
+    let mut d = super::tests::directory();
+    let (id, _rx) = receive(&mut d, -2, 1, WIZARD);
+    let w = d.worlds.get_mut(&-2).unwrap();
+    w.players
+        .get_mut(&id)
+        .unwrap()
+        .conditions
+        .insert(crate::content::SLOWED, (0, 150));
+    w.now = 149;
+    let v = d.player_view(id).unwrap();
+    assert_eq!(v.character.conditions, crate::content::SLOWED);
+    let json = serde_json::to_string(&v).unwrap();
+    assert!(!json.contains("until") && !json.contains("since"));
+    let w = d.worlds.get_mut(&-2).unwrap();
+    w.now = 150;
+    w.players.get_mut(&id).unwrap().paused = true;
+    assert_eq!(d.player_view(id).unwrap().character.conditions, 1 << 20);
+}
+
+#[test]
 fn restricted_view_excludes_private_inventory_ai_and_undiscovered_collision() {
     let mut d = super::tests::directory();
     let (a, _ar) = receive(&mut d, -2, 1, WIZARD);
