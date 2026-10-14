@@ -32,6 +32,7 @@ pub struct SessionControl {
 pub struct Owner {
     registry: Arc<Mutex<BTreeMap<i32, Option<SessionControl>>>>,
     id: i32,
+    registered: bool,
     cancel: Option<tokio::sync::watch::Receiver<bool>>,
     done: Option<tokio::sync::watch::Sender<Option<std::result::Result<(), String>>>>,
     acknowledged: bool,
@@ -74,6 +75,7 @@ impl App {
         Ok(Owner {
             registry: self.owners.clone(),
             id,
+            registered: false,
             cancel: None,
             done: None,
             acknowledged: false,
@@ -548,8 +550,11 @@ async fn handle(
             }
             r.done()?;
             let authentication = a.authentication.read().await;
+            let registered = !password.is_empty();
             let id = a.store.authenticate(guid, password).await?;
-            *account = Some(a.claim_session(id)?);
+            let mut owner = a.claim_session(id)?;
+            owner.registered = registered;
+            *account = Some(owner);
             drop(authentication);
             a.store.compete(id).await?;
             let (destination, character) = a
@@ -671,7 +676,9 @@ async fn handle(
             ) {
                 let result = async {
                     ensure!(a.discord_link_token.is_some(), "Discord linking is not configured");
-                    let owner = account.as_ref().context("authenticated session required")?.id;
+                    let owner = account.as_ref().context("authenticated session required")?;
+                    ensure!(owner.registered, "sign into your registered account again before Discord account actions");
+                    let owner = owner.id;
                     let reply = match text.trim() {
                         "/discord recovery" => {
                             let code = a.store.issue_recovery_code(owner).await?;
