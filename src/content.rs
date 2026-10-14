@@ -5,6 +5,11 @@ use std::{collections::BTreeMap, io::Read, path::Path};
 
 pub const WIZARD: u16 = 0x030e;
 pub const PRIEST: u16 = 0x0310;
+pub const SLOWED: i32 = 1 << 3;
+pub const DAZED: i32 = 1 << 5;
+pub const STUNNED: i32 = 1 << 6;
+pub const PARALYZED: i32 = 1 << 13;
+pub const SPEEDY: i32 = 1 << 14;
 pub const STATS: [(u8, &str); 8] = [
     (0, "MaxHitPoints"),
     (3, "MaxMagicPoints"),
@@ -31,6 +36,7 @@ pub struct Projectile {
     pub amplitude: f32,
     pub frequency: f32,
     pub passes_cover: bool,
+    pub conditions: Vec<(i32, u64)>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Object {
@@ -148,6 +154,32 @@ impl Content {
                     amplitude: number(p, "Amplitude", 0.)?,
                     frequency: number(p, "Frequency", 1.)?,
                     passes_cover: child(p, "PassesCover").is_some(),
+                    conditions: p
+                        .children()
+                        .filter(|c| c.has_tag_name("ConditionEffect"))
+                        .filter_map(|c| {
+                            let effect = match c.text()?.trim() {
+                                "Slowed" => SLOWED,
+                                "Dazed" => DAZED,
+                                "Stunned" => STUNNED,
+                                "Paralyzed" => PARALYZED,
+                                "Speedy" => SPEEDY,
+                                _ => return None,
+                            };
+                            Some((|| -> Result<_> {
+                                let duration = c
+                                    .attribute("duration")
+                                    .context("condition duration missing")?
+                                    .parse()?;
+                                Ok((
+                                    effect,
+                                    std::time::Duration::try_from_secs_f64(duration)?
+                                        .as_millis()
+                                        .try_into()?,
+                                ))
+                            })())
+                        })
+                        .collect::<Result<_>>()?,
                 };
                 ensure!(
                     projectiles.insert(index, projectile).is_none(),
