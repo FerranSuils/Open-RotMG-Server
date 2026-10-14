@@ -893,13 +893,14 @@ impl Grid {
     }
     fn segment(&self, from: Pos, to: Pos) -> bool {
         let steps = (from.distance(to) * 4.).ceil().max(1.) as i32;
-        (0..=steps).all(|i| {
-            let f = i as f32 / steps as f32;
-            self.walkable.contains(&tile(Pos {
-                x: from.x + (to.x - from.x) * f,
-                y: from.y + (to.y - from.y) * f,
-            }))
-        })
+        self.walkable.contains(&tile(to))
+            && (0..=steps).all(|i| {
+                let f = i as f32 / steps as f32;
+                self.walkable.contains(&tile(Pos {
+                    x: from.x + (to.x - from.x) * f,
+                    y: from.y + (to.y - from.y) * f,
+                }))
+            })
     }
     fn next(&self, from: Pos, to: Pos) -> Option<Pos> {
         let start = tile(from);
@@ -907,14 +908,14 @@ impl Grid {
         if !self.walkable.contains(&finish) {
             return None;
         }
-        if self.segment(from, to) {
-            // Distant remembered terrain may contain cover that is not currently visible.
-            let distance = from.distance(to);
-            let fraction = 4. / distance.max(4.);
-            return Some(Pos {
-                x: from.x + (to.x - from.x) * fraction,
-                y: from.y + (to.y - from.y) * fraction,
-            });
+        // A distant sampling grid can miss the nearby waypoint's blocked cell.
+        let fraction = 4. / from.distance(to).max(4.);
+        let waypoint = Pos {
+            x: from.x + (to.x - from.x) * fraction,
+            y: from.y + (to.y - from.y) * fraction,
+        };
+        if self.segment(from, to) && self.segment(from, waypoint) {
+            return Some(waypoint);
         }
         if start == finish {
             return None;

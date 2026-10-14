@@ -28,6 +28,22 @@ fn retained_exploration_can_outscore_a_clear_distant_enemy() {
 }
 
 #[test]
+fn bounded_waypoint_checks_its_actual_endpoint_not_a_distant_sampling_grid() {
+    let mut v = view(&content());
+    v.position = Pos {
+        x: 12.1716,
+        y: 12.1715,
+    };
+    v.tiles.retain(|t| (t.x, t.y) != (15, 14));
+    let grid = Grid::new(&v);
+    let target = Pos { x: 25.5, y: 25.5 };
+    assert!(grid.segment(v.position, target));
+    let next = grid.next(v.position, target).unwrap();
+    assert!(grid.walkable.contains(&tile(next)));
+    assert!(grid.segment(v.position, next));
+}
+
+#[test]
 fn observed_static_cover_survives_leaving_view_but_not_a_verified_clear_tile() {
     let c = content();
     let mut v = view(&c);
