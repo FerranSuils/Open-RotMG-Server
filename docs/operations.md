@@ -18,8 +18,8 @@ For hosting, build with `cargo build --release --locked` and run `openrotmg --co
 
 `GET /health` reports monotonic process `uptime_seconds` and distinct native human `players`, autonomous `bots` and `qa_actors`. Enable the three-Wizard population explicitly with `"shore_bots": true`; reserve at least one human slot and never enable production QA control. Bot accounts are created once with normal starter equipment, resume committed characters, and remain retired after permanent death. Private disk/SQLite backups retain their registry, identity and inventory. Credential-free exports omit identities; restoring those exports requires operator-reviewed identity recovery before bot startup.
 
-Native registration converts a guest without changing account ownership; subsequent login uses email/password rather than the guest GUID. SQLite stores Argon2id verifiers. Registered accounts can choose one free, unique 3–10-letter name through the original client; name changes after that, email verification and password recovery are not implemented.
+Native registration converts a guest without changing account ownership; subsequent login uses email/password rather than the guest GUID. SQLite stores Argon2id verifiers. Registered accounts can choose one free, unique 3–10-letter name through the original client; name changes after that and email verification are not implemented.
 
-Hiscores, drop-collection provenance and the private `/discord` → Discord `/link` flow are described in `docs/hiscores.md`. `/kick` and `/recover` remain disabled.
+Hiscores, drop-collection provenance and the private `/discord` → Discord `/link` flow, self-only `/kick` and opt-in Discord `/recover` are described in `docs/hiscores.md`. Native email-based password recovery is not implemented.
 
 Independent credential-free backup and offline restore instructions are in `scripts/backups/OPERATIONS.md`.

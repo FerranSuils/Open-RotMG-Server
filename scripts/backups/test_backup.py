@@ -47,6 +47,61 @@ INSERT INTO collections VALUES(1,2594,123);
 INSERT INTO discord_links VALUES(1,'1558662335076376578');
 INSERT INTO discord_codes VALUES(1,'NEVER_EXPORT_LINK_CODE_HASH',100,400);''')
 
+    def add_actions(self):
+        self.add_hiscores()
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.executescript("""
+CREATE TABLE account_fame(account INTEGER PRIMARY KEY REFERENCES accounts(id),balance INTEGER NOT NULL,earned INTEGER NOT NULL);
+CREATE TABLE discord_recovery(account INTEGER PRIMARY KEY REFERENCES discord_links(account),enabled_at INTEGER NOT NULL,last_issued_at INTEGER NOT NULL);
+CREATE TABLE recovery_codes(account INTEGER PRIMARY KEY REFERENCES accounts(id),hash TEXT NOT NULL UNIQUE,issued_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
+CREATE TABLE password_resets(account INTEGER PRIMARY KEY REFERENCES accounts(id),hash TEXT NOT NULL UNIQUE,issued_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
+INSERT INTO account_fame SELECT id,27,40 FROM accounts;
+INSERT INTO discord_recovery VALUES(1,123,124);
+INSERT INTO recovery_codes VALUES(1,'NEVER_EXPORT_RECOVERY_CODE_HASH',100,400);
+INSERT INTO password_resets VALUES(1,'NEVER_EXPORT_RESET_TOKEN_HASH',100,1000);""")
+
+    def test_actions_roundtrip_preserves_wallet_and_consent_without_reset_authority(self):
+        self.add_actions()
+        before = self.export()
+        self.assertEqual(before['schema'], 5)
+        raw = gzip.decompress(self.output.read_bytes())
+        for secret in [b'NEVER_EXPORT', b'password_resets', b'recovery_codes', b'credentials', b'discord_codes']:
+            self.assertNotIn(secret, raw)
+        directory = self.root / 'actions-restored'
+        backup.restore(self.output, directory)
+        self.assertEqual(backup.snapshot(directory / 'game.db', backup.ACTIONS_GAME), before['game'])
+        with closing(sqlite3.connect(directory / 'game.db')) as db:
+            self.assertTrue(all(r[0] is None for r in db.execute('SELECT guid FROM accounts')))
+            self.assertEqual(db.execute('SELECT balance,earned FROM account_fame WHERE account=1').fetchone(), (27,40))
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone(), (5,))
+            for secret_table in ['credentials', 'discord_codes', 'password_resets', 'recovery_codes']:
+                self.assertFalse(db.execute("SELECT 1 FROM sqlite_schema WHERE name=?", [secret_table]).fetchall())
+
+    def test_actions_invalid_wallet_and_permission_fail_closed(self):
+        self.add_actions()
+        before = self.export()
+        for table, field, value in [('account_fame','balance',-1), ('account_fame','balance',41), ('account_fame','earned',True), ('discord_recovery','enabled_at',0), ('discord_recovery','last_issued_at',-1), ('discord_recovery','account',999)]:
+            malformed = deepcopy(before)
+            malformed['game'][table][0][field] = value
+            with self.subTest(table=table, field=field), self.assertRaises(ValueError):
+                backup.validate(malformed)
+        for table in ['account_fame', 'discord_recovery']:
+            malformed = deepcopy(before)
+            malformed['game'][table][0]['secret'] = 'NEVER_EXPORT'
+            with self.assertRaisesRegex(ValueError, 'fields'):
+                backup.validate(malformed)
+        malformed = deepcopy(before)
+        malformed['game']['account_fame'] = []
+        with self.assertRaisesRegex(ValueError, 'wallet'):
+            backup.validate(malformed)
+
+    def test_actions_unknown_secret_column_rejected_before_export(self):
+        self.add_actions()
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.execute('ALTER TABLE password_resets ADD COLUMN clear_token TEXT')
+        with self.assertRaisesRegex(ValueError, 'columns'):
+            self.export()
+
     def test_hiscores_roundtrip_keeps_records_and_ids_but_no_authentication(self):
         self.add_hiscores()
         before = self.export()
@@ -297,7 +352,7 @@ INSERT INTO discord_codes VALUES(1,'NEVER_EXPORT_LINK_CODE_HASH',100,400);''')
             del malformed['game'][table]
             with self.subTest(missing=table), self.assertRaisesRegex(ValueError, 'tables'):
                 backup.validate(malformed)
-        for version in [5, True, '3']:
+        for version in [6, True, '3']:
             with self.subTest(version=version), self.assertRaisesRegex(ValueError, 'envelope'):
                 backup.validate(dict(before, schema=version))
 

@@ -2,21 +2,21 @@ use super::*;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
-fn now() -> Result<i64> {
+pub(super) fn now() -> Result<i64> {
     Ok(i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs(),
     )?)
 }
-fn discord_id(id: &str) -> Result<()> {
+pub(super) fn discord_id(id: &str) -> Result<()> {
     ensure!(
         (17..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit()),
         "invalid Discord identity"
     );
     Ok(())
 }
-fn code_hash(code: &str) -> Result<String> {
+pub(super) fn code_hash(code: &str) -> Result<String> {
     ensure!(
         code.len() == 32 && code.bytes().all(|b| b.is_ascii_hexdigit()),
         "invalid or expired link code"
@@ -74,10 +74,11 @@ impl Store {
             let tx = db.transaction()?;
             let mut records = std::collections::BTreeMap::<i32, serde_json::Value>::new();
             {
-                let mut q=tx.prepare("SELECT a.id,a.name,l.discord_id FROM accounts a JOIN competitors c ON c.account=a.id LEFT JOIN discord_links l ON l.account=a.id WHERE NOT EXISTS(SELECT 1 FROM shore_bots b WHERE b.account=a.id) ORDER BY a.id")?;
-                for row in q.query_map([], |r| Ok((r.get::<_,i32>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?)))? {
-                    let (id,name,discord)=row?;
-                    records.insert(id,serde_json::json!({"account":id,"name":name,"discord_id":discord,"base_fame":0,"total_fame":0,"collection":0}));
+                let mut q=tx.prepare("SELECT a.id,a.name,l.discord_id,f.balance FROM accounts a JOIN competitors c ON c.account=a.id LEFT JOIN account_fame f ON f.account=a.id LEFT JOIN discord_links l ON l.account=a.id WHERE NOT EXISTS(SELECT 1 FROM shore_bots b WHERE b.account=a.id) ORDER BY a.id")?;
+                for row in q.query_map([], |r| Ok((r.get::<_,i32>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,i64>(3)?)))? {
+                    let (id,name,discord,balance)=row?;
+                    ensure!(balance >= 0, "negative account fame");
+                    records.insert(id,serde_json::json!({"account":id,"name":name,"discord_id":discord,"base_fame":0,"total_fame":balance,"collection":0}));
                 }
             }
             let mut characters = std::collections::BTreeMap::new();
@@ -96,7 +97,6 @@ impl Store {
                     ensure!(c.fame >= 0, "negative persisted fame for character {}", c.id);
                     let best=row["base_fame"].as_i64().context("invalid best fame")?;
                     if i64::from(c.fame)>best {row["base_fame"]=c.fame.into();}
-                    if !c.alive {row["total_fame"]=row["total_fame"].as_i64().context("invalid total fame")?.checked_add(i64::from(c.fame)).context("lifetime fame overflow")?.into();}
                 }
             }
             {

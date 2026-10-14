@@ -37,7 +37,7 @@ fn email(value: &str) -> Result<String> {
     );
     Ok(value.to_ascii_lowercase())
 }
-fn password(value: &str) -> Result<()> {
+pub(super) fn password(value: &str) -> Result<()> {
     ensure!(
         (5..=128).contains(&value.len()) && !value.chars().any(char::is_control),
         "password must be 5–128 bytes without control characters"
@@ -68,6 +68,10 @@ fn guest(db: &Connection, guid: &str, create: bool) -> Result<i32> {
     ensure!(create, "unknown guest; load character list first");
     db.execute("INSERT INTO accounts(guid,name) VALUES(?1,'Guest')", [guid])?;
     let id = i32::try_from(db.last_insert_rowid())?;
+    db.execute(
+        "INSERT INTO account_fame(account,balance,earned) VALUES(?1,0,0)",
+        [id],
+    )?;
     db.execute(
         "UPDATE accounts SET name=?2 WHERE id=?1",
         params![id, format!("Guest{id}")],
