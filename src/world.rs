@@ -28,7 +28,7 @@ mod mechanics_tests;
 mod reconciliation;
 #[cfg(test)]
 mod reconciliation_tests;
-pub use reconciliation::NativeInput;
+pub use reconciliation::{InvalidShotOrigin, NativeInput};
 mod progression;
 #[cfg(test)]
 mod progression_tests;
@@ -1637,20 +1637,14 @@ impl World {
         };
         if p.pos.distance(center) > 0.001 {
             self.validate_move_at(id, center, time, received)
-                .with_context(|| format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at))?;
+                .with_context(|| InvalidShotOrigin(format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at)))?;
         }
         let spec = item
             .projectiles
             .get(&0)
             .cloned()
             .context("weapon has no projectile zero")?;
-        // The selected client's integer attack period cannot fund a fractional charge indefinitely.
-        let rate = if flags & crate::condition::bit(crate::condition::DAZED) != 0 {
-            0.0015
-        } else {
-            0.0015 + (0.008 - 0.0015) * p.character.effective(&self.content)?[5] as f64 / 75.
-        };
-        let cooldown = (1. / (rate * f64::from(item.rate))).floor() as f32;
+        let cooldown = reconciliation::attack_cooldown(p, &self.content, self.now, item.rate)?;
         let p = self.players.get_mut(&id).unwrap();
         ensure!(time >= 0, "negative shot time");
         if time != p.last_attack {
