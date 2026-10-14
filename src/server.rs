@@ -581,10 +581,10 @@ async fn handle(
                         Ok(_) => Ok(()),
                         Err(error)
                             if error
-                                .downcast_ref::<crate::world::InvalidShotOrigin>()
+                                .downcast_ref::<crate::world::RejectedNativeShot>()
                                 .is_some() =>
                         {
-                            w.correct_shot_origin(id, time, bullet, kind, &format!("{error:#}"))
+                            w.correct_native_shot(id, time, bullet, kind, &format!("{error:#}"))
                         }
                         Err(error) => Err(error),
                     }

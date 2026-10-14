@@ -32,7 +32,7 @@ mod mechanics_tests;
 mod reconciliation;
 #[cfg(test)]
 mod reconciliation_tests;
-pub use reconciliation::{InvalidShotOrigin, NativeInput};
+pub use reconciliation::{NativeInput, RejectedNativeShot};
 mod progression;
 #[cfg(test)]
 mod progression_tests;
@@ -1674,7 +1674,7 @@ impl World {
         };
         if p.pos.distance(center) > 0.001 {
             self.validate_move_at(id, center, time, received)
-                .with_context(|| InvalidShotOrigin(format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at)))?;
+                .with_context(|| RejectedNativeShot(format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at)))?;
         }
         let spec = item
             .projectiles
@@ -1684,6 +1684,8 @@ impl World {
         let cooldown = reconciliation::attack_cooldown(p, &self.content, self.now, item.rate)?;
         let p = self.players.get_mut(&id).unwrap();
         ensure!(time >= 0, "negative shot time");
+        ensure!(shot_index < item.shots, "too many projectiles in attack");
+        ensure!(bullet == p.next_bullet, "unexpected player bullet counter");
         if time != p.last_attack {
             ensure!(
                 i64::from(time) - i64::from(p.last_attack) >= cooldown as i64 - 2,
@@ -1695,21 +1697,16 @@ impl World {
             let credit = (p.attack_credit + elapsed as f32).min(cooldown * 2.);
             ensure!(
                 credit >= cooldown - 50.,
-                "attack exceeds server time budget: credit={credit} cooldown={cooldown} received_time={received} simulation_time={} last_received_time={} shot_time={time} last_shot_time={}",
-                self.now,
-                p.last_attack_at,
-                p.last_attack
+                RejectedNativeShot(format!(
+                    "attack exceeds server time budget: credit={credit} cooldown={cooldown} received_time={received} simulation_time={} last_received_time={} shot_time={time} last_shot_time={}",
+                    self.now, p.last_attack_at, p.last_attack
+                ))
             );
             p.attack_credit = credit - cooldown;
             p.last_attack_at = received;
             p.last_attack = time;
             p.attack_count = 0;
         }
-        ensure!(
-            p.attack_count < item.shots,
-            "too many projectiles in attack"
-        );
-        ensure!(bullet == p.next_bullet, "unexpected player bullet counter");
         p.next_bullet = (bullet + 1) % 128;
         p.attack_count += 1;
         p.character.shots += 1;
