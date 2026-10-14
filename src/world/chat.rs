@@ -13,13 +13,21 @@ pub(crate) fn chat_error(reason: &str) -> Packet {
     text_packet("*Error*", -1, 0, reason)
 }
 
+pub(crate) fn chat_info(text: &str) -> Packet {
+    text_packet("", -1, 0, text)
+}
+
 fn text_packet(name: &str, object: i32, bubble: u8, text: &str) -> Packet {
+    text_to(name, object, bubble, "", text)
+}
+
+fn text_to(name: &str, object: i32, bubble: u8, recipient: &str, text: &str) -> Packet {
     let mut out = Writer::new();
     out.utf(name)
         .i32(object)
         .i32(0)
         .u8(bubble)
-        .utf("")
+        .utf(recipient)
         .utf(text)
         .utf("");
     Packet {
@@ -28,7 +36,7 @@ fn text_packet(name: &str, object: i32, bubble: u8, text: &str) -> Packet {
     }
 }
 
-fn validate(text: &str) -> Result<()> {
+pub(crate) fn validate(text: &str) -> Result<()> {
     ensure!(!text.trim().is_empty(), "Chat message is empty.");
     ensure!(
         text.encode_utf16().count() <= 128,
@@ -41,44 +49,58 @@ fn validate(text: &str) -> Result<()> {
                 || matches!(c, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')),
         "Chat message contains control characters."
     );
-    ensure!(
-        !text.trim_start().starts_with('/') || text.trim().eq_ignore_ascii_case("/pause"),
-        "Unknown chat command."
-    );
     Ok(())
 }
 
-impl Directory {
-    pub fn chat(&mut self, id: i32, text: String, now: Instant) -> Result<()> {
-        validate(&text)?;
-        let world = self.resolve(Target::Player(id))?;
-        let sender = &world.players[&id];
+impl Player {
+    fn can_chat(&self) -> bool {
+        self.character.alive
+            && self.character.hp > 0
+            && !self.death_pending
+            && !self.departing
+            && self.persistence_failure.is_none()
+    }
+}
+
+impl World {
+    pub fn account_list_target(&self, id: i32, target: i32) -> Result<i32> {
+        let sender = self.players.get(&id).context("player missing")?;
+        let target_player = self.players.get(&target).context("player not found")?;
         ensure!(
-            sender.character.alive
-                && sender.character.hp > 0
-                && !sender.death_pending
-                && !sender.departing
-                && sender.persistence_failure.is_none(),
+            sender.can_chat()
+                && target_player.can_chat()
+                && id != target
+                && sender.known.contains(&target),
+            "account list target is not an available nearby player"
+        );
+        Ok(target_player.character.account)
+    }
+
+    pub fn sync_account_lists(&mut self, id: i32, lists: Option<AccountLists>) -> Result<()> {
+        let player = self.players.get_mut(&id).context("player missing")?;
+        if let Some(lists) = lists {
+            player.account_lists = lists;
+        }
+        for (list, accounts) in player.account_lists.iter().enumerate() {
+            let mut out = Writer::new();
+            out.i32(list as i32).i16(i16::try_from(accounts.len())?);
+            for account in accounts {
+                out.i32(*account);
+            }
+            send(player, wire::ACCOUNT_LIST, out.0);
+        }
+        Ok(())
+    }
+}
+
+impl Directory {
+    pub fn chat_permit(&mut self, id: i32, now: Instant) -> Result<()> {
+        let sender = &self.resolve(Target::Player(id))?.players[&id];
+        ensure!(
+            sender.can_chat(),
             "Dead, departing or quarantined players cannot chat."
         );
-        if text.trim().eq_ignore_ascii_case("/pause") {
-            ensure!(
-                sender.paused
-                    || !world.entities.values().any(|e| e.hp > 0
-                        && world.content.objects[&e.kind].enemy
-                        && sender.pos.distance(e.pos) <= 8.),
-                "Not safe enough to pause!"
-            );
-            let p = world.players.get_mut(&id).unwrap();
-            p.paused = !p.paused;
-            p.last_move_at = world.now;
-            let text = format!("Game {}.", if p.paused { "paused" } else { "resumed" });
-            let reply = text_packet("", -1, 0, &text);
-            send(p, reply.id, reply.body);
-            return Ok(());
-        }
         let account = sender.character.account;
-        let packet = text_packet(&sender.character.name, id, 5, &text);
         // Account budgets survive world transfers and reconnects without touching durable game saves.
         self.chat_budgets
             .retain(|_, b| now.saturating_duration_since(b.updated).as_secs() < 3);
@@ -100,15 +122,89 @@ impl Directory {
             "Chat rate limit: wait one second before sending again."
         );
         budget.tokens -= 1.;
+        Ok(())
+    }
+
+    pub fn chat(&mut self, id: i32, text: String, now: Instant) -> Result<()> {
+        validate(&text)?;
+        let trimmed = text.trim();
+        let (command, rest) = trimmed
+            .split_once(char::is_whitespace)
+            .unwrap_or((trimmed, ""));
+        let tell = command.eq_ignore_ascii_case("/tell") || command.eq_ignore_ascii_case("/t");
+        ensure!(
+            !trimmed.starts_with('/') || tell || trimmed.eq_ignore_ascii_case("/pause"),
+            "Unknown chat command."
+        );
+        let world = self.resolve(Target::Player(id))?;
+        let sender = &world.players[&id];
+        ensure!(
+            sender.can_chat(),
+            "Dead, departing or quarantined players cannot chat."
+        );
+        if text.trim().eq_ignore_ascii_case("/pause") {
+            ensure!(
+                sender.paused
+                    || !world.entities.values().any(|e| e.hp > 0
+                        && world.content.objects[&e.kind].enemy
+                        && sender.pos.distance(e.pos) <= 8.),
+                "Not safe enough to pause!"
+            );
+            let p = world.players.get_mut(&id).unwrap();
+            p.paused = !p.paused;
+            p.last_move_at = world.now;
+            let text = format!("Game {}.", if p.paused { "paused" } else { "resumed" });
+            let reply = text_packet("", -1, 0, &text);
+            send(p, reply.id, reply.body);
+            return Ok(());
+        }
+        let account = sender.character.account;
+        let name = sender.character.name.clone();
+        ensure!(
+            !tell || crate::store::name_chosen(account, &name),
+            "Choose a name before using /tell."
+        );
+        self.chat_permit(id, now)?;
+        if tell {
+            let (recipient, message) = rest
+                .trim_start()
+                .split_once(char::is_whitespace)
+                .filter(|(_, message)| !message.trim().is_empty())
+                .context("Usage: /tell <player> <message>")?;
+            let target = self
+                .worlds
+                .values()
+                .flat_map(|w| w.players.values())
+                .find(|p| p.can_chat() && p.character.name.eq_ignore_ascii_case(recipient))
+                .context("Player not found.")?;
+            ensure!(
+                target.character.account != account,
+                "You cannot tell yourself."
+            );
+            let packet = text_to(&name, -1, 0, &target.character.name, message.trim());
+            let ignored = target.account_lists[1].contains(&account);
+            if !ignored {
+                send(target, packet.id, packet.body.clone());
+            }
+            let sender = &self.resolve(Target::Player(id))?.players[&id];
+            send(sender, packet.id, packet.body);
+            tracing::info!(
+                player = id,
+                account,
+                delivered = !ignored,
+                bytes = message.len(),
+                "private chat processed"
+            );
+            return Ok(());
+        }
+        let packet = text_packet(&name, id, 5, &text);
         let world = self.resolve(Target::Player(id))?;
         let mut recipients = 0;
-        for player in world.players.values().filter(|p| {
-            p.character.alive
-                && p.character.hp > 0
-                && !p.death_pending
-                && !p.departing
-                && p.persistence_failure.is_none()
-        }) {
+        for player in world
+            .players
+            .values()
+            .filter(|p| p.can_chat() && !p.account_lists[1].contains(&account))
+        {
             send(player, packet.id, packet.body.clone());
             recipients += 1;
         }
@@ -222,6 +318,112 @@ mod tests {
         validate(&"😀".repeat(64)).unwrap();
         validate(&"a".repeat(128)).unwrap();
     }
+    #[test]
+    fn tells_cross_worlds_without_leaking_or_spoofing_and_share_public_throttle() {
+        let mut d = super::super::tests::directory();
+        let now = Instant::now();
+        let (a, mut ar) = receive(&mut d, -2, 1);
+        let (_, mut spectator) = receive(&mut d, -2, 2);
+        let (b, mut br) = receive(&mut d, -3, 3);
+        let (_, mut remote_spectator) = receive(&mut d, -3, 4);
+        assert!(d.chat(a, "/tell Guest3 unnamed".into(), now).is_err());
+        assert!(ar.try_recv().is_err());
+        assert!(br.try_recv().is_err());
+        d.worlds
+            .get_mut(&-2)
+            .unwrap()
+            .players
+            .get_mut(&a)
+            .unwrap()
+            .character
+            .name = "Alice".into();
+        let body = "<Guest4>: /tell Guest2 private";
+        d.chat(a, format!("/TeLl gUeSt3 {body}"), now).unwrap();
+        for packet in [ar.try_recv().unwrap(), br.try_recv().unwrap()] {
+            let mut r = Reader::new(&packet.body);
+            assert_eq!(packet.id, wire::TEXT);
+            assert_eq!(r.utf().unwrap(), "Alice");
+            assert_eq!(r.i32().unwrap(), -1);
+            assert_eq!(r.i32().unwrap(), 0);
+            assert_eq!(r.u8().unwrap(), 0);
+            assert_eq!(r.utf().unwrap(), "Guest3");
+            assert_eq!(r.utf().unwrap(), body);
+            assert_eq!(r.utf().unwrap(), "");
+            r.done().unwrap();
+        }
+        assert!(spectator.try_recv().is_err());
+        assert!(remote_spectator.try_recv().is_err());
+        d.worlds
+            .get_mut(&-3)
+            .unwrap()
+            .players
+            .get_mut(&b)
+            .unwrap()
+            .account_lists[1]
+            .insert(1);
+        d.chat(a, "/t Guest3 ignored".into(), now).unwrap();
+        assert!(ar.try_recv().is_ok());
+        assert!(br.try_recv().is_err());
+        d.chat(a, "public".into(), now).unwrap();
+        assert!(ar.try_recv().is_ok());
+        assert!(spectator.try_recv().is_ok());
+        assert!(d.chat(a, "/tell Guest3 throttled".into(), now).is_err());
+        assert!(br.try_recv().is_err());
+        for text in [
+            "/tell",
+            "/tell Guest3",
+            "/tell Guest3  ",
+            "/tell nobody hi",
+            "/tell Alice hi",
+            "/t Guest3 hi\nspoof",
+        ] {
+            assert!(
+                d.chat(a, text.into(), now + std::time::Duration::from_secs(10))
+                    .is_err()
+            );
+        }
+        assert!(ar.try_recv().is_err());
+        assert!(spectator.try_recv().is_err());
+        assert!(remote_spectator.try_recv().is_err());
+    }
+
+    #[test]
+    fn account_list_packets_use_accounts_and_ignores_filter_local_chat() {
+        let mut d = super::super::tests::directory();
+        let (a, mut ar) = receive(&mut d, -2, 1);
+        let (b, mut br) = receive(&mut d, -2, 2);
+        let (c, _) = receive(&mut d, -3, 3);
+        let w = d.worlds.get_mut(&-2).unwrap();
+        assert!(w.account_list_target(a, a).is_err());
+        assert!(w.account_list_target(a, c).is_err());
+        assert!(w.account_list_target(a, b).is_err());
+        w.players.get_mut(&a).unwrap().known.insert(b);
+        assert_eq!(w.account_list_target(a, b).unwrap(), 2);
+        w.sync_account_lists(b, Some([BTreeSet::from([1]), BTreeSet::from([1])]))
+            .unwrap();
+        for list in 0..2 {
+            let p = br.try_recv().unwrap();
+            assert_eq!(p.id, wire::ACCOUNT_LIST);
+            let mut r = Reader::new(&p.body);
+            assert_eq!(r.i32().unwrap(), list);
+            assert_eq!(r.i16().unwrap(), 1);
+            assert_eq!(r.i32().unwrap(), 1);
+            r.done().unwrap();
+        }
+        let now = Instant::now();
+        d.chat(a, "ignored".into(), now).unwrap();
+        assert!(ar.try_recv().is_ok());
+        assert!(br.try_recv().is_err());
+        d.worlds
+            .get_mut(&-2)
+            .unwrap()
+            .sync_account_lists(b, Some([BTreeSet::from([1]), BTreeSet::new()]))
+            .unwrap();
+        while br.try_recv().is_ok() {}
+        d.chat(a, "unignored".into(), now).unwrap();
+        message(br.try_recv().unwrap(), "Guest1", a, "unignored");
+    }
+
     #[test]
     fn chat_throttle_survives_transfers_reconnects_and_rejects_departed_senders() {
         let mut d = super::super::tests::directory();

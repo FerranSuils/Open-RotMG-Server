@@ -9,6 +9,8 @@ mod account_actions;
 mod accounts;
 mod hiscores;
 mod legends;
+mod social;
+pub use social::AccountLists;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Character {
@@ -189,7 +191,7 @@ impl Store {
         let mut c = Connection::open(path)?;
         let version: i32 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            matches!(version, 0 | 5),
+            matches!(version, 0 | 5 | 6),
             "unsupported game database schema {version}"
         );
         let wallet_exists: bool = c.query_row(
@@ -198,8 +200,16 @@ impl Store {
             |r| r.get(0),
         )?;
         ensure!(
-            version != 5 || wallet_exists,
+            version < 5 || wallet_exists,
             "schema-5 fame wallet table missing; restore reviewed state instead of recreating balances"
+        );
+        let lists_exist: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='account_lists')",
+            [], |r| r.get(0),
+        )?;
+        ensure!(
+            version != 6 || lists_exist,
+            "schema-6 account lists missing; restore reviewed state instead of clearing preferences"
         );
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY,guid TEXT NOT NULL UNIQUE,name TEXT NOT NULL);
@@ -217,6 +227,7 @@ CREATE TABLE IF NOT EXISTS account_fame(account INTEGER PRIMARY KEY REFERENCES a
 CREATE TABLE IF NOT EXISTS discord_recovery(account INTEGER PRIMARY KEY REFERENCES discord_links(account),enabled_at INTEGER NOT NULL,last_issued_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS recovery_codes(account INTEGER PRIMARY KEY REFERENCES accounts(id),hash TEXT NOT NULL UNIQUE,issued_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS password_resets(account INTEGER PRIMARY KEY REFERENCES accounts(id),hash TEXT NOT NULL UNIQUE,issued_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS account_lists(account INTEGER NOT NULL REFERENCES accounts(id),list_id INTEGER NOT NULL CHECK(list_id IN (0,1)),target INTEGER NOT NULL REFERENCES accounts(id),PRIMARY KEY(account,list_id,target),CHECK(account<>target));
 CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         let migration = c.transaction()?;
         let records = {
@@ -290,7 +301,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 "account fame wallet missing; restore reviewed state instead of recreating balances"
             );
         }
-        migration.pragma_update(None, "user_version", 5)?;
+        migration.pragma_update(None, "user_version", 6)?;
         migration.commit()?;
         if migrated > 0 {
             tracing::info!(
