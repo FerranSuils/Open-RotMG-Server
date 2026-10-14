@@ -12,16 +12,19 @@ pub struct Config {
     pub state: PathBuf,
     pub max_players: usize,
     pub behind_proxy: bool,
-    #[serde(default)]
+    #[serde(default = "default_shore_bots")]
     pub shore_bots: bool,
     pub realm_seed: u64,
+}
+fn default_shore_bots() -> bool {
+    true
 }
 impl Config {
     pub fn load(args: &[String]) -> Result<(Self, bool)> {
         let mut file = None;
         let mut port = None;
         let mut control = false;
-        let mut shore_bots = false;
+        let mut shore_bots = None;
         let mut client_dir = None;
         let mut state_dir = None;
         let mut args = args.iter();
@@ -42,9 +45,9 @@ impl Config {
                     ensure!(!control, "duplicate --dev-control");
                     control = true;
                 }
-                "--shore-bots" => {
-                    ensure!(!shore_bots, "duplicate --shore-bots");
-                    shore_bots = true;
+                "--shore-bots" | "--no-shore-bots" => {
+                    ensure!(shore_bots.is_none(), "duplicate or conflicting bot flags");
+                    shore_bots = Some(arg == "--shore-bots");
                 }
                 "--client" => {
                     ensure!(client_dir.is_none(), "duplicate --client");
@@ -59,7 +62,7 @@ impl Config {
                     ));
                 }
                 _ => anyhow::bail!(
-                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--shore-bots] [--client DIR] [--state DIR]"
+                    "usage: openrotmg [--config FILE] [--port PORT] [--dev-control] [--shore-bots | --no-shore-bots] [--client DIR] [--state DIR]"
                 ),
             }
         }
@@ -80,7 +83,7 @@ impl Config {
                 state: root.join(".local"),
                 max_players: 85,
                 behind_proxy: false,
-                shore_bots: false,
+                shore_bots: true,
                 realm_seed: rand::random(),
             }
         };
@@ -96,7 +99,9 @@ impl Config {
                 config.origin = format!("http://{}", config.bind);
             }
         }
-        config.shore_bots |= shore_bots;
+        if let Some(enabled) = shore_bots {
+            config.shore_bots = enabled;
+        }
         config.validate(control)?;
         Ok((config, control))
     }
@@ -191,10 +196,27 @@ mod tests {
         );
     }
     #[test]
-    fn shore_bots_are_opt_in_and_reserve_human_capacity() {
-        assert!(!Config::load(&[]).unwrap().0.shore_bots);
+    fn shore_bots_default_on_allow_explicit_disable_and_reserve_human_capacity() {
+        assert!(Config::load(&[]).unwrap().0.shore_bots);
+        assert!(config().shore_bots);
+        assert!(
+            !Config::load(&["--no-shore-bots".into()])
+                .unwrap()
+                .0
+                .shore_bots
+        );
         assert!(Config::load(&["--shore-bots".into()]).unwrap().0.shore_bots);
-        assert!(Config::load(&["--shore-bots".into(), "--shore-bots".into()]).is_err());
+        for flags in [
+            ["--shore-bots", "--shore-bots"],
+            ["--no-shore-bots", "--no-shore-bots"],
+            ["--shore-bots", "--no-shore-bots"],
+            ["--no-shore-bots", "--shore-bots"],
+        ] {
+            assert!(Config::load(&flags.map(String::from)).is_err());
+        }
+        let disabled: Config = serde_json::from_str(r#"{"bind":"127.0.0.1:18923","origin":"https://openrotmg.org","data":"/opt/openrotmg/data","client":"/opt/openrotmg/client","state":"/var/lib/openrotmg","max_players":3,"behind_proxy":true,"shore_bots":false,"realm_seed":12351}"#).unwrap();
+        assert!(!disabled.shore_bots);
+        disabled.validate(false).unwrap();
         let mut production = config();
         production.shore_bots = true;
         production.validate(false).unwrap();

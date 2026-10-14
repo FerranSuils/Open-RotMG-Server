@@ -6,9 +6,9 @@ The two video reports record observations and limits; `research/decision-spike.m
 
 ## Local shore prototype
 
-Run `./run.sh 18923 --shore-bots --release`, then enter the Realm through its normal portal. Bayleaf prioritizes recovery, Mossy resources and Trellis companions. They start with ordinary Wizard equipment, use the restricted player view, earn XP and accessible loot, and save through ordinary inventory/progression rules. Native local chat `Trellis follow me` requests following while the sender is visible; it does not reveal a hidden position.
+Run `./run.sh 18923 --release`, then enter the Realm through its normal portal. Bayleaf prioritizes recovery, Mossy resources and Trellis companions. They start with ordinary Wizard equipment, use the restricted player view, earn XP and accessible loot, and save through ordinary inventory/progression rules. Native local chat `Trellis follow me` requests following while the sender is visible; it does not reveal a hidden position.
 
-This flag is default-off and separate from QA control. Hosting can explicitly set `shore_bots: true` with capacity for three bots plus humans; production QA controls remain prohibited. Human, QA and autonomous ownership/counts are distinct. Saved bot accounts resume their committed character; a dead character stays retired. There is no automatic replacement, trade negotiation, dungeon routing or language service. The candidate shore and passing mechanical tests do not establish historical authenticity or the complete community vision.
+The three Wizards run by default, separately from QA control. Isolated tests can use `--no-shore-bots` or explicit `"shore_bots": false`; production QA controls remain prohibited. Human, QA and autonomous ownership/counts are distinct. Saved bot accounts resume their committed character; a dead character stays retired. There is no automatic replacement, trade negotiation, dungeon routing or language service. The candidate shore and passing mechanical tests do not establish historical authenticity or the complete community vision.
 
 ## Approved north star
 
