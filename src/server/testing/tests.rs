@@ -32,6 +32,78 @@ fn spec(pos: Pos) -> Value {
     json!({"guid":"qa-interface-unit","class":WIZARD,"level":8,"seed":12351,"equipment":[2712,-1,-1,-1],"backpack":[2599,2594,-1,-1,-1,-1,-1,-1],"world":-1,"position":pos,"controller":"direct","stats":null})
 }
 #[tokio::test]
+async fn oversized_requests_are_rejected_before_acceptance() {
+    let (dir, app) = fixture();
+    let result = request(
+        &app,
+        "oversized",
+        json!({"op":"capabilities","padding":"x".repeat(MAX_REQUEST_BYTES)}),
+    )
+    .await;
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("8192-byte limit")
+    );
+    assert_eq!(
+        fs::read_dir(&app.testing.as_ref().unwrap().root)
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(app.world.clock.paused());
+    app.shutdown.send_replace(true);
+    fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
+async fn mutation_budget_preserves_replay_and_does_not_resume() {
+    let (dir, app) = fixture();
+    let original = request(&app, "retained", json!({"op":"pause","native_paused":[]})).await;
+    let testing = app.testing.as_ref().unwrap();
+    for n in 1..MAX_MUTATIONS {
+        fs::write(testing.path(&format!("budget-{n}"), "receipt"), b"").unwrap();
+    }
+    app.world.clock.set_paused(false);
+    let denied = request(&app, "over-budget", json!({"op":"resume"})).await;
+    assert!(
+        denied["error"]
+            .as_str()
+            .unwrap()
+            .contains("mutation budget")
+    );
+    assert!(app.world.clock.paused());
+    assert!(!testing.path("over-budget", "receipt").exists());
+    assert_eq!(
+        request(&app, "retained", json!({"op":"pause","native_paused":[]})).await,
+        original
+    );
+    app.shutdown.send_replace(true);
+    fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
+async fn unknown_cancellation_cannot_grow_the_registry() {
+    let (dir, app) = fixture();
+    let result = request(
+        &app,
+        "cancel",
+        json!({"op":"cancel","request":"not-accepted"}),
+    )
+    .await;
+    assert_eq!(result["status"], "failed");
+    assert!(
+        app.testing
+            .as_ref()
+            .unwrap()
+            .cancelled
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    app.shutdown.send_replace(true);
+    fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
 async fn explicit_spawn_idempotency_and_compact_observations() {
     let (dir, app) = fixture();
     let pos = app

@@ -13,6 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+const MAX_REQUEST_BYTES: usize = 8192;
+const MAX_MUTATIONS: usize = 1024;
+
 type NativePings = BTreeMap<i32, (i32, tokio::sync::oneshot::Sender<()>)>;
 
 #[derive(Clone)]
@@ -542,7 +545,7 @@ pub(crate) async fn spawn(a: &App, t: &Testing, spec: Spawn) -> Result<Value> {
 }
 async fn execute(a: &App, t: &Testing, id: &str, command: Command) -> Result<Value> {
     match command {
-        Command::Capabilities => Ok(json!({"schema":1,"provenance":"prepared","pause_scope":"isolated server and all registered native clients","controllers":["direct","native","game_bot"],"game_bot_profiles":crate::bots::profiles(),"goals":["time","level","kills","pirate_caves"],"max_game_ms":600000,"trace_page_limit":40})),
+        Command::Capabilities => Ok(json!({"schema":1,"provenance":"prepared","pause_scope":"isolated server and all registered native clients","controllers":["direct","native","game_bot"],"game_bot_profiles":crate::bots::profiles(),"goals":["time","level","kills","pirate_caves"],"max_game_ms":600000,"trace_page_limit":40,"request_bytes_limit":MAX_REQUEST_BYTES,"mutation_limit":MAX_MUTATIONS})),
         Command::Catalog{search,limit} => {ensure!(!search.is_empty() && search.len()<=80 && (1..=20).contains(&limit),"catalog needs search and limit 1–20");let matches=a.content.objects.values().filter(|o|o.name.to_lowercase().contains(&search.to_lowercase())).collect::<Vec<_>>();Ok(json!({"items":matches.iter().take(limit).map(|o|json!({"id":o.kind,"name":o.name,"class":o.class,"slot_type":o.slot_type,"unsupported_equipment":o.unsupported_equipment})).collect::<Vec<_>>(),"omitted":matches.len().saturating_sub(limit)}))},
         Command::WorldInfo{world} => a.world.in_world(world).call(|w|Ok(json!({"name":w.name,"width":w.map.width,"height":w.map.height,"spawn_points":w.map.spawns,"prepared_seed":w.prepared_seed,"privileged":true}))).await,
         Command::Spawn{spec} => spawn(a,t,spec).await,
@@ -620,12 +623,13 @@ async fn execute(a: &App, t: &Testing, id: &str, command: Command) -> Result<Val
         },
         Command::Result{request}=>{valid_id(&request)?;let saved:Value=serde_json::from_slice(&fs::read(t.path(&request,"receipt"))?)?;if saved["status"]=="running" {Ok(json!({"status":"incomplete","error":"request has no confirmed result; inspect trace, do not replay effects"}))}else{Ok(saved.get("receipt").context("stored receipt missing")?.clone())}}, 
         Command::Trace{request,offset,limit}=>{valid_id(&request)?;ensure!((1..=40).contains(&limit),"trace limit must be 1–40");let raw=fs::read_to_string(t.root.join(format!("{request}.jsonl")))?;let lines=raw.lines().collect::<Vec<_>>();Ok(json!({"events":lines.iter().skip(offset).take(limit).map(|s|serde_json::from_str::<Value>(s)).collect::<std::result::Result<Vec<_>,_>>()?,"total":lines.len(),"next_offset":(offset+limit).min(lines.len())}))},
-        Command::Cancel{request}=>{valid_id(&request)?;t.cancelled.lock().expect("cancellation registry poisoned").insert(request);Ok(json!({"cancel_requested":true}))},
+        Command::Cancel{request}=>{valid_id(&request)?;ensure!(t.path(&request,"receipt").is_file(),"cancel requires an accepted request; no cancellation was registered");t.cancelled.lock().expect("cancellation registry poisoned").insert(request);Ok(json!({"cancel_requested":true}))},
     }
 }
 pub async fn command(State(a): State<App>, headers: HeaderMap, Json(raw): Json<Value>) -> Response {
     let result:Result<Value>=async {
         control(&a,&headers)?;
+        ensure!(serde_json::to_vec(&raw)?.len()<=MAX_REQUEST_BYTES,"request exceeds 8192-byte limit; rejected before acceptance");
         let t=a.testing.as_ref().context("testing interface requires an exclusively created --test-state directory")?;
         let request:Request=serde_json::from_value(raw.clone())?;valid_id(&request.id)?;
         if matches!(request.command,Command::Observe{..}|Command::Inspect{..}|Command::Catalog{..}|Command::WorldInfo{..}|Command::Result{..}|Command::Trace{..}|Command::Capabilities|Command::Cancel{..}) {return execute(&a,t,&request.id,request.command).await;}
@@ -636,6 +640,11 @@ pub async fn command(State(a): State<App>, headers: HeaderMap, Json(raw): Json<V
             ensure!(previous["request"]==raw,"request ID reused with different input");
             ensure!(previous["status"] != "running", "previous request has no confirmed result; inspect its trace rather than repeating its effects");
             return Ok(previous.get("receipt").context("stored receipt is malformed")?.clone());
+        }
+        let mutations=fs::read_dir(&t.root)?.collect::<std::io::Result<Vec<_>>>()?.iter().filter(|entry|entry.file_name().as_encoded_bytes().ends_with(b".receipt.json")).count();
+        if mutations>=MAX_MUTATIONS {
+            a.world.clock.set_paused(true);
+            bail!("prepared mutation budget reached; server clock stopped, native clients require wrapper cleanup; preserve this state and use a new owned test state");
         }
         write_json(&path,&json!({"request":raw,"status":"running"}))?;
         t.record(&request.id,json!({"event":"accepted","request":raw}))?;
