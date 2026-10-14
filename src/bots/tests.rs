@@ -437,6 +437,24 @@ fn only_addressed_native_chat_changes_companion_memory() {
     assert!(brain.companion.is_none());
     assert!(brain.receive(packet("Trellis follow me"), &v).unwrap());
     assert_eq!(brain.companion, Some(9));
+    v.objects[0].position = Pos { x: 20.5, y: 11.5 };
+    let mut leader = object(2, WIZARD, 11.5, 22.5);
+    leader.name = "Mossy".into();
+    leader.equipped = v.character.items[..4].to_vec();
+    v.objects.push(leader);
+    brain.goal = Goal::Follow(2);
+    let accepted = brain.decide(&v, &content).unwrap();
+    assert_eq!(accepted.goal, Goal::Follow(9));
+    brain.goal = accepted.goal;
+    v.character.hp = 20;
+    v.tick += 5;
+    v.time_ms += 250;
+    assert_eq!(brain.decide(&v, &content).unwrap().goal, Goal::Recover);
+    v.character.hp = v.character.stats[0];
+    v.time_ms += 60000;
+    v.tick += 1200;
+    assert_eq!(brain.decide(&v, &content).unwrap().goal, Goal::Follow(2));
+    assert!(brain.companion.is_none());
 }
 
 #[test]

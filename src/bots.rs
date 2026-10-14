@@ -578,7 +578,8 @@ impl Brain {
                         && player.name == self.profile.leader))
             {
                 let score = if self.companion == Some(player.id) {
-                    70.
+                    // An accepted invitation must outrank an existing crew-follow commitment.
+                    100.
                 } else {
                     45. + self.profile.companions * (d - 4.).min(4.)
                 };
