@@ -10,6 +10,29 @@ pub enum NativeInput {
     DiscardedUntilGotoAck,
 }
 
+#[derive(Debug)]
+pub struct InvalidShotOrigin(pub String);
+impl std::fmt::Display for InvalidShotOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+pub(super) fn attack_cooldown(
+    p: &Player,
+    content: &Content,
+    now: u64,
+    item_rate: f32,
+) -> Result<f32> {
+    let rate = if p.conditions(now) & crate::condition::bit(crate::condition::DAZED) != 0 {
+        0.0015
+    } else {
+        0.0015 + (0.008 - 0.0015) * p.character.effective(content)?[5] as f64 / 75.
+    };
+    // Ruffle's integer attack period must not accumulate fractional server charges.
+    Ok((1. / (rate * f64::from(item_rate))).floor() as f32)
+}
+
 pub(super) fn goto(p: &mut Player, own: bool, body: Vec<u8>) {
     let Some(output) = &p.tx else { return };
     if p.goto_acks.len() == ACK_LIMIT {
@@ -43,6 +66,17 @@ impl Player {
         }
         Ok(false)
     }
+    fn consume_discarded_shot(&mut self, id: i32, time: i32, bullet: u8, count: i32) {
+        self.discarded_attack = Some((time, count + 1));
+        // Ruffle allocated these bullet IDs before receiving the correction; authority stays unchanged.
+        self.next_bullet = (bullet + 1) % 128;
+        tracing::warn!(
+            player = id,
+            client_time = time,
+            bullet,
+            "discarded SHOOT across position correction"
+        );
+    }
 }
 
 impl World {
@@ -67,6 +101,54 @@ impl World {
         }
         p.goto_acks.pop_front();
         tracing::debug!(player = id, client_time = time, own, "GOTO acknowledged");
+        Ok(())
+    }
+
+    fn validate_discarded_shot(&self, id: i32, time: i32, bullet: u8, kind: u16) -> Result<i32> {
+        let p = self.players.get(&id).context("player missing")?;
+        ensure!(
+            time >= 0 && time >= p.last_attack,
+            "invalid correcting SHOOT time"
+        );
+        ensure!(
+            p.character.items[0] == i32::from(kind),
+            "weapon does not match equipped item"
+        );
+        ensure!(bullet == p.next_bullet, "unexpected player bullet counter");
+        let (last, count) = p
+            .discarded_attack
+            .unwrap_or((p.last_attack, p.attack_count));
+        ensure!(time >= last, "discarded attack clock regressed");
+        let item = self.content.get(kind)?;
+        let count = if time == last { count } else { 0 };
+        if time != last {
+            let cooldown = attack_cooldown(p, &self.content, self.now, item.rate)?;
+            ensure!(
+                i64::from(time) - i64::from(last) >= cooldown as i64 - 2,
+                "discarded attack too fast"
+            );
+        }
+        ensure!(
+            count < item.shots,
+            "too many discarded projectiles in attack"
+        );
+        Ok(count)
+    }
+
+    pub fn correct_shot_origin(
+        &mut self,
+        id: i32,
+        time: i32,
+        bullet: u8,
+        kind: u16,
+        reason: &str,
+    ) -> Result<()> {
+        let count = self.validate_discarded_shot(id, time, bullet, kind)?;
+        self.correct_position(id, time, reason)?;
+        self.players
+            .get_mut(&id)
+            .unwrap()
+            .consume_discarded_shot(id, time, bullet, count);
         Ok(())
     }
 
@@ -96,52 +178,24 @@ impl World {
         start: Pos,
         angle: f32,
     ) -> Result<bool> {
-        let p = self.players.get_mut(&id).context("player missing")?;
+        let p = self.players.get(&id).context("player missing")?;
         let correcting = p.correcting()?;
         let continuing = p.discarded_attack.is_some_and(|(last, _)| time == last);
         if let Some((last, _)) = p.discarded_attack {
             ensure!(time >= last, "discarded attack clock regressed");
         }
         if !correcting && !continuing {
-            if let Some((last, _)) = p.discarded_attack {
-                ensure!(time > last, "recovered attack clock regressed");
-            }
             return Ok(false);
         }
         ensure!(
-            time >= 0
-                && time >= p.last_attack
-                && start.x.is_finite()
-                && start.y.is_finite()
-                && angle.is_finite(),
+            start.x.is_finite() && start.y.is_finite() && angle.is_finite(),
             "invalid correcting SHOOT"
         );
-        ensure!(
-            p.character.items[0] == i32::from(kind),
-            "weapon does not match equipped item"
-        );
-        ensure!(bullet == p.next_bullet, "unexpected player bullet counter");
-        let count = if continuing {
-            p.discarded_attack.unwrap().1
-        } else if time == p.last_attack {
-            p.attack_count
-        } else {
-            0
-        };
-        ensure!(
-            count < self.content.get(kind)?.shots,
-            "too many discarded projectiles in attack"
-        );
-        p.discarded_attack = Some((time, count + 1));
-        // Ruffle allocated these bullet IDs before receiving the correction; authority stays unchanged.
-        p.next_bullet = (bullet + 1) % 128;
-        tracing::warn!(
-            player = id,
-            client_time = time,
-            bullet,
-            correcting,
-            "discarded SHOOT across GOTO acknowledgement"
-        );
+        let count = self.validate_discarded_shot(id, time, bullet, kind)?;
+        self.players
+            .get_mut(&id)
+            .unwrap()
+            .consume_discarded_shot(id, time, bullet, count);
         Ok(true)
     }
 

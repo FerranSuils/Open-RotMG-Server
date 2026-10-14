@@ -577,8 +577,17 @@ async fn handle(
             let id = player.context("shoot before character")?;
             a.world
                 .call(move |w| {
-                    w.native_shoot_received(id, (time, received), bullet, kind, pos, angle)
-                        .map(|_| ())
+                    match w.native_shoot_received(id, (time, received), bullet, kind, pos, angle) {
+                        Ok(_) => Ok(()),
+                        Err(error)
+                            if error
+                                .downcast_ref::<crate::world::InvalidShotOrigin>()
+                                .is_some() =>
+                        {
+                            w.correct_shot_origin(id, time, bullet, kind, &format!("{error:#}"))
+                        }
+                        Err(error) => Err(error),
+                    }
                 })
                 .await?;
         }

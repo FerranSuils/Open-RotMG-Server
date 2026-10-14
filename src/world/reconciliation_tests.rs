@@ -17,6 +17,75 @@ fn native() -> (World, i32, mpsc::Receiver<Packet>, watch::Receiver<bool>) {
 }
 
 #[test]
+fn predicted_origin_failure_is_typed_and_correction_never_authorizes_the_shot() {
+    let (mut w, id, _rx, _loss) = native();
+    let pos = w.players[&id].pos;
+    let received = w.attack_epoch + Duration::from_millis(100);
+    let error = w
+        .native_shoot_received(
+            id,
+            (1100, received),
+            1,
+            0xa97,
+            Pos {
+                x: pos.x + 1.,
+                y: pos.y,
+            },
+            0.,
+        )
+        .unwrap_err();
+    assert!(error.downcast_ref::<InvalidShotOrigin>().is_some());
+    assert_eq!(w.players[&id].next_bullet, 1);
+    assert_eq!(w.players[&id].attack_credit, 1000.);
+    assert!(
+        w.correct_shot_origin(id, 1100, 99, 0xa97, "bad counter")
+            .is_err()
+    );
+    assert!(w.players[&id].goto_acks.is_empty());
+    w.correct_shot_origin(id, 1100, 1, 0xa97, &format!("{error:#}"))
+        .unwrap();
+    assert_eq!(w.players[&id].next_bullet, 2);
+    assert_eq!(w.players[&id].character.shots, 0);
+    assert_eq!(w.players[&id].attack_credit, 1000.);
+    assert_eq!(w.players[&id].movement_credit, 0.);
+    assert_eq!(w.players[&id].pos.distance(pos), 0.);
+    assert!(w.bullets.is_empty());
+    w.acknowledge_goto(id, 1100).unwrap();
+    assert!(
+        w.correct_shot_origin(id, 1200, 2, 0xa97, "too fast")
+            .is_err()
+    );
+    assert!(w.players[&id].goto_acks.is_empty());
+    assert_eq!(w.players[&id].next_bullet, 2);
+    assert!(
+        w.correct_shot_origin(id, 1000, 2, 0xa97, "backwards")
+            .is_err()
+    );
+    assert_eq!(
+        w.native_shoot_received(id, (1100, received), 2, 0xa97, pos, 0.)
+            .unwrap(),
+        NativeInput::DiscardedUntilGotoAck
+    );
+    assert_eq!(
+        w.native_shoot_received(
+            id,
+            (2100, w.attack_epoch + Duration::from_millis(500)),
+            3,
+            0xa97,
+            Pos {
+                x: pos.x + 0.3,
+                y: pos.y
+            },
+            0.
+        )
+        .unwrap(),
+        NativeInput::Applied
+    );
+    assert_eq!(w.players[&id].character.shots, 1);
+    assert_eq!(w.bullets.len(), 1);
+}
+
+#[test]
 fn correction_discards_buffered_input_without_granting_authority() {
     let (mut w, id, _rx, _loss) = native();
     let pos = w.players[&id].pos;
