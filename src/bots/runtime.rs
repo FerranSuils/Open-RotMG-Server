@@ -46,6 +46,94 @@ async fn enter(
     Ok((id, output, Brain::new(profile, &view)))
 }
 
+async fn continue_character(
+    store: &crate::store::Store,
+    content: &Content,
+    profile: Profile,
+    session: &crate::world::view::Session,
+    destination: i32,
+) -> Result<(Character, i32)> {
+    // Departure can commit a death after the transfer was requested.
+    let character = store
+        .shore_character(profile.name.into(), content, profile.healer)
+        .await?;
+    ensure!(
+        character.account == session.account,
+        "departed autonomous account binding changed"
+    );
+    let destination = if character.id == session.character {
+        destination
+    } else {
+        -3
+    };
+    Ok((character, destination))
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn death_committed_during_departure_rebuilds_in_realm_without_resurrection() {
+    let content = Content::load(std::path::Path::new("data")).unwrap();
+    let store = crate::store::Store::open(std::path::Path::new(":memory:"), &content).unwrap();
+    let profile = PROFILES[0];
+    let mut wizard = store
+        .shore_character(profile.name.into(), &content, true)
+        .await
+        .unwrap();
+    wizard.level = 5;
+    wizard.exp = crate::store::level_start(5).unwrap();
+    store.progress(wizard.clone()).await.unwrap();
+    let session = crate::world::view::Session {
+        world: -3,
+        player: 1,
+        account: wizard.account,
+        character: wizard.id,
+    };
+    let (living, destination) = continue_character(&store, &content, profile, &session, -2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (living.id, living.class, destination),
+        (wizard.id, crate::content::WIZARD, -2)
+    );
+    wizard.hp = 0;
+    wizard.alive = false;
+    store
+        .death(wizard.clone(), "prepared departure race fixture".into())
+        .await
+        .unwrap();
+    assert!(
+        store
+            .load(session.account, session.character)
+            .await
+            .is_err()
+    );
+    let (replacement, destination) = continue_character(&store, &content, profile, &session, -2)
+        .await
+        .unwrap();
+    assert_eq!(destination, -3);
+    assert_eq!(replacement.account, session.account);
+    assert_ne!(replacement.id, session.character);
+    assert_eq!(
+        (replacement.class, replacement.level, replacement.exp),
+        (crate::content::PRIEST, 1, 0)
+    );
+    assert_eq!(
+        replacement.items,
+        content.get(crate::content::PRIEST).unwrap().equipment
+    );
+    let replacement_id = replacement.id;
+    let (same, _) = continue_character(&store, &content, profile, &session, -2)
+        .await
+        .unwrap();
+    assert_eq!(same.id, replacement_id);
+    assert!(
+        store
+            .load(session.account, session.character)
+            .await
+            .is_err()
+    );
+}
+
 pub async fn start(app: &App) -> Result<()> {
     for profile in PROFILES {
         let character = app
@@ -154,9 +242,13 @@ pub async fn start(app: &App) -> Result<()> {
                                 server::depart(&app, id).await?;
                                 let character_id = app.world.directory(move |d| d.consume(account, destination, time, key)).await?;
                                 ensure!(character_id == view.session.character, "transfer character binding changed");
-                                let character = app.store.load(account, character_id).await?;
+                                let (character, destination) = continue_character(&app.store, &app.content, profile, &view.session, destination).await?;
+                                let current_character = character.id;
+                                if current_character != character_id {
+                                    tracing::info!(account,character=character_id,replacement=current_character,"autonomous transfer interrupted by permanent death");
+                                }
                                 (id, output, brain) = enter(&app, profile, character, destination).await?;
-                                tracing::info!(player=id,account,character=character_id,destination,?portal,"autonomous durable transfer completed");
+                                tracing::info!(player=id,account,character=current_character,destination,?portal,"autonomous durable transfer completed");
                             }
                         }
                     }
