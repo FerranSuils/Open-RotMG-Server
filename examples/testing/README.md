@@ -21,8 +21,7 @@ env -u DISPLAY -u WAYLAND_DISPLAY XDG_RUNTIME_DIR="$QA_DISPLAY" \
 In another terminal, retain the normal user bus/runtime for the managed launcher and Chrome's keyring, but point Chrome exclusively at that private display:
 
 ```sh
-env -u DISPLAY WAYLAND_DISPLAY="$QA_DISPLAY/rotmg-qa" \
-  CHROME_MCP_CPUQUOTA=400% node --input-type=module - <<'JS'
+env -u DISPLAY WAYLAND_DISPLAY="$QA_DISPLAY/rotmg-qa" node --input-type=module - <<'JS'
 import {launchBrowser} from '/home/wacket/.local/share/pi-browser-tools/launch-browser.mjs';
 console.log(await launchBrowser({owner:process.env.PI_BROWSER_OWNER,args:[
   `--remote-debugging-port=${process.env.CHROME_PORT}`,
@@ -32,6 +31,6 @@ console.log(await launchBrowser({owner:process.env.PI_BROWSER_OWNER,args:[
 JS
 ```
 
-Export the port/profile variables; jobs outside Pi must supply an explicit `PI_BROWSER_OWNER`. The 400% ceiling applies only to this QA browser; keep the launcher's low CPU weight and shared defaults unchanged. The default 150% scope throttled renderer/GPU/recording children here even though Chrome's parent had moved to an uncapped desktop-app scope. Inspect the actual renderer/GPU child cgroup, not only the parent. Hardware acceleration also needs evidence: Chrome `SystemInfo.getInfo` and private KWin `supportInformation` identified AMD hardware rendering and a 60 Hz virtual output; merely opening a render node is not proof. This corrects the measured quota bottleneck, not every source of lag: one 17-second native take qualified at40.8 source FPS/45Hz received cursor movement, but fresh retakes still failed during high shared CPU pressure despite zero quota throttling. Keep the quality gates; do not raise priority above desktop applications, stop other owners' work or claim this ceiling guarantees capture cadence. Use managed target creation/activity helpers. Close owned targets/Chrome before stopping the owned compositor; preserve profiles. Do not use host `Page.bringToFront`, `Target.activateTarget` or MCP `bringToFront:true`. Focus emulation alone does not guarantee render cadence: verify actual frames and native outcomes, without host activation as repair. Xvfb alone failed native rendering here (WebGL blocklisting/AVM2 errors); do not silently substitute it or relax GPU/security flags.
+Export the port/profile variables; jobs outside Pi must supply an explicit `PI_BROWSER_OWNER`. Use managed target creation/activity helpers. Close owned targets/Chrome before stopping the owned compositor; preserve profiles. Do not use host `Page.bringToFront`, `Target.activateTarget` or MCP `bringToFront:true`. Focus emulation alone does not guarantee render cadence: verify actual frames and native outcomes, without host activation as repair. Xvfb alone failed native rendering here (WebGL blocklisting/AVM2 errors); do not silently substitute it or relax GPU/security flags.
 
 Rust recipes compile with the existing tests; the prepared-state recipe runs only when explicitly selected. No browser dependency is bundled: use your existing browser-scoped connection, never desktop input. Keep generated state, media and exploratory scripts outside Git.
