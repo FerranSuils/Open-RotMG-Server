@@ -80,6 +80,23 @@ impl Player {
 }
 
 impl World {
+    pub fn acknowledge_autonomous_goto(&mut self, id: i32) -> Result<()> {
+        ensure!(
+            self.players
+                .get(&id)
+                .context("GOTO ACK player missing")?
+                .controller
+                == Controller::Autonomous,
+            "GOTO ACK requires autonomous ownership"
+        );
+        self.acknowledge_goto(
+            id,
+            self.now
+                .try_into()
+                .context("autonomous GOTO clock overflow")?,
+        )
+    }
+
     pub fn acknowledge_goto(&mut self, id: i32, time: i32) -> Result<()> {
         let p = self
             .players

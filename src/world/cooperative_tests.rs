@@ -58,6 +58,61 @@ fn selected_minimap_teleport_goto_effect_and_current_view() {
     }
 }
 #[test]
+fn autonomous_teleport_outputs_acknowledge_fifo_without_crossing_movement_clock_domains() {
+    let (mut d, a, b, mut ar, mut br) = setup();
+    let (human, mut hr) = receive(&mut d, -2, 3, WIZARD);
+    let w = d.worlds.get_mut(&-2).unwrap();
+    w.players.get_mut(&a).unwrap().controller = Controller::Autonomous;
+    w.players.get_mut(&b).unwrap().controller = Controller::Autonomous;
+    w.attack_epoch = Instant::now() - Duration::from_secs(5);
+    for id in [a, b, human] {
+        w.updates(id, false).unwrap();
+    }
+    for rx in [&mut ar, &mut br, &mut hr] {
+        while rx.try_recv().is_ok() {}
+    }
+    let now = Instant::now();
+    d.teleport(a, b, now).unwrap();
+    d.teleport(b, a, now).unwrap();
+    let w = d.worlds.get_mut(&-2).unwrap();
+    for (id, rx) in [(a, &mut ar), (b, &mut br)] {
+        assert_eq!(w.players[&id].last_move_at, 600);
+        assert_eq!(w.players[&id].goto_acks.len(), 2);
+        for packet in std::iter::from_fn(|| rx.try_recv().ok()) {
+            if packet.id == wire::GOTO {
+                w.acknowledge_autonomous_goto(id).unwrap();
+            }
+        }
+        assert!(w.players[&id].goto_acks.is_empty());
+        assert!(w.acknowledge_autonomous_goto(id).is_err());
+    }
+    assert_eq!(w.players[&human].goto_acks.len(), 2);
+    assert!(w.acknowledge_autonomous_goto(human).is_err());
+    assert_eq!(w.players[&human].goto_acks.len(), 2);
+    w.now = 650;
+    for id in [a, b] {
+        let pos = w.players[&id].pos;
+        w.move_to(
+            id,
+            Pos {
+                x: pos.x + 0.02,
+                y: pos.y,
+            },
+            650,
+        )
+        .unwrap();
+        assert_eq!(w.players[&id].last_move_at, 650);
+    }
+    for _ in 0..2 {
+        w.acknowledge_goto(human, 650).unwrap();
+    }
+    w.expire_goto_acks();
+    for id in [a, b, human] {
+        assert!(!w.players[&id].departing);
+    }
+}
+
+#[test]
 fn teleport_cooldown_survives_transfer_reconnect_and_refills_exactly() {
     let (mut d, a, b, _ar, _br) = setup();
     let now = Instant::now();

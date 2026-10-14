@@ -65,7 +65,12 @@ impl Directory {
         let p = world.players.get_mut(&id).unwrap();
         p.pos = position;
         p.movement_credit = 0.78;
-        p.last_move_at = movement_received;
+        // Server-driven motors budget against simulation time, not native packet arrival time.
+        p.last_move_at = if p.controller == Controller::Human {
+            movement_received
+        } else {
+            world.now
+        };
         let receipt = TeleportReceipt {
             player: id,
             character: p.character.id,

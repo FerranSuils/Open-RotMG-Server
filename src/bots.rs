@@ -634,6 +634,10 @@ pub async fn start(app: &App) -> Result<()> {
                     }
                     ensure!(matches!(view.lifecycle.output,OutputState::Live) && !view.lifecycle.departing && !view.lifecycle.quarantined,"controller is not live");
                     while let Ok(packet)=output.try_recv() {
+                        if packet.id == crate::wire::GOTO {
+                            app.world.for_player(id).call(move |w| w.acknowledge_autonomous_goto(id)).await?;
+                            continue;
+                        }
                         if brain.receive(packet,&view)? {
                             if let Err(error)=app.world.directory(move |d|d.chat(id,"omw".into(),Instant::now())).await {
                                 tracing::warn!(player=id,%error,"invitation acknowledgement rejected");
