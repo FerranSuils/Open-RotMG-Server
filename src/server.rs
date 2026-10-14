@@ -19,14 +19,38 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+#[derive(Clone)]
+pub struct SessionControl {
+    cancel: tokio::sync::watch::Sender<bool>,
+    done: tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
+}
 pub struct Owner {
-    registry: Arc<Mutex<BTreeSet<i32>>>,
+    registry: Arc<Mutex<BTreeMap<i32, Option<SessionControl>>>>,
     id: i32,
+    registered: bool,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    done: Option<tokio::sync::watch::Sender<Option<std::result::Result<(), String>>>>,
+    acknowledged: bool,
+}
+impl Owner {
+    fn release(mut self) {
+        self.acknowledged = true;
+        let done = self.done.clone();
+        drop(self);
+        if let Some(done) = done {
+            done.send_replace(Some(Ok(())));
+        }
+    }
+    fn failed(&self, error: String) {
+        if let Some(done) = &self.done {
+            done.send_replace(Some(Err(error)));
+        }
+    }
 }
 impl Drop for Owner {
     fn drop(&mut self) {
@@ -34,21 +58,81 @@ impl Drop for Owner {
             .lock()
             .expect("ownership registry poisoned")
             .remove(&self.id);
+        if !self.acknowledged {
+            self.failed("Session ended without a save acknowledgement".into());
+        }
     }
 }
 impl App {
     pub(crate) fn claim(&self, id: i32) -> Result<Owner> {
         let mut owners = self.owners.lock().expect("ownership registry poisoned");
         ensure!(owners.len() < self.max_players, "development world full");
-        ensure!(owners.insert(id), "account already has an active session");
+        ensure!(
+            !owners.contains_key(&id),
+            "account already has an active session"
+        );
+        owners.insert(id, None);
         Ok(Owner {
             registry: self.owners.clone(),
             id,
+            registered: false,
+            cancel: None,
+            done: None,
+            acknowledged: false,
         })
+    }
+    fn claim_session(&self, id: i32) -> Result<Owner> {
+        let mut owner = self.claim(id)?;
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let (done, completion) = tokio::sync::watch::channel(None);
+        self.owners
+            .lock()
+            .expect("ownership registry poisoned")
+            .insert(
+                id,
+                Some(SessionControl {
+                    cancel,
+                    done: completion,
+                }),
+            );
+        owner.cancel = Some(receiver);
+        owner.done = Some(done);
+        Ok(owner)
+    }
+    async fn kick(&self, account: i32) -> Result<bool> {
+        let control = self
+            .owners
+            .lock()
+            .expect("ownership registry poisoned")
+            .get(&account)
+            .cloned();
+        let Some(control) = control else {
+            return Ok(false);
+        };
+        let mut control =
+            control.context("Account is busy outside a game connection; retry shortly")?;
+        control.cancel.send_replace(true);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let Some(result) = control.done.borrow().clone() {
+                    result.map_err(anyhow::Error::msg)?;
+                    return Ok(true);
+                }
+                control
+                    .done
+                    .changed()
+                    .await
+                    .context("Session closed without a save acknowledgement")?;
+            }
+        })
+        .await
+        .context("Disconnect save is still pending; no successful kick was confirmed")?
     }
 }
 use tokio::sync::mpsc;
+mod account_actions;
 mod hiscores;
+use account_actions::{discord_kick, discord_recover, reset_password};
 use hiscores::{collection, discord_link, hiscores};
 #[derive(Clone)]
 pub struct App {
@@ -67,7 +151,8 @@ pub struct App {
     pub connections: Arc<tokio::sync::Semaphore>,
     pub control: Option<String>,
     pub discord_link_token: Option<String>,
-    pub owners: Arc<Mutex<BTreeSet<i32>>>,
+    pub owners: Arc<Mutex<BTreeMap<i32, Option<SessionControl>>>>,
+    pub authentication: Arc<tokio::sync::RwLock<()>>,
     pub bots: Arc<Mutex<BTreeMap<i32, Owner>>>,
     pub quarantined: Arc<Mutex<Vec<Owner>>>,
     pub shutdown: tokio::sync::watch::Sender<bool>,
@@ -148,6 +233,7 @@ async fn chars(
             "external platform authentication is not implemented"
         );
         let password = form.get("password").context("password required")?.clone();
+        let _authentication = a.authentication.read().await;
         let account = a.store.characters(guid, password).await?;
         Ok(account.xml())
     }
@@ -170,6 +256,7 @@ async fn account_request(
         Err(e) => return error(e),
     }
     let result: Result<String> = async {
+        let _authentication = a.authentication.read().await;
         let guid = form.get("guid").context("guid required")?.clone();
         let id = match operation.as_str() {
             "register" => {
@@ -462,8 +549,13 @@ async fn handle(
                 r.utf()?;
             }
             r.done()?;
+            let authentication = a.authentication.read().await;
+            let registered = !password.is_empty();
             let id = a.store.authenticate(guid, password).await?;
-            *account = Some(a.claim(id)?);
+            let mut owner = a.claim_session(id)?;
+            owner.registered = registered;
+            *account = Some(owner);
+            drop(authentication);
             a.store.compete(id).await?;
             let (destination, character) = a
                 .world
@@ -578,12 +670,30 @@ async fn handle(
             let text = player_text(&mut r)?;
             let id = player.context("chat before character")?;
             let received = std::time::Instant::now();
-            if text.trim() == "/discord" {
+            if matches!(
+                text.trim(),
+                "/discord" | "/discord recovery" | "/discord norecovery"
+            ) {
                 let result = async {
                     ensure!(a.discord_link_token.is_some(), "Discord linking is not configured");
-                    let owner = account.as_ref().context("authenticated session required")?.id;
-                    let code = a.store.issue_discord_code(owner).await?;
-                    Ok::<_, anyhow::Error>(format!("Use /link code:{code} with the official Discord bot within five minutes. This makes your Discord identity visible on hiscores. Keep this code private."))
+                    let owner = account.as_ref().context("authenticated session required")?;
+                    ensure!(owner.registered, "sign into your registered account again before Discord account actions");
+                    let owner = owner.id;
+                    let reply = match text.trim() {
+                        "/discord recovery" => {
+                            let code = a.store.issue_recovery_code(owner).await?;
+                            format!("Use /recover code:{code} with your linked Discord account within five minutes. This ENABLES that Discord account to reset your game password. Keep this code private. Use /discord norecovery to revoke permission.")
+                        }
+                        "/discord norecovery" => {
+                            a.store.disable_recovery(owner).await?;
+                            "Discord password recovery disabled. All recovery codes and reset links revoked.".into()
+                        }
+                        _ => {
+                            let code = a.store.issue_discord_code(owner).await?;
+                            format!("Use /link code:{code} with the official Discord bot within five minutes. This makes your Discord identity visible on hiscores. Keep this code private.")
+                        }
+                    };
+                    Ok::<_, anyhow::Error>(reply)
                 }.await;
                 let reply = match result {
                     Ok(text) => text,
@@ -765,7 +875,10 @@ async fn handle(
             o.0.extend(key);
             tx.send(Packet { id: 39, body: o.0 }).await?;
             *reconnecting = true;
-            account.take();
+            account
+                .take()
+                .context("transfer ownership missing")?
+                .release();
             tracing::info!(
                 player = id,
                 destination,
@@ -828,6 +941,12 @@ async fn connection(socket: WebSocket, mut a: App) {
                 Some(Ok(_))=>{tracing::warn!("non-binary game message rejected");break},
                 Some(Err(e))=>{tracing::warn!(error=%e,"WebSocket failed");break},
             },
+            _=async {
+                match session.account.as_ref().and_then(|o| o.cancel.clone()) {
+                    Some(mut cancel) => { if !*cancel.borrow() { let _ = cancel.changed().await; } }
+                    None => std::future::pending::<()>().await,
+                }
+            }=>{tracing::info!(account=session.account.as_ref().map(|o|o.id),"closing requested game session");break;},
             _=shutdown.changed()=>break,
             _=lost_rx.changed()=>{tracing::warn!(player=session.player,"closing slow game connection before its state diverges");break;},
             _=&mut deadline,if session.player.is_none() && (!session.reconnecting || reconnect_sent)=>{tracing::warn!(reconnecting=session.reconnecting,reconnect_sent,"game selection or reconnect-close deadline exceeded");break;},
@@ -847,11 +966,15 @@ async fn connection(socket: WebSocket, mut a: App) {
     {
         tracing::error!(player=id,error=%e,"disconnect save failed; avatar retained for diagnosis");
         if let Some(owner) = session.account.take() {
+            owner.failed(e.to_string());
             a.quarantined
                 .lock()
                 .expect("quarantine registry poisoned")
                 .push(owner);
         }
+    }
+    if let Some(owner) = session.account.take() {
+        owner.release();
     }
 }
 pub(crate) async fn depart(a: &App, id: i32) -> Result<()> {
@@ -1196,7 +1319,10 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
         .route("/health", get(health))
         .route("/api/hiscores", get(hiscores))
         .route("/api/collection/{account}", get(collection))
-        .route("/internal/discord/link", post(discord_link));
+        .route("/internal/discord/link", post(discord_link))
+        .route("/internal/discord/kick", post(discord_kick))
+        .route("/internal/discord/recover", post(discord_recover))
+        .route("/api/account/recover", post(reset_password));
     let app = app
         .route("/dev/join", post(bot_create))
         .route("/dev/action", post(bot_action))

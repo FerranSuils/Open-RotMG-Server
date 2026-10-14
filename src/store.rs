@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::mpsc};
 use tokio::sync::oneshot;
 
+mod account_actions;
 mod accounts;
 mod hiscores;
 mod legends;
@@ -130,6 +131,8 @@ pub struct Account {
     pub id: i32,
     pub name: String,
     pub next_id: i32,
+    pub fame: i64,
+    pub earned_fame: i64,
     pub best_levels: std::collections::BTreeMap<u16, i32>,
     pub characters: Vec<Character>,
 }
@@ -184,6 +187,20 @@ impl Store {
             .context("Wizard class missing")?
             .base;
         let mut c = Connection::open(path)?;
+        let version: i32 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        ensure!(
+            matches!(version, 0 | 5),
+            "unsupported game database schema {version}"
+        );
+        let wallet_exists: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='account_fame')",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            version != 5 || wallet_exists,
+            "schema-5 fame wallet table missing; restore reviewed state instead of recreating balances"
+        );
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY,guid TEXT NOT NULL UNIQUE,name TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS shore_bots(name TEXT PRIMARY KEY,account INTEGER NOT NULL UNIQUE REFERENCES accounts(id));
@@ -196,6 +213,10 @@ CREATE TABLE IF NOT EXISTS competitors(account INTEGER PRIMARY KEY REFERENCES ac
 CREATE TABLE IF NOT EXISTS collections(account INTEGER NOT NULL REFERENCES accounts(id),item INTEGER NOT NULL CHECK(item BETWEEN 0 AND 65535),found_at INTEGER NOT NULL,PRIMARY KEY(account,item));
 CREATE TABLE IF NOT EXISTS discord_links(account INTEGER PRIMARY KEY REFERENCES accounts(id),discord_id TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS discord_codes(account INTEGER PRIMARY KEY REFERENCES accounts(id),hash TEXT NOT NULL UNIQUE,issued_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS account_fame(account INTEGER PRIMARY KEY REFERENCES accounts(id),balance INTEGER NOT NULL CHECK(balance BETWEEN 0 AND 2147483647),earned INTEGER NOT NULL CHECK(earned BETWEEN balance AND 2147483647));
+CREATE TABLE IF NOT EXISTS discord_recovery(account INTEGER PRIMARY KEY REFERENCES discord_links(account),enabled_at INTEGER NOT NULL,last_issued_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS recovery_codes(account INTEGER PRIMARY KEY REFERENCES accounts(id),hash TEXT NOT NULL UNIQUE,issued_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS password_resets(account INTEGER PRIMARY KEY REFERENCES accounts(id),hash TEXT NOT NULL UNIQUE,issued_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         let migration = c.transaction()?;
         let records = {
@@ -231,6 +252,45 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 migrated += 1;
             }
         }
+        if !wallet_exists {
+            let mut earned = std::collections::BTreeMap::<i32, i64>::new();
+            {
+                let mut q = migration.prepare(
+                "SELECT c.account,d.snapshot FROM deaths d JOIN characters c ON c.id=d.character",
+            )?;
+                for row in q.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))? {
+                    let (account, raw) = row?;
+                    let ch = decode_character(&raw, legacy_base)?;
+                    ensure!(
+                        ch.account == account && !ch.alive && ch.fame >= 0,
+                        "invalid death credit"
+                    );
+                    let amount = earned.entry(account).or_default();
+                    *amount = amount
+                        .checked_add(i64::from(ch.fame))
+                        .context("account fame overflow")?;
+                }
+            }
+            let accounts = {
+                let mut q = migration.prepare("SELECT id FROM accounts")?;
+                q.query_map([], |r| r.get::<_, i32>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for account in accounts {
+                let amount = earned.get(&account).copied().unwrap_or(0);
+                migration.execute(
+                    "INSERT INTO account_fame(account,balance,earned) VALUES(?1,?2,?2)",
+                    params![account, amount],
+                )?;
+            }
+        } else {
+            let missing: bool = migration.query_row("SELECT EXISTS(SELECT 1 FROM accounts a LEFT JOIN account_fame f ON f.account=a.id WHERE f.account IS NULL)", [], |r| r.get(0))?;
+            ensure!(
+                !missing,
+                "account fame wallet missing; restore reviewed state instead of recreating balances"
+            );
+        }
+        migration.pragma_update(None, "user_version", 5)?;
         migration.commit()?;
         if migrated > 0 {
             tracing::info!(
@@ -286,7 +346,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             let name:String=tx.query_row("SELECT name FROM accounts WHERE id=?1",[id],|r|r.get(0))?;
             let mut characters=Vec::new();{let mut q=tx.prepare("SELECT id,stats,items,revision,alive FROM characters WHERE account=?1 AND alive=1 ORDER BY id")?;let rows=q.query_map([id],|r|Ok((r.get::<_,i32>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i32>(3)?,r.get::<_,bool>(4)?)))?;
             for row in rows{let(cid,stats,items,rev,alive)=row?;let mut ch:Character=serde_json::from_str(&stats)?;ch.id=cid;ch.account=id;ch.name=name.clone();ch.items=serde_json::from_str(&items)?;ch.revision=rev;ch.alive=alive;characters.push(ch);}}
-            let next_id:i32=tx.query_row("SELECT coalesce(max(id),0)+1 FROM characters WHERE account=?1",[id],|r|r.get(0))?;let best_levels = { let mut q = tx.prepare("SELECT json_extract(stats,'$.class'),max(json_extract(stats,'$.level')) FROM characters WHERE account=?1 GROUP BY json_extract(stats,'$.class')")?; q.query_map([id], |r| Ok((r.get::<_,u16>(0)?, r.get::<_,i32>(1)?)))?.collect::<rusqlite::Result<std::collections::BTreeMap<_,_>>>()? };tx.commit()?;Ok(Account{id,name,next_id,best_levels,characters})}).await?;
+            let next_id:i32=tx.query_row("SELECT coalesce(max(id),0)+1 FROM characters WHERE account=?1",[id],|r|r.get(0))?;let best_levels = { let mut q = tx.prepare("SELECT json_extract(stats,'$.class'),max(json_extract(stats,'$.level')) FROM characters WHERE account=?1 GROUP BY json_extract(stats,'$.class')")?; q.query_map([id], |r| Ok((r.get::<_,u16>(0)?, r.get::<_,i32>(1)?)))?.collect::<rusqlite::Result<std::collections::BTreeMap<_,_>>>()? };let (fame,earned_fame) = tx.query_row("SELECT balance,earned FROM account_fame WHERE account=?1",[id],|r|Ok((r.get(0)?,r.get(1)?)))?;tx.commit()?;Ok(Account{id,name,next_id,fame,earned_fame,best_levels,characters})}).await?;
         self.vault(account.id).await?;
         Ok(account)
     }
@@ -306,7 +366,9 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 None => {
                     let guid = format!("shore-{:032x}", rand::random::<u128>());
                     tx.execute("INSERT INTO accounts(guid,name) VALUES(?1,?2)", params![guid,name])?;
-                    tx.execute("INSERT INTO shore_bots(name,account) VALUES(?1,?2)", params![name,tx.last_insert_rowid()])?;
+                    let account = tx.last_insert_rowid();
+                    tx.execute("INSERT INTO account_fame(account,balance,earned) VALUES(?1,0,0)", [account])?;
+                    tx.execute("INSERT INTO shore_bots(name,account) VALUES(?1,?2)", params![name,account])?;
                     guid
                 }
             };
@@ -516,8 +578,11 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         }).await
     }
     pub async fn death(&self, ch: Character, killed_by: String) -> Result<()> {
-        ensure!(!ch.alive && ch.hp == 0, "death snapshot must be dead");
-        self.call(move|c|{let tx=c.transaction()?;let n=tx.execute("UPDATE characters SET alive=0,stats=?3,items=?4,revision=revision+1 WHERE id=?1 AND account=?2 AND alive=1 AND revision=?5",params![ch.id,ch.account,serde_json::to_string(&ch)?,serde_json::to_string(&vec![-1;12])?,ch.revision])?;ensure!(n==1,"death already recorded or inventory conflict");tx.execute("INSERT INTO deaths(character,snapshot,killed_by) VALUES(?1,?2,?3)",params![ch.id,serde_json::to_string(&ch)?,killed_by])?;tx.commit()?;Ok(())}).await
+        ensure!(
+            !ch.alive && ch.hp == 0 && ch.fame >= 0,
+            "death snapshot must be dead with nonnegative fame"
+        );
+        self.call(move|c|{let tx=c.transaction()?;let n=tx.execute("UPDATE characters SET alive=0,stats=?3,items=?4,revision=revision+1 WHERE id=?1 AND account=?2 AND alive=1 AND revision=?5",params![ch.id,ch.account,serde_json::to_string(&ch)?,serde_json::to_string(&vec![-1;12])?,ch.revision])?;ensure!(n==1,"death already recorded or inventory conflict");tx.execute("INSERT INTO deaths(character,snapshot,killed_by) VALUES(?1,?2,?3)",params![ch.id,serde_json::to_string(&ch)?,killed_by])?;ensure!(tx.execute("UPDATE account_fame SET balance=balance+?2,earned=earned+?2 WHERE account=?1",params![ch.account,ch.fame])?==1,"account fame wallet missing");tx.commit()?;Ok(())}).await
     }
     pub async fn fame(&self, account: i32, id: i32) -> Result<String> {
         let legacy_base = self.legacy_base;
@@ -585,10 +650,12 @@ impl Account {
         };
         let records: String = self.best_levels.iter().map(|(class, level)| format!("<ClassStats objectType=\"{class}\"><BestLevel>{level}</BestLevel><BestFame>0</BestFame></ClassStats>")).collect();
         format!(
-            "<Chars nextCharId=\"{}\" maxNumChars=\"1\">{chars}<Account><AccountId>{}</AccountId><Name>{}</Name>{chosen}<Stats><Fame>0</Fame><TotalFame>0</TotalFame>{records}</Stats><Credits>0</Credits><NextCharSlotPrice>600</NextCharSlotPrice></Account><Servers><Server><Name>Local development</Name><DNS>127.0.0.1</DNS><Lat>0</Lat><Long>0</Long><Usage>0</Usage></Server></Servers><News/></Chars>",
+            "<Chars nextCharId=\"{}\" maxNumChars=\"1\">{chars}<Account><AccountId>{}</AccountId><Name>{}</Name>{chosen}<Stats><Fame>{}</Fame><TotalFame>{}</TotalFame>{records}</Stats><Credits>0</Credits><NextCharSlotPrice>600</NextCharSlotPrice></Account><Servers><Server><Name>Local development</Name><DNS>127.0.0.1</DNS><Lat>0</Lat><Long>0</Long><Usage>0</Usage></Server></Servers><News/></Chars>",
             self.next_id,
             self.id,
-            xml_escape(&self.name)
+            xml_escape(&self.name),
+            self.fame,
+            self.earned_fame
         )
     }
 }

@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
             Err(error) => return Err(error.into()),
         },
         owners: Arc::default(),
+        authentication: Arc::default(),
         bots: Arc::default(),
         quarantined: Arc::default(),
         shutdown: tokio::sync::watch::channel(false).0,

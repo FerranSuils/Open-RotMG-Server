@@ -1,11 +1,28 @@
-# Hiscores and Discord linking
+# Hiscores and Discord account actions
 
-`GET /api/hiscores` supplies permanent Discord top-ten messages and the website's full rankings. **Base fame** is the best one-character record per account, alive/dead; **collection** counts unique enemy-drop pickups; **total fame** sums immutable dead-character credited fame before spending. Current death records credit base fame, not historical bonuses. Ties share rank, ordered stably by account ID. Registered native accounts qualify after connecting; linking is optional and shore bots/QA are excluded.
+`GET /api/hiscores` supplies permanent Discord top-ten messages and full website rankings. **Base fame** is the best single-character record per account, alive/dead; **collection** counts unique enemy-drop pickups; **total fame** is spendable account fame, matching the Play screen. Death records credit base fame, not historical bonuses. `account_fame` is the authoritative wallet: death and credit commit together, historical deaths initialize it once, and restarting never overwrites spending. Future purchases must debit this wallet atomically; purchase systems are not implemented here. Registered native accounts qualify after connecting; linking is optional and shore bots/QA are excluded.
 
-Collection and inventory commit atomically. Starter/map gear, trades, Vault moves and player-dropped items never earn credit. There is no invented historical backfill. The loot tables define the collectible set; the website atlas uses those original sprites and silhouettes, and rejects catalogue mismatches.
+Collection and inventory commit atomically. Starter/map gear, trades, Vault moves and player-dropped items never earn credit. The loot tables define the collectible set; original sprites/silhouettes reject catalogue mismatches. There is no inventory backfill.
 
-Authenticated registered `/discord` issues a private random 128-bit code, SHA-256 stored, five-minute expiry, once/minute/account. Ephemeral Discord `/link` consumes it atomically, one-to-one; conflicts never replace links. `/kick`, `/recover`, unlinking and recovery privileges remain disabled. The client/SWF is unchanged.
+## Linking and self-disconnection
 
-`POST /internal/discord/link` accepts only `{code,discord_id}` from direct loopback plus its dedicated bearer credential; Origin, forwarding and unknown fields are rejected. Caddy denies `/internal/*`. The bot cannot read game state or control gameplay. Set `DISCORD_LINK_TOKEN_FILE` for both services and the bot's explicit loopback `GAME_API_URL`; hosted units use `LoadCredential` from root-private `/etc/openrotmg/discord-link-token`.
+Registered `/discord` privately issues a random 128-bit link code, SHA-256 stored, five-minute expiry, once/minute/account. Ephemeral Discord `/link` consumes it atomically, one-to-one, without replacement. Linking alone grants no password recovery.
 
-Before production migration, install/test schema-4 backups and hide the new credential in the backup sandbox. Nonsecret eligibility/collections/Discord IDs survive; credentials/code hashes do not. Restored associations grant no authentication or password recovery. Verification uses Rust/Clippy, exact backup roundtrips, encrypted two-account packet acceptance and website/Discord tests; packet acceptance is not rendered production gameplay acceptance.
+Discord `/kick` resolves only the actual caller's linked, registered account. It signals that connection and confirms only after normal departure saves finish and ownership is released. Offline accounts are reported honestly. Failed saves retain quarantine ownership and return an error; neither ownership flags nor other players are cleared.
+
+## Opt-in password recovery
+
+1. Link while signed into the game using `/discord` and Discord `/link`.
+2. In game, type `/discord recovery`. This explicitly grants your linked Discord account password-reset authority. Use its separate five-minute consent code in ephemeral Discord `/recover code:<code>`.
+3. Open the private 15-minute, one-use HTTPS reset link. Enter the new password only on the website. Later `/recover` requests need no consent code. Protect your Discord account accordingly.
+4. In game, `/discord norecovery` revokes permission, consent codes and outstanding reset links.
+
+Reset links use a 256-bit fragment token, erased from browser history on load; only its SHA-256 hash is stored. No token is sent in request URLs or logged. Only the latest link is valid, with one issuance/minute/account. Password validation and Argon2 hashing match native registration. Reset fences authentication through session ownership claims, saves/disconnects the active session, then atomically replaces the verifier and consumes reset secrets. Failed save, expired grant or revoked permission cannot change the password. No email service, Flash/SWF changes, unlinking, moderation or guest/name recovery is provided.
+
+## API and backups
+
+`POST /internal/discord/{link,kick,recover}` requires direct loopback and the dedicated bearer credential. Origin, forwarding headers and unknown fields are rejected. Identity always comes from the bot's actual interaction user. Caddy denies public `/internal/*`. The bot has no game DB access and never accepts passwords. Configure both services with `DISCORD_LINK_TOKEN_FILE`, using systemd `LoadCredential`, and the bot's explicit loopback `GAME_API_URL`.
+
+`POST /api/account/recover` accepts only `{token,password}`, requires the exact browser Origin and has no-store responses. The static `/recover/` page has strict same-origin CSP, no referrers, third-party resources or browser storage.
+
+Install/test schema-5 backup support before migration. Wallets and recovery opt-in records survive; GUIDs, credentials and all link/consent/reset hash tables do not. Restored links/permissions grant no login or reset authority without existing registered credentials. Disaster identity recovery remains separate. Rust/Clippy, exact backup roundtrips, encrypted two-account packet and website/Discord tests are not rendered production gameplay acceptance.
