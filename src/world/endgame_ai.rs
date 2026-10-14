@@ -306,6 +306,45 @@ mod tests {
         id
     }
     #[test]
+    fn oryx_minion_wanders_and_fires_both_xml_volleys_only_at_close_range() {
+        let d = super::super::tests::directory();
+        let mut w = d
+            .make(finale::CHAMBER, "Oryx's Chamber", false, None)
+            .unwrap();
+        w.entities.clear();
+        let id = player(&mut w, Pos { x: 60., y: 50. });
+        let minion = w
+            .spawn_entity(0x1749, Pos { x: 60., y: 56. }, vec![])
+            .unwrap();
+        for tick in 1..=10 {
+            w.now = tick * 50;
+            w.npc_step();
+        }
+        assert!(w.bullets.is_empty(), "distant minion must not fire");
+        assert!(matches!(
+            finale::profile(0x1749).unwrap().motion,
+            crate::encounter::Motion::Wander
+        ));
+        let pos = w.entities[&minion].pos;
+        w.players.get_mut(&id).unwrap().pos = Pos {
+            x: pos.x,
+            y: pos.y - 1.5,
+        };
+        w.now = 2000;
+        w.npc_step();
+        assert_eq!(w.bullets.len(), 6);
+        for index in 0..=1 {
+            let spec = &w.content.objects[&0x1749].projectiles[&index];
+            assert_eq!(
+                w.bullets
+                    .iter()
+                    .filter(|b| b.spec.min == spec.min && b.spec.max == spec.max)
+                    .count(),
+                3
+            );
+        }
+    }
+    #[test]
     fn actor_guardian_recovery_requires_its_real_sword_and_paired_completion_binds_chamber() {
         let mut d = super::super::tests::directory();
         let mut w = d

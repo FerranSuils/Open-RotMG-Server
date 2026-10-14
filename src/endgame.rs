@@ -204,15 +204,7 @@ pub fn profile(kind: u16) -> Option<Profile> {
             700,
             25.,
         ),
-        0x1749 => (
-            Motion::Chase {
-                sight: 15.,
-                stop: 2.,
-            },
-            3.,
-            1000,
-            12.,
-        ),
+        0x1749 => (Motion::Wander, 3., 1000, 3.),
         0x944 => (Motion::Wander, 2., 2500, 15.),
         0xde0 => (
             Motion::Chase {
@@ -560,7 +552,11 @@ pub fn attacks(kind: u16, hp: i32, max_hp: i32, heading: f32, elapsed: u64) -> V
         ),
         0x1748 => ring(0, 12, heading),
         0x174a | 0x174b => ring((elapsed / 700 % 2) as u8, 4, heading),
-        0x1749 => fan((elapsed / 1000 % 2) as u8, 3, 10., heading),
+        0x1749 => {
+            let mut shots = fan(0, 3, 10., heading);
+            shots.extend(fan(1, 3, 10., heading));
+            shots
+        }
         0x944 => {
             let mut shots = vec![(0, heading)];
             shots.extend(fan(1, 3, 10., heading));
