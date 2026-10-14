@@ -16,6 +16,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 mod chat;
+mod enemy_shots;
 pub(crate) use chat::chat_error;
 #[cfg(test)]
 mod bot_tests;
@@ -2798,6 +2799,7 @@ impl World {
                 );
                 continue;
             }
+            let mut notices = Vec::with_capacity(shots.len());
             for (index, angle) in shots {
                 let spec = self.content.objects[&kind]
                     .projectiles
@@ -2823,15 +2825,13 @@ impl World {
                     spec,
                     hit: BTreeSet::new(),
                 };
-                let mut out = Writer::new();
-                out.u8(bullet.id)
-                    .i32(id)
-                    .u8(index)
-                    .f32(bullet.start.x)
-                    .f32(bullet.start.y)
-                    .f32(angle)
-                    .i16(bullet.damage as i16);
-                packets.push((id, out.0));
+                notices.push(enemy_shots::EnemyShot {
+                    bullet: bullet.id,
+                    projectile: index,
+                    start: bullet.start,
+                    angle,
+                    damage: bullet.damage,
+                });
                 if kind == 0x927 {
                     tracing::info!(
                         boss = id,
@@ -2842,6 +2842,11 @@ impl World {
                 }
                 self.bullets.push(bullet);
             }
+            packets.extend(
+                enemy_shots::packets(id, &notices)
+                    .into_iter()
+                    .map(|body| (id, body)),
+            );
         }
         packets
     }
