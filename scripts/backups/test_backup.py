@@ -32,6 +32,63 @@ CREATE TABLE deaths(character INTEGER PRIMARY KEY REFERENCES characters(id),snap
             db.execute('CREATE TABLE levels(guild_id TEXT,user_id TEXT,username TEXT,xp INTEGER,last_xp_at INTEGER,last_message_id TEXT,PRIMARY KEY(guild_id,user_id))')
             db.execute("INSERT INTO levels VALUES('1','2','someone',210,5000,'9')")
 
+    def add_hiscores(self):
+        self.add_shore_state()
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.executescript('''
+CREATE TABLE competitors(account INTEGER PRIMARY KEY REFERENCES accounts(id));
+CREATE TABLE collections(account INTEGER NOT NULL REFERENCES accounts(id),item INTEGER NOT NULL,found_at INTEGER NOT NULL,PRIMARY KEY(account,item));
+CREATE TABLE discord_links(account INTEGER PRIMARY KEY REFERENCES accounts(id),discord_id TEXT NOT NULL UNIQUE);
+CREATE TABLE discord_codes(account INTEGER PRIMARY KEY REFERENCES accounts(id),hash TEXT NOT NULL UNIQUE,issued_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
+CREATE TABLE credentials(account INTEGER PRIMARY KEY REFERENCES accounts(id),email TEXT NOT NULL,password_hash TEXT NOT NULL);
+INSERT INTO credentials VALUES(1,'NEVER_EXPORT_EMAIL','NEVER_EXPORT_PASSWORD_HASH');
+INSERT INTO competitors VALUES(1);
+INSERT INTO collections VALUES(1,2594,123);
+INSERT INTO discord_links VALUES(1,'1558662335076376578');
+INSERT INTO discord_codes VALUES(1,'NEVER_EXPORT_LINK_CODE_HASH',100,400);''')
+
+    def test_hiscores_roundtrip_keeps_records_and_ids_but_no_authentication(self):
+        self.add_hiscores()
+        before = self.export()
+        self.assertEqual(before['schema'], 4)
+        raw = gzip.decompress(self.output.read_bytes())
+        self.assertNotIn(b'NEVER_EXPORT_LINK_CODE_HASH', raw)
+        self.assertNotIn(b'discord_codes', raw)
+        restored = self.root / 'hiscores-restored'
+        backup.restore(self.output, restored)
+        self.assertEqual(backup.snapshot(restored / 'game.db', backup.HISCORES_GAME), before['game'])
+        with closing(sqlite3.connect(restored / 'game.db')) as db:
+            self.assertTrue(all(r[0] is None for r in db.execute('SELECT guid FROM accounts')))
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_schema WHERE type='table'")}
+            self.assertNotIn('credentials', tables)
+            self.assertNotIn('discord_codes', tables)
+
+    def test_hiscores_unknown_columns_and_nested_secrets_fail_closed(self):
+        self.add_hiscores()
+        before = self.export()
+        for table in ['collections', 'competitors', 'discord_links']:
+            malformed = deepcopy(before)
+            malformed['game'][table][0]['token'] = 'SECRET'
+            with self.subTest(table=table), self.assertRaisesRegex(ValueError, 'fields'):
+                backup.validate(malformed)
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.execute('ALTER TABLE discord_codes ADD COLUMN token TEXT')
+        with self.assertRaisesRegex(ValueError, 'columns'):
+            self.export()
+
+    def test_hiscores_invalid_owner_duplicate_ids_and_items_rejected(self):
+        self.add_hiscores()
+        before = self.export()
+        for field, value in [('item', -1), ('found_at', 0), ('account', 999999)]:
+            malformed = deepcopy(before)
+            malformed['game']['collections'][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                backup.validate(malformed)
+        malformed = deepcopy(before)
+        malformed['game']['discord_links'].append(malformed['game']['discord_links'][0])
+        with self.assertRaisesRegex(ValueError, 'Duplicate'):
+            backup.validate(malformed)
+
     def tearDown(self):
         self.temp.cleanup()
 
@@ -240,7 +297,7 @@ CREATE TABLE deaths(character INTEGER PRIMARY KEY REFERENCES characters(id),snap
             del malformed['game'][table]
             with self.subTest(missing=table), self.assertRaisesRegex(ValueError, 'tables'):
                 backup.validate(malformed)
-        for version in [4, True, '3']:
+        for version in [5, True, '3']:
             with self.subTest(version=version), self.assertRaisesRegex(ValueError, 'envelope'):
                 backup.validate(dict(before, schema=version))
 

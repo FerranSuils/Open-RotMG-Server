@@ -5,6 +5,10 @@ pub(super) struct ChatBudget {
     tokens: f32,
 }
 
+pub(crate) fn chat_private(text: &str) -> Packet {
+    text_packet("*Discord*", -1, 0, text)
+}
+
 pub(crate) fn chat_error(reason: &str) -> Packet {
     text_packet("*Error*", -1, 0, reason)
 }

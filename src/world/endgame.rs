@@ -810,7 +810,7 @@ mod tests {
         assert!(!w.entities.contains_key(&opened) && !w.entities[&locked].reserved);
     }
     #[test]
-    fn chunked_boss_rewards_conserve_every_item_and_ownership() {
+    fn chunked_boss_rewards_conserve_every_item_ownership_and_collection() {
         let mut w = super::super::tests::world();
         let mut rng = rand::rngs::mock::StepRng::new(0, 0);
         let rewards: Vec<i32> = crate::loot::rewards(&w.content, crate::endgame::ORYX2, &mut rng)
@@ -829,10 +829,18 @@ mod tests {
             .filter(|e| !existing.contains(&e.id))
             .collect();
         assert_eq!(bags.len(), 2);
-        assert!(
-            bags.iter()
-                .all(|e| e.items.len() == 8 && e.accessible(7) && !e.accessible(8))
-        );
+        assert!(bags.iter().all(|e| {
+            e.items.len() == 8
+                && e.accessible(7)
+                && !e.accessible(8)
+                && e.drop_slots
+                    == e.items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| **item >= 0)
+                        .map(|(slot, _)| slot)
+                        .collect()
+        }));
         let items: Vec<_> = bags
             .into_iter()
             .flat_map(|e| e.items.iter().copied().filter(|i| *i >= 0))
