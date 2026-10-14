@@ -88,6 +88,19 @@ class UpdateTest(unittest.TestCase):
                     update.main()
                 self.assertFalse((root / 'state/status.json').exists())
 
+    def test_successful_backup_starts_reset_the_retry_counter(self):
+        with patch.object(update.subprocess, 'check_output', return_value='success'), patch.object(update, 'run') as run:
+            update.start_backup()
+            self.assertEqual([call.args for call in run.call_args_list],
+                             [('systemctl', 'reset-failed', 'openrotmg-backup.service'),
+                              ('systemctl', 'start', 'openrotmg-backup.service')])
+
+    def test_failed_backups_never_bypass_the_retry_limit(self):
+        with patch.object(update.subprocess, 'check_output', return_value='exit-code'), patch.object(update, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'Previous backup failed'):
+                update.start_backup()
+            run.assert_not_called()
+
     def test_save_failure_prevents_source_exchange(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

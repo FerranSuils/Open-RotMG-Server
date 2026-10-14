@@ -112,6 +112,15 @@ def backup_module(stage):
     return module
 
 
+def start_backup():
+    require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'Result', '--value'], text=True).strip() == 'success',
+            'Previous backup failed; resolve it or await its scheduled retry')
+    # Successful deployment backups must not consume the scheduled job's failure-retry budget.
+    run('systemctl', 'reset-failed', 'openrotmg-backup.service')
+    run('systemctl', 'start', 'openrotmg-backup.service')
+    require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Independent GitHub backup failed')
+
+
 def install_backups(stage):
     require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'ActiveState', '--value'], text=True).strip() == 'inactive', 'Backup already active; retry after it finishes')
     run('runuser', '-u', 'openrotmg', '--', sys.executable, '-B', '-W', 'error::ResourceWarning',
@@ -122,8 +131,7 @@ def install_backups(stage):
         temporary.write_bytes((stage / 'scripts/backups' / name).read_bytes())
         temporary.chmod(target.stat().st_mode & 0o777)
         temporary.replace(target)
-    run('systemctl', 'start', 'openrotmg-backup.service')
-    require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Independent GitHub backup failed')
+    start_backup()
 
 
 def rehearse(stage, work, config):
@@ -184,8 +192,7 @@ def deploy(stage, work, metadata, config):
     require(digest(LIVE / 'openrotmg') == metadata['binary_sha256'], 'Activated binary mismatch')
     pid = int(subprocess.check_output(['systemctl', 'show', 'openrotmg', '-p', 'MainPID', '--value'], text=True))
     require(pid > 0 and digest(f'/proc/{pid}/exe') == metadata['binary_sha256'], 'Running process binary mismatch')
-    run('systemctl', 'start', 'openrotmg-backup.service')
-    require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Post-release GitHub backup failed')
+    start_backup()
 
 
 def main_revision():
@@ -202,8 +209,7 @@ def main():
         ready(int(json.loads(CONFIG.read_text())['bind'].rsplit(':', 1)[1]))
         previous = ROOT / 'status.json'
         if previous.exists() and json.loads(previous.read_text())['state'] == 'failed':
-            run('systemctl', 'start', 'openrotmg-backup.service')
-            require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Independent backup remains failed')
+            start_backup()
         status('up_to_date', desired)
         return
     require(shutil.disk_usage(ROOT).free >= 2 * 1024**3, 'Less than 2 GiB free; inspect retained recovery data before deploying')
