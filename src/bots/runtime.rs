@@ -154,7 +154,7 @@ pub async fn start(app: &App) -> Result<()> {
                                 ensure!(character_id == view.session.character, "transfer character binding changed");
                                 let character = app.store.load(account, character_id).await?;
                                 (id, output, brain) = enter(&app, profile, character, destination).await?;
-                                tracing::info!(player=id,account,character=character_id,destination,"autonomous durable transfer completed");
+                                tracing::info!(player=id,account,character=character_id,destination,?portal,"autonomous durable transfer completed");
                             }
                         }
                     }
