@@ -257,11 +257,7 @@ impl Directory {
         self.worlds
             .values()
             .flat_map(|w| w.players.values())
-            .filter(|p| {
-                p.controller == Controller::Human
-                    && !p.death_pending
-                    && p.persistence_failure.is_none()
-            })
+            .filter(|p| p.controller == Controller::Human && p.persistence_failure.is_none())
             .map(|p| p.character.clone())
             .collect()
     }
@@ -3698,6 +3694,34 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn hiscore_snapshots_exclude_qa_and_keep_the_latest_fame_until_death_commits() {
+        let mut d = Directory::load(Path::new("data"), world().content, 16).unwrap();
+        let world_id = d.initial(-2).unwrap();
+        let (id, _receiver) = receive(&mut d, world_id, 1, WIZARD);
+        let w = d.worlds.get_mut(&world_id).unwrap();
+        w.players.get_mut(&id).unwrap().character.fame = 100;
+        w.players.get_mut(&id).unwrap().death_pending = true;
+        assert_eq!(d.competitive_characters()[0].fame, 100);
+        d.worlds
+            .get_mut(&world_id)
+            .unwrap()
+            .players
+            .get_mut(&id)
+            .unwrap()
+            .controller = Controller::Qa;
+        assert!(d.competitive_characters().is_empty());
+        let p = d
+            .worlds
+            .get_mut(&world_id)
+            .unwrap()
+            .players
+            .get_mut(&id)
+            .unwrap();
+        p.controller = Controller::Human;
+        p.persistence_failure = Some("test storage failure".into());
+        assert!(d.competitive_characters().is_empty());
     }
     #[test]
     fn only_human_enemy_drop_pickups_stage_collection_and_player_drops_never_do() {
