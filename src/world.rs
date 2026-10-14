@@ -737,7 +737,7 @@ impl Handle {
         self.directory(move |d| f(d.resolve(target)?)).await
     }
 }
-fn send(p: &Player, id: u8, body: Vec<u8>) {
+pub(crate) fn send(p: &Player, id: u8, body: Vec<u8>) {
     if let Some(tx) = &p.tx
         && tx.packets.try_send(Packet { id, body }).is_err()
     {

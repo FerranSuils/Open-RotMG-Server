@@ -205,3 +205,49 @@ async fn controls_do_not_enable_the_testing_interface_on_ordinary_state() {
     app.shutdown.send_replace(true);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn native_input_acknowledgement_is_bound_to_the_exact_session() {
+    let (dir, app) = fixture();
+    let testing = app.testing.as_ref().unwrap();
+    let (sender, mut receiver) = tokio::sync::oneshot::channel();
+    testing
+        .native_pings
+        .lock()
+        .unwrap()
+        .insert(-1, (42, sender));
+    testing.acknowledge_native(-1, 43);
+    assert_eq!(
+        receiver.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    );
+    testing.acknowledge_native(-1, 42);
+    assert_eq!(receiver.try_recv(), Ok(()));
+    testing.acknowledge_native(-1, 42);
+    assert!(testing.native_pings.lock().unwrap().is_empty());
+    assert!(app.world.clock.paused());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn synchronizing_an_already_paused_session_never_resumes_it() {
+    let (dir, app) = fixture();
+    let result = request(
+        &app,
+        "paused-native-sync",
+        json!({"op":"native_sync","actors":[1]}),
+    )
+    .await;
+    assert_eq!(result["result"]["already_paused"], true);
+    assert!(app.world.clock.paused());
+    assert_eq!(
+        request(
+            &app,
+            "duplicate-native-sync",
+            json!({"op":"native_sync","actors":[1,1]})
+        )
+        .await["status"],
+        "failed"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

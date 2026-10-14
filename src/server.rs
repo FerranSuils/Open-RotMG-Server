@@ -748,9 +748,12 @@ async fn handle(
             }
         }
         wire::PONG => {
-            r.i32()?;
+            let nonce = r.i32()?;
             r.i32()?;
             r.done()?;
+            if let (Some(testing), Some(player)) = (&a.testing, player) {
+                testing.acknowledge_native(nonce, *player);
+            }
         }
         22 => {
             r.i32()?;
@@ -943,7 +946,7 @@ async fn connection(socket: WebSocket, mut a: App) {
                         if session.reconnecting { break; }
                         let id=packet.id;
                         if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost).await {
-                            tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,error=%format_args!("{e:#}"),"game command rejected");
+                            tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,paused=a.world.clock.paused(),error=%format_args!("{e:#}"),"game command rejected");
                             if matches!(id,1|21|37|57) && let Some(player) = session.player {
                                 let reason = e.to_string();
                                 let closed = a.world.for_player(player).call(move |w| Ok(w.cancel_trade(player, &reason))).await;

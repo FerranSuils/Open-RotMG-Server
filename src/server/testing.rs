@@ -13,11 +13,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+type NativePings = BTreeMap<i32, (i32, tokio::sync::oneshot::Sender<()>)>;
+
 #[derive(Clone)]
 pub struct Testing {
     root: PathBuf,
     gate: Arc<tokio::sync::Mutex<()>>,
     cancelled: Arc<Mutex<BTreeSet<String>>>,
+    native_serial: Arc<std::sync::atomic::AtomicI32>,
+    native_pings: Arc<Mutex<NativePings>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -91,6 +95,9 @@ enum Command {
         native_paused: Vec<i32>,
     },
     Resume,
+    NativeSync {
+        actors: Vec<i32>,
+    },
     Result {
         request: String,
     },
@@ -161,7 +168,27 @@ impl Testing {
             root,
             gate: Arc::default(),
             cancelled: Arc::default(),
+            native_serial: Arc::new(std::sync::atomic::AtomicI32::new(-1)),
+            native_pings: Arc::default(),
         }))
+    }
+    pub(super) fn acknowledge_native(&self, nonce: i32, player: i32) {
+        let mut pending = self
+            .native_pings
+            .lock()
+            .expect("native acknowledgement registry poisoned");
+        if pending
+            .get(&nonce)
+            .is_some_and(|(expected, _)| *expected == player)
+            && let Some((_, sender)) = pending.remove(&nonce)
+            && sender.send(()).is_err()
+        {
+            tracing::warn!(
+                nonce,
+                player,
+                "native acknowledgement arrived after its waiter closed"
+            );
+        }
     }
     fn path(&self, id: &str, suffix: &str) -> PathBuf {
         self.root.join(format!("{id}.{suffix}.json"))
@@ -242,6 +269,61 @@ async fn snapshot(a: &App, actor: i32, detail: bool) -> Result<Value> {
         character["stats"] = json!({"max_hp":view.character.stats[0],"max_mp":view.character.stats[1],"attack":view.character.stats[2],"defense":view.character.stats[3],"speed":view.character.stats[4],"dexterity":view.character.stats[5],"vitality":view.character.stats[6],"wisdom":view.character.stats[7]});
         Ok(json!({"actor":actor,"controller":controller,"session":view.session,"world":view.map.name,"tick":view.tick,"game_ms":view.time_ms,"position":view.position,"character":character,"equipment":ch.items[..4].iter().map(|i|item(*i)).collect::<Result<Vec<_>>>()?,"lifecycle":view.lifecycle,"verification":{"shots":ch.shots,"kills":ch.kills,"pirate_caves":ch.pirate_caves},"nearby":nearby,"omitted_relevant_objects":relevant.len().saturating_sub(8),"paused":d.clock.paused(),"pause_scope":"server","knowledge_scope":"client_known_and_server_visible","provenance":"prepared"}))
     }).await
+}
+async fn native_sync(a: &App, t: &Testing, actors: Vec<i32>) -> Result<Value> {
+    ensure!(
+        !actors.is_empty()
+            && actors.len() <= 8
+            && actors.iter().collect::<BTreeSet<_>>().len() == actors.len(),
+        "native synchronization requires 1–8 unique actors"
+    );
+    if a.world.clock.paused() {
+        return Ok(json!({"already_paused":true}));
+    }
+    let mut acknowledgements = Vec::new();
+    for actor in actors {
+        let player = resolve(a, actor).await?;
+        let nonce = t
+            .native_serial
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        ensure!(
+            nonce > i32::MIN && nonce < 0,
+            "native synchronization serial budget exhausted"
+        );
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        t.native_pings
+            .lock()
+            .expect("native acknowledgement registry poisoned")
+            .insert(nonce, (player, sender));
+        let result: Result<()> = async {
+            a.world
+                .directory(move |d| {
+                    let view = d.player_view(player)?;
+                    let p = &d.worlds[&view.session.world].players[&player];
+                    ensure!(
+                        p.controller == crate::world::Controller::Human,
+                        "native synchronization requires the actual native controller"
+                    );
+                    let mut body = Writer::new();
+                    body.i32(nonce);
+                    crate::world::send(p, wire::PING, body.0);
+                    Ok(())
+                })
+                .await?;
+            tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .context("native input acknowledgement timed out")?
+                .context("native acknowledgement waiter closed")
+        }
+        .await;
+        t.native_pings
+            .lock()
+            .expect("native acknowledgement registry poisoned")
+            .remove(&nonce);
+        result?;
+        acknowledgements.push(json!({"actor":actor,"player":player,"nonce":nonce}));
+    }
+    Ok(json!({"acknowledged":acknowledgements}))
 }
 async fn pause(a: &App, native: &[i32]) -> Result<()> {
     let native = native.to_vec();
@@ -443,6 +525,7 @@ async fn execute(a: &App, t: &Testing, id: &str, command: Command) -> Result<Val
         Command::Observe{actor} => {t.registration(actor)?;snapshot(a,actor,false).await},
         Command::Inspect{actor} => {t.registration(actor)?;snapshot(a,actor,true).await},
         Command::Resume => {a.world.clock.set_paused(false);Ok(json!({"paused":false}))},
+        Command::NativeSync{actors} => native_sync(a,t,actors).await,
         Command::Pause{native_paused} => {pause(a,&native_paused).await?;Ok(json!({"paused":true,"native_paused":native_paused}))},
         Command::Act{actor,action,duration_ms,pause_after} => {
             let spec=t.registration(actor)?;

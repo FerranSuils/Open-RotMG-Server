@@ -92,6 +92,7 @@ async function connect(spec) {
 }
 async function pauseAll() {
   const errors=[], confirmed=[];
+  if(clients.length)try{await api({op:'native_sync',actors:clients.map(c=>c.actor)});}catch(e){errors.push(String(e));}
   for (const c of clients) {
     try {
       await c.clock(true);
