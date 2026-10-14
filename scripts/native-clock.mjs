@@ -1,7 +1,8 @@
 export function nativeClock(paused) {
+  if(paused!==null&&typeof paused!=='boolean')throw new Error('Native clock requires true, false or null; frozen live drains are unsupported');
   const player=document.querySelector('ruffle-player');
   if(!player)throw new Error('Ruffle missing');
-  const api=player.ruffle(), key=Symbol.for('openrotmg.testing.native-clock.v3');
+  const api=player.ruffle(), key=Symbol.for('openrotmg.testing.native-clock.v4');
   let clock=globalThis[key], initialized=false;
   if(!clock) {
     if(!api.isPlaying){globalThis[key]={invalid:true};throw new Error('Untracked native pause: reconnect the same living character before initializing the native clock');}
@@ -19,20 +20,18 @@ export function nativeClock(paused) {
     }
     Object.setPrototypeOf(PausableDate,NativeDate);PausableDate.prototype=NativeDate.prototype;
     Object.defineProperty(PausableDate,'now',{value:()=>Math.trunc(epoch+now())});globalThis.Date=PausableDate;
-    clock=globalThis[key]={draining:false,pause:()=>{if(stopped===null)stopped=raw();},resume:()=>{if(stopped!==null){excluded+=raw()-stopped;stopped=null;}},read:()=>({paused:stopped!==null,clock_ms:now()})};
+    clock=globalThis[key]={pause:()=>{if(stopped===null)stopped=raw();},resume:()=>{if(stopped!==null){excluded+=raw()-stopped;stopped=null;}},read:()=>({paused:stopped!==null,clock_ms:now()})};
   }
-  if(clock.invalid||api.isPlaying!==(clock.draining||!clock.read().paused)||(clock.draining&&!clock.read().paused)) {
+  if(clock.invalid||api.isPlaying===clock.read().paused) {
     clock.invalid=true;
     api.suspend();if(clock.pause)clock.pause();
     throw new Error('Native clock invalid after untracked pause or playback change; reconnect the same living character');
   }
-  if(paused==='drain'&&!clock.read().paused){clock.pause();clock.draining=true;}
-  else if(paused===true) {
-    api.suspend();clock.pause();clock.draining=false;
+  if(paused===true) {
+    api.suspend();clock.pause();
     if(api.isPlaying)throw new Error('Ruffle did not pause');
   } else if(paused===false){
-    if(clock.draining)throw new Error('Complete native suspension before resuming a drain');
     clock.resume();api.resume();if(!api.isPlaying)throw new Error('Ruffle did not resume');
   }
-  return {...clock.read(),initialized,draining:clock.draining};
+  return {...clock.read(),initialized};
 }

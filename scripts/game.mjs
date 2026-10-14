@@ -92,7 +92,8 @@ async function initializeClock(c) {
 }
 async function pauseAll() {
   const errors=[], confirmed=[];
-  for(const c of clients)try{await initializeClock(c);await c.clock('drain');}catch(e){errors.push(String(e));}
+  // Ruffle can synthesize frame time while playing, even when page clocks are frozen.
+  for(const c of clients)try{await initializeClock(c);}catch(e){errors.push(String(e));}
   if(clients.length)try{await api({op:'native_sync',actors:clients.map(c=>c.actor)});}catch(e){errors.push(String(e));}
   for (const c of clients) {
     try {

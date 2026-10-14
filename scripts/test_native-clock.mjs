@@ -20,11 +20,11 @@ test('twenty seconds paused funds neither performance nor Date clocks on resume'
 test('animation callbacks cannot fund paused time after ten minutes without frames',()=>{
   const f=fixture();f.call(null);vm.runInContext('requestAnimationFrame(t=>globalThis.frameTime=t)',f.context);f.call(true);f.advance(600000);f.call(false);f.frame();assert.equal(vm.runInContext('frameTime',f.context),100);
 });
-test('draining keeps the network pump live without funding any native clock',()=>{
-  const f=fixture();f.call('drain');f.advance(5000);const during=[f.api.isPlaying,f.clocks()];f.call(true);assert.deepEqual([during,f.api.isPlaying,f.clocks()],[[true,[100,1000100,1000100]],false,[100,1000100,1000100]]);
+test('ordinary barrier time advances until actual native suspension',()=>{
+  const f=fixture();f.call(null);f.advance(5000);f.call(true);f.advance(300000);assert.deepEqual([f.api.isPlaying,f.clocks()],[false,[5100,1005100,1005100]]);
 });
-test('an incomplete drain cannot be silently resumed',()=>{
-  const f=fixture();f.call('drain');assert.throws(()=>f.call(false),/Complete native suspension/);
+test('frozen live drains are rejected without changing playback or clocks',()=>{
+  const f=fixture();f.call(null);assert.throws(()=>f.call('drain'),/frozen live drains are unsupported/);f.advance(40);assert.deepEqual([f.api.isPlaying,f.clocks()],[true,[140,1000140,1000140]]);
 });
 test('Date.now preserves integer milliseconds during active page time',()=>{
   const f=fixture();f.call(null);f.advance(0.25);assert.deepEqual(f.clocks(),[100.25,1000100,1000100]);
@@ -43,7 +43,7 @@ test('stopping after an untracked pause cannot silently clear clock invalidation
   const f=fixture(false);for(const op of [null,true])try{f.call(op);}catch{}f.api.resume();assert.throws(()=>f.call(false),/Native clock invalid/);
 });
 test('cleanup suspends out of band playback but still refuses native acceptance',()=>{
-  const f=fixture();f.call(true);f.api.resume();try{f.call(true);}catch{}assert.deepEqual([f.api.isPlaying,vm.runInContext('globalThis[Symbol.for("openrotmg.testing.native-clock.v3")].invalid',f.context)],[false,true]);
+  const f=fixture();f.call(true);f.api.resume();try{f.call(true);}catch{}assert.deepEqual([f.api.isPlaying,vm.runInContext('globalThis[Symbol.for("openrotmg.testing.native-clock.v4")].invalid',f.context)],[false,true]);
 });
 test('explicit Date construction, static methods and callable Date remain compatible',()=>{
   const f=fixture();f.call(null);
