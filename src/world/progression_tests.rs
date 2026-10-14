@@ -257,6 +257,57 @@ fn selected_private_boss_rewards_reach_every_eligible_player_including_the_ninth
 }
 
 #[test]
+fn spell_rolls_xml_damage_and_publishes_the_authoritative_values_without_weapon_rng() {
+    use rand::RngCore;
+    let mut w = arena();
+    let mut ch = tests::ch(&w);
+    ch.items[1] = 0xb24;
+    let (tx, mut rx) = mpsc::channel(64);
+    let (lost, _) = watch::channel(false);
+    let id = w.enter(ch, Some(Output { packets: tx, lost })).unwrap();
+    while rx.try_recv().is_ok() {}
+    w.now = 1000;
+    let target = w.players[&id].pos;
+    let slot = Slot {
+        object: id,
+        slot: 1,
+        kind: 0xb24,
+    };
+    let native_seed = w.players[&id].seed;
+    let spec = w.content.objects[&0xb24].projectiles[&0].clone();
+    let mut expected_rng = w.rng.clone();
+    let expected: Vec<_> = (0..20)
+        .map(|_| expected_rng.gen_range(spec.min..=spec.max))
+        .collect();
+    w.use_item(id, slot, target).unwrap();
+    assert_eq!(
+        w.bullets.iter().map(|b| b.damage).collect::<Vec<_>>(),
+        expected
+    );
+    assert!(expected.iter().any(|damage| *damage > spec.min));
+    assert_eq!(w.players[&id].seed, native_seed);
+    for bullet in &w.bullets {
+        let packet = rx.try_recv().unwrap();
+        assert_eq!(packet.id, 13);
+        let mut r = crate::wire::Reader::new(&packet.body);
+        assert_eq!(r.u8().unwrap(), bullet.id);
+        assert_eq!(r.i32().unwrap(), id);
+        assert_eq!(r.i16().unwrap(), 0xb24);
+        assert_eq!(r.f32().unwrap(), target.x);
+        assert_eq!(r.f32().unwrap(), target.y);
+        assert_eq!(r.f32().unwrap(), bullet.angle);
+        assert_eq!(r.i16().unwrap() as i32, bullet.damage);
+        r.done().unwrap();
+    }
+    assert!(rx.try_recv().is_err());
+    let mut before_rejected = w.rng.clone();
+    assert!(w.use_item(id, slot, target).is_err());
+    assert_eq!(w.rng.next_u64(), before_rejected.next_u64());
+    assert_eq!(w.players[&id].seed, native_seed);
+    assert_eq!(w.bullets.len(), 20);
+}
+
+#[test]
 fn timed_conditions_expire_and_quiet_blocks_mana_consumption_and_spells() {
     let mut w = tests::world();
     w.safe = true;
