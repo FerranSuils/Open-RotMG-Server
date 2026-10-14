@@ -891,7 +891,13 @@ impl Grid {
             return None;
         }
         if self.segment(from, to) {
-            return Some(to);
+            // Distant remembered terrain may contain cover that is not currently visible.
+            let distance = from.distance(to);
+            let fraction = 4. / distance.max(4.);
+            return Some(Pos {
+                x: from.x + (to.x - from.x) * fraction,
+                y: from.y + (to.y - from.y) * fraction,
+            });
         }
         if start == finish {
             return None;

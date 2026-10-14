@@ -28,6 +28,34 @@ fn retained_exploration_can_outscore_a_clear_distant_enemy() {
 }
 
 #[test]
+fn remembered_routes_advance_nearby_before_revalidating_distant_cover() {
+    let c = content();
+    let mut v = view(&c);
+    v.position = Pos { x: 9.5, y: 70.5 };
+    v.tiles = (0..98)
+        .flat_map(|y| {
+            (0..94).map(move |x| Tile {
+                x,
+                y,
+                ground: 253,
+                ground_speed: 1.,
+            })
+        })
+        .collect();
+    let destination = Pos { x: 8.5, y: 93.5 };
+    let grid = Grid::new(&v);
+    let next = grid.next(v.position, destination).unwrap();
+    assert!(v.position.distance(next) <= 4.001);
+    assert!(next.distance(destination) < v.position.distance(destination));
+    let mut wall = object(2, 0x1ce, destination.x, destination.y);
+    wall.blocks = true;
+    v.objects.push(wall);
+    assert!(Grid::new(&v).next(next, destination).is_none());
+    let nearby = Pos { x: 10.5, y: 70.5 };
+    assert_eq!(Grid::new(&v).next(v.position, nearby).unwrap().x, nearby.x);
+}
+
+#[test]
 fn dodge_predictions_use_actual_movement_conditions_and_ground() {
     use crate::content::{PARALYZED, SLOWED, SPEEDY};
     let c = content();
@@ -265,10 +293,13 @@ fn projectile_dodge_uses_observed_trajectory_and_only_known_routes() {
         walkable: (0..=24).map(|x| (x, 0)).collect(),
         known: (0..=24).map(|x| (x, 0)).collect(),
     };
-    assert_eq!(
-        tile(straight.next(center((0, 0)), center((24, 0))).unwrap()),
-        (24, 0)
-    );
+    let mut position = center((0, 0));
+    for _ in 0..6 {
+        let next = straight.next(position, center((24, 0))).unwrap();
+        assert!(position.distance(next) <= 4.001);
+        position = next;
+    }
+    assert_eq!(tile(position), (24, 0));
     straight.walkable.remove(&(13, 0));
     assert!(!straight.segment(center((0, 0)), center((24, 0))));
     assert!(straight.next(center((0, 0)), center((24, 0))).is_none());
