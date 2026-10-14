@@ -18,6 +18,8 @@ async fn enter(
     } else {
         world
     };
+    tracing::info!(name = profile.name, saved = %serde_json::to_string(&character)?,
+        "autonomous saved character loaded");
     // Concurrent novas and hit receipts must fit between bounded perception updates.
     let (packets, output) = mpsc::channel(OUTPUT_CAPACITY);
     let (lost, _) = watch::channel(false);
