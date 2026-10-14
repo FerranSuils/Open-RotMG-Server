@@ -87,7 +87,7 @@ pub struct Player {
     pub pos: Pos,
     pub tx: Option<Output>,
     pub departing: bool,
-    controller: Controller,
+    pub(crate) controller: Controller,
     pub known: BTreeSet<i32>,
     known_since: BTreeMap<i32, u64>,
     tiles: BTreeSet<(i16, i16)>,
@@ -99,7 +99,7 @@ pub struct Player {
     pub pending: bool,
     pub experience_queued: i32,
     caves_queued: u64,
-    progress_started: bool,
+    pub(crate) progress_started: bool,
     pub death_pending: bool,
     persistence_failure: Option<String>,
     pub bot_goal: Option<Pos>,
@@ -196,6 +196,7 @@ pub struct World {
     rng: rand::rngs::StdRng,
     pub now: u64,
     attack_epoch: Instant,
+    clock: crate::clock::Clock,
     pub tick: u64,
     ids: Arc<AtomicI32>,
     pub name: String,
@@ -242,6 +243,7 @@ struct Portal {
     expires: u64,
 }
 pub struct Directory {
+    pub clock: crate::clock::Clock,
     pub worlds: BTreeMap<i32, World>,
     templates: BTreeMap<String, Arc<Map>>,
     content: Arc<Content>,
@@ -309,6 +311,7 @@ impl Directory {
             Arc::new(crate::terrain::generate(&content, seed, 512)?),
         );
         let mut d = Self {
+            clock: crate::clock::Clock::default(),
             worlds: BTreeMap::new(),
             templates,
             content,
@@ -358,6 +361,8 @@ impl Directory {
                 .clone(),
             self.ids.clone(),
         )?;
+        world.clock = self.clock.clone();
+        world.attack_epoch = self.clock.now();
         world.name = name.into();
         world.safe = safe;
         world.owner = owner;
@@ -648,10 +653,12 @@ type Job = Box<dyn FnOnce(&mut Directory) + Send>;
 pub struct Handle {
     tx: mpsc::Sender<Job>,
     target: Target,
+    pub clock: crate::clock::Clock,
 }
 impl Handle {
     pub fn spawn(directory: Directory) -> Self {
         let (tx, mut rx) = mpsc::channel::<Job>(256);
+        let clock = directory.clock.clone();
         tokio::spawn(async move {
             let mut directory = directory;
             let mut timer = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -659,6 +666,7 @@ impl Handle {
             loop {
                 tokio::select! {
                     _ = timer.tick() => {
+                        if directory.clock.paused() { continue; }
                         let start=Instant::now(); directory.step();
                         let us=start.elapsed().as_micros() as u64;
                         directory.max_tick_us=directory.max_tick_us.max(us);
@@ -678,18 +686,21 @@ impl Handle {
         Self {
             tx,
             target: Target::World(-1),
+            clock,
         }
     }
     pub fn in_world(&self, id: i32) -> Self {
         Self {
             tx: self.tx.clone(),
             target: Target::World(id),
+            clock: self.clock.clone(),
         }
     }
     pub fn for_player(&self, id: i32) -> Self {
         Self {
             tx: self.tx.clone(),
             target: Target::Player(id),
+            clock: self.clock.clone(),
         }
     }
     pub async fn directory<T: Send + 'static>(
@@ -826,6 +837,7 @@ impl World {
             rng: rand::rngs::StdRng::from_entropy(),
             now: 0,
             attack_epoch: Instant::now(),
+            clock: crate::clock::Clock::default(),
             tick: 0,
             ids,
             name: "Development tutorial".into(),
@@ -842,6 +854,19 @@ impl World {
             trades: BTreeMap::new(),
             trade_requests: BTreeMap::new(),
         })
+    }
+    pub fn settled(&self) -> Result<bool> {
+        for p in self.players.values() {
+            ensure!(
+                p.persistence_failure.is_none(),
+                "character {} is quarantined",
+                p.character.id
+            );
+        }
+        Ok(self
+            .players
+            .values()
+            .all(|p| !p.pending && !p.progress_started && !p.death_pending && !p.departing))
     }
     pub fn load_vault(&mut self, vault: Vault) -> Result<()> {
         ensure!(
@@ -949,6 +974,20 @@ impl World {
         o.0
     }
     pub fn enter(&mut self, ch: Character, tx: Option<Output>) -> Result<i32> {
+        self.enter_at(ch, tx, None)
+    }
+    pub fn enter_at(
+        &mut self,
+        ch: Character,
+        tx: Option<Output>,
+        position: Option<Pos>,
+    ) -> Result<i32> {
+        if let Some(pos) = position {
+            ensure!(
+                pos.x.is_finite() && pos.y.is_finite() && self.walkable(pos),
+                "prepared position is blocked or outside the world"
+            );
+        }
         ensure!(ch.alive && ch.hp > 0, "dead character");
         ch.effective(&self.content)?;
         ensure!(
@@ -973,7 +1012,7 @@ impl World {
             id,
             Player {
                 character: ch,
-                pos: Pos { x, y },
+                pos: position.unwrap_or(Pos { x, y }),
                 departing: false,
                 controller: if tx.is_none() {
                     Controller::Qa
@@ -1312,7 +1351,12 @@ impl World {
         angle: f32,
     ) -> Result<()> {
         // Skipped actor ticks must not charge real client attacks against a slower simulation clock.
-        let received = self.attack_epoch.elapsed().as_millis() as u64;
+        let received = self
+            .clock
+            .now()
+            .checked_duration_since(self.attack_epoch)
+            .context("attack clock regressed")?
+            .as_millis() as u64;
         self.shoot_timed(id, (time, received), bullet, kind, start, angle)
     }
     // Fixture tests drive fixed ticks without sleeping, so script shots use simulation time.
@@ -4112,6 +4156,36 @@ mod tests {
             );
             assert!(w.bullets.is_empty());
         }
+    }
+    #[test]
+    fn paused_wall_time_cannot_fund_native_attack_credit() {
+        let mut w = world();
+        let mut character = ch(&w);
+        character.base[5] = 26;
+        let player = w.enter(character, None).unwrap();
+        let pos = w.players[&player].pos;
+        let start = Pos {
+            x: pos.x + 0.3,
+            y: pos.y,
+        };
+        let p = w.players.get_mut(&player).unwrap();
+        p.last_attack = 1000;
+        p.last_attack_at = 1000;
+        p.attack_credit = 0.;
+        w.attack_epoch = w.clock.now() - std::time::Duration::from_millis(1000);
+        w.clock.set_paused(true);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let error = w
+            .native_shoot(player, 1298, 1, 0xa97, start, 0.)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("attack exceeds server time budget")
+        );
+        w.clock.set_paused(false);
+        assert!(w.native_shoot(player, 1298, 1, 0xa97, start, 0.).is_err());
+        assert_eq!(w.players[&player].character.shots, 0);
     }
     #[test]
     fn native_attack_credit_uses_receive_time_not_skipped_simulation_ticks() {

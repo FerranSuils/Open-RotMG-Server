@@ -10,6 +10,8 @@ pub struct Config {
     pub data: PathBuf,
     pub client: PathBuf,
     pub state: PathBuf,
+    #[serde(default)]
+    pub test_state: bool,
     pub max_players: usize,
     pub behind_proxy: bool,
     #[serde(default)]
@@ -24,6 +26,7 @@ impl Config {
         let mut shore_bots = false;
         let mut client_dir = None;
         let mut state_dir = None;
+        let mut test_state = false;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -52,8 +55,11 @@ impl Config {
                         args.next().context("--client requires a directory")?,
                     ));
                 }
-                "--state" => {
-                    ensure!(state_dir.is_none(), "duplicate --state");
+                "--state" | "--test-state" => {
+                    ensure!(state_dir.is_none(), "duplicate state directory");
+                    if arg == "--test-state" {
+                        test_state = true;
+                    }
                     state_dir = Some(PathBuf::from(
                         args.next().context("--state requires a directory")?,
                     ));
@@ -78,6 +84,7 @@ impl Config {
                     .context("workspace parent missing")?
                     .join("client"),
                 state: root.join(".local"),
+                test_state: false,
                 max_players: 85,
                 behind_proxy: false,
                 shore_bots: false,
@@ -97,6 +104,12 @@ impl Config {
             }
         }
         config.shore_bots |= shore_bots;
+        config.test_state |= test_state;
+        control |= test_state;
+        ensure!(
+            !config.test_state || control,
+            "test state requires local development control"
+        );
         config.validate(control)?;
         Ok((config, control))
     }

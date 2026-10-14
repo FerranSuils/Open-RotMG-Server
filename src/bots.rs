@@ -11,7 +11,7 @@ use anyhow::{Context, Result, ensure};
 use rand::{Rng, SeedableRng};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -580,20 +580,57 @@ pub async fn start(app: &App) -> Result<()> {
             );
             continue;
         };
-        let owner = app.claim(ch.account)?;
-        let (packets, mut output) = mpsc::channel(64);
-        let (lost, _) = watch::channel(false);
-        let id = app
-            .world
-            .in_world(-3)
-            .call(move |w| w.enter_autonomous(ch, Output { packets, lost }))
-            .await?;
-        let view = app.world.directory(move |d| d.player_view(id)).await?;
-        let mut brain = Brain::new(profile, &view);
-        let app = app.clone();
-        tokio::spawn(async move {
-            let mut shutdown = app.shutdown.subscribe();
-            let result:Result<()> = async {
+        launch(app, ch, -3, None, profile).await?;
+    }
+    Ok(())
+}
+pub fn validate_test_class(class: u16) -> Result<()> {
+    ensure!(
+        class == WIZARD,
+        "this source revision only implements the Wizard gameplay controller"
+    );
+    Ok(())
+}
+pub async fn start_test(
+    app: &App,
+    ch: crate::store::Character,
+    world: i32,
+    pos: Pos,
+) -> Result<()> {
+    validate_test_class(ch.class)?;
+    launch(app, ch, world, Some(pos), PROFILES[1]).await
+}
+async fn launch(
+    app: &App,
+    ch: crate::store::Character,
+    world: i32,
+    pos: Option<Pos>,
+    profile: Profile,
+) -> Result<()> {
+    let owner = app.claim(ch.account)?;
+    let (packets, mut output) = mpsc::channel(64);
+    let (lost, _) = watch::channel(false);
+    let id = app
+        .world
+        .in_world(world)
+        .call(move |w| match pos {
+            None => w.enter_autonomous(ch, Output { packets, lost }),
+            Some(pos) => {
+                let id = w.enter_at(ch, Some(Output { packets, lost }), Some(pos))?;
+                w.players
+                    .get_mut(&id)
+                    .context("new bot missing")?
+                    .controller = crate::world::Controller::Autonomous;
+                Ok(id)
+            }
+        })
+        .await?;
+    let view = app.world.directory(move |d| d.player_view(id)).await?;
+    let mut brain = Brain::new(profile, &view);
+    let app = app.clone();
+    tokio::spawn(async move {
+        let mut shutdown = app.shutdown.subscribe();
+        let result:Result<()> = async {
                 loop {
                     tokio::select! { _=tokio::time::sleep(Duration::from_millis(50))=>{},_=shutdown.changed()=>break }
                     let view=app.world.directory(move |d|d.player_view(id)).await?;
@@ -605,7 +642,8 @@ pub async fn start(app: &App) -> Result<()> {
                     ensure!(matches!(view.lifecycle.output,OutputState::Live) && !view.lifecycle.departing && !view.lifecycle.quarantined,"controller is not live");
                     while let Ok(packet)=output.try_recv() {
                         if brain.receive(packet,&view)? {
-                            if let Err(error)=app.world.directory(move |d|d.chat(id,"omw".into(),Instant::now())).await {
+                            let received = app.world.clock.now();
+                            if let Err(error)=app.world.directory(move |d|d.chat(id,"omw".into(),received)).await {
                                 tracing::warn!(player=id,%error,"invitation acknowledgement rejected");
                             }
                             tracing::info!(player=id,companion=brain.companion,"visible invitation accepted");
@@ -637,23 +675,22 @@ pub async fn start(app: &App) -> Result<()> {
                 }
                 server::depart(&app,id).await
             }.await;
-            if let Err(error) = result {
-                tracing::error!(player=id,name=profile.name,%error,"autonomous controller stopped; account retained for diagnosis");
-                let reason = error.to_string();
-                if let Err(error) = app
-                    .world
-                    .for_player(id)
-                    .call(move |w| w.poison(id, reason))
-                    .await
-                {
-                    tracing::error!(player=id,%error,"autonomous quarantine failed");
-                }
-                app.quarantined
-                    .lock()
-                    .expect("quarantine registry poisoned")
-                    .push(owner);
+        if let Err(error) = result {
+            tracing::error!(player=id,name=profile.name,%error,"autonomous controller stopped; account retained for diagnosis");
+            let reason = error.to_string();
+            if let Err(error) = app
+                .world
+                .for_player(id)
+                .call(move |w| w.poison(id, reason))
+                .await
+            {
+                tracing::error!(player=id,%error,"autonomous quarantine failed");
             }
-        });
-    }
+            app.quarantined
+                .lock()
+                .expect("quarantine registry poisoned")
+                .push(owner);
+        }
+    });
     Ok(())
 }
