@@ -180,6 +180,8 @@ def deploy(stage, work, metadata, config):
     ready(int(config['bind'].rsplit(':', 1)[1]))
     require((LIVE / 'REVISION').read_text().strip() == metadata['revision'], 'Activated revision mismatch')
     require(digest(LIVE / 'openrotmg') == metadata['binary_sha256'], 'Activated binary mismatch')
+    pid = int(subprocess.check_output(['systemctl', 'show', 'openrotmg', '-p', 'MainPID', '--value'], text=True))
+    require(pid > 0 and digest(f'/proc/{pid}/exe') == metadata['binary_sha256'], 'Running process binary mismatch')
     run('systemctl', 'start', 'openrotmg-backup.service')
     require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Post-release GitHub backup failed')
 
@@ -197,6 +199,7 @@ def main():
             require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Independent backup remains failed')
         status('up_to_date', desired)
         return
+    require(shutil.disk_usage(ROOT).free >= 2 * 1024**3, 'Less than 2 GiB free; inspect retained recovery data before deploying')
     status('checking_release', desired)
     work = ROOT / (desired + '-' + str(time.time_ns()))
     work.mkdir(mode=0o700)
