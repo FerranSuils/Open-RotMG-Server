@@ -1,10 +1,11 @@
 use super::*;
-fn fixture() -> (PathBuf, App) {
+pub(crate) fn fixture() -> (PathBuf, App) {
     let dir = std::env::temp_dir().join(format!("session-actions-{}", rand::random::<u64>()));
     std::fs::create_dir(&dir).unwrap();
     let content = Arc::new(Content::load(std::path::Path::new("data")).unwrap());
     let app = App {
         started: std::time::Instant::now(),
+        testing: None,
         store: Store::open(&dir.join("game.db"), &content).unwrap(),
         world: Handle::spawn(
             crate::world::Directory::with_seed(

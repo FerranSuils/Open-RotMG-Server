@@ -1,4 +1,5 @@
 mod bots;
+mod clock;
 mod config;
 mod content;
 mod crypto;
@@ -52,13 +53,46 @@ async fn main() -> Result<()> {
     let content = Arc::new(content::Content::load(&config.data)?);
     let keys = Arc::new(crypto::Keys::load(&state)?);
     let swf = Arc::new(keys.client(&client.join("client.swf"))?);
+    if config.test_state {
+        ensure!(
+            !state.join("game.db").exists(),
+            "--test-state refuses an existing game database; resume an owned prepared save with --state and --dev-control"
+        );
+        use std::io::Write;
+        let mut marker = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(state.join("testing.json"))?;
+        marker.write_all(br#"{"schema":1,"provenance":"prepared"}"#)?;
+        marker.sync_all()?;
+    }
+    let testing = server::testing::Testing::open(&state)?;
+    ensure!(
+        testing.is_none() || dev_control,
+        "prepared test state requires --dev-control"
+    );
+    ensure!(
+        testing.is_none() || !config.shore_bots,
+        "prepared sessions require --no-shore-bots or shore_bots:false; spawn every controller explicitly"
+    );
     let store = store::Store::open(&state.join("game.db"), &content)?;
-    let directory = world::Directory::with_seed(
-        &config.data,
-        content.clone(),
-        config.max_players,
-        config.realm_seed,
-    )?;
+    let directory = match &testing {
+        Some(_) => world::Directory::prepared(
+            &config.data,
+            content.clone(),
+            config.max_players,
+            config.realm_seed,
+        )?,
+        None => world::Directory::with_seed(
+            &config.data,
+            content.clone(),
+            config.max_players,
+            config.realm_seed,
+        )?,
+    };
+    if testing.is_some() {
+        directory.clock.set_paused(true);
+    }
     let world = world::Handle::spawn(directory);
     let control = if dev_control {
         let mut bytes = [0u8; 32];
@@ -81,6 +115,7 @@ async fn main() -> Result<()> {
     };
     let app = server::App {
         started,
+        testing,
         store,
         world,
         keys,

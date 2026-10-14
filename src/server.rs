@@ -132,11 +132,13 @@ impl App {
 use tokio::sync::mpsc;
 mod account_actions;
 mod hiscores;
+pub(crate) mod testing;
 use account_actions::{discord_kick, discord_recover, reset_password};
 use hiscores::{collection, discord_link, hiscores};
 #[derive(Clone)]
 pub struct App {
     pub started: std::time::Instant,
+    pub testing: Option<testing::Testing>,
     pub store: Store,
     pub world: Handle,
     pub keys: Arc<Keys>,
@@ -557,11 +559,25 @@ async fn handle(
             *account = Some(owner);
             drop(authentication);
             a.store.compete(id).await?;
+            let prepared = a
+                .testing
+                .as_ref()
+                .map(|t| t.native_entry(id))
+                .transpose()?
+                .flatten();
             let (destination, character) = a
                 .world
                 .directory(move |d| {
                     if key.is_empty() {
-                        Ok((d.initial(game)?, None))
+                        if let Some((world, _)) = prepared {
+                            ensure!(
+                                d.worlds.contains_key(&world),
+                                "prepared native world no longer exists"
+                            );
+                            Ok((world, None))
+                        } else {
+                            Ok((d.initial(game)?, None))
+                        }
                     } else {
                         Ok((game, Some(d.consume(id, game, keytime, key)?)))
                     }
@@ -615,18 +631,27 @@ async fn handle(
                 None
             };
             let lists = a.store.account_lists(account).await?;
+            let prepared = a
+                .testing
+                .as_ref()
+                .map(|t| t.native_entry(account))
+                .transpose()?
+                .flatten();
             *player = Some(
                 a.world
                     .call(move |w| {
                         if let Some(vault) = vault {
                             w.load_vault(vault)?;
                         }
-                        let id = w.enter(ch, Some(output))?;
+                        let id = w.enter_at(ch, Some(output), prepared.map(|(_, pos)| pos))?;
                         w.sync_account_lists(id, Some(lists))?;
                         Ok(id)
                     })
                     .await?,
             );
+            if let Some(testing) = &a.testing {
+                testing.native_entered(account)?;
+            }
         }
         wire::UPDATE_ACK => {
             r.done()?;
@@ -672,7 +697,7 @@ async fn handle(
         wire::PLAYER_TEXT => {
             let text = player_text(&mut r)?;
             let id = player.context("chat before character")?;
-            let received = std::time::Instant::now();
+            let received = a.world.clock.now();
             if matches!(
                 text.trim(),
                 "/discord" | "/discord recovery" | "/discord norecovery"
@@ -794,7 +819,7 @@ async fn handle(
             let target = r.i32()?;
             r.done()?;
             let id = player.context("teleport before character")?;
-            let received = std::time::Instant::now();
+            let received = a.world.clock.now();
             if let Err(error) = a
                 .world
                 .directory(move |d| d.teleport(id, target, received))
@@ -806,9 +831,12 @@ async fn handle(
             }
         }
         wire::PONG => {
-            r.i32()?;
+            let nonce = r.i32()?;
             r.i32()?;
             r.done()?;
+            if let (Some(testing), Some(player)) = (&a.testing, player) {
+                testing.acknowledge_native(nonce, *player);
+            }
         }
         22 => {
             r.i32()?;
@@ -1001,7 +1029,7 @@ async fn connection(socket: WebSocket, mut a: App) {
                         if session.reconnecting { break; }
                         let id=packet.id;
                         if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost).await {
-                            tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,error=%format_args!("{e:#}"),"game command rejected");
+                            tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,paused=a.world.clock.paused(),error=%format_args!("{e:#}"),"game command rejected");
                             if matches!(id,1|21|37|57) && let Some(player) = session.player {
                                 let reason = e.to_string();
                                 let closed = a.world.for_player(player).call(move |w| Ok(w.cancel_trade(player, &reason))).await;
@@ -1040,7 +1068,7 @@ async fn connection(socket: WebSocket, mut a: App) {
                 // Ruffle can discard unread TCP bytes when the proxy closes before its next frame.
                 if reconnect {reconnect_sent=true;deadline.as_mut().reset(tokio::time::Instant::now()+std::time::Duration::from_secs(10));}
             },
-            _=ping.tick()=>{if session.account.is_some(){serial+=1;let mut o=Writer::new();o.i32(serial);
+            _=ping.tick()=>{if session.account.is_some() && !a.world.clock.paused(){serial+=1;let mut o=Writer::new();o.i32(serial);
                 if wsout.send(Message::Binary(codec.frame(wire::PING,o.0).into())).await.is_err(){break;}}}
         }
     }
@@ -1407,6 +1435,7 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
         .route("/internal/discord/recover", post(discord_recover))
         .route("/api/account/recover", post(reset_password));
     let app = app
+        .route("/dev/testing", post(testing::command))
         .route("/dev/join", post(bot_create))
         .route("/dev/action", post(bot_action))
         .route("/dev/trade", post(bot_trade))

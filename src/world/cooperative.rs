@@ -171,6 +171,15 @@ impl World {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let combat = self.entities.iter().any(|(enemy_id, enemy)| {
+            enemy.hp > 0
+                && self.content.objects[&enemy.kind].enemy
+                && healing.iter().any(|(target, amount)| {
+                    *amount > 0
+                        && self.players[target].known.contains(enemy_id)
+                        && self.players[target].pos.distance(enemy.pos) <= 15.
+                })
+        });
         let p = self.players.get_mut(&id).unwrap();
         p.character.mp -= item.mana_cost;
         p.last_ability = self.now;
@@ -209,6 +218,10 @@ impl World {
         }
         tracing::info!(
             player = id,
+            character = self.players[&id].character.id,
+            world = %self.name,
+            time_ms = self.now,
+            combat,
             item = item.kind,
             mana = item.mana_cost,
             range = item.heal_range,
