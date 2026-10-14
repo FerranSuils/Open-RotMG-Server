@@ -94,6 +94,18 @@ async fn main() -> Result<()> {
         requests: Arc::default(),
         connections: Arc::new(tokio::sync::Semaphore::new(config.max_players * 2)),
         control,
+        discord_link_token: match std::env::var("DISCORD_LINK_TOKEN_FILE") {
+            Ok(path) => {
+                let token = std::fs::read_to_string(path)?;
+                ensure!(
+                    token.trim().len() == 64 && token.trim().bytes().all(|b| b.is_ascii_hexdigit()),
+                    "invalid Discord link API credential"
+                );
+                Some(token.trim().to_string())
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(error.into()),
+        },
         owners: Arc::default(),
         bots: Arc::default(),
         quarantined: Arc::default(),

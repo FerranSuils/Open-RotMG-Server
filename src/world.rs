@@ -16,7 +16,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 mod chat;
-pub(crate) use chat::chat_error;
+pub(crate) use chat::{chat_error, chat_private};
 #[cfg(test)]
 mod bot_tests;
 mod trade;
@@ -50,6 +50,8 @@ pub struct Entity {
     pub size: i32,
     pub condition: i32,
     pub items: Vec<i32>,
+    #[serde(skip)]
+    drop_slots: BTreeSet<usize>,
     pub extra_stats: Vec<(u8, i32)>,
     pub reserved: bool,
     published: bool,
@@ -161,6 +163,8 @@ pub struct InventoryPlan {
     pub mana: i32,
     pub vault: Option<Vault>,
     pub dropped: Option<i32>,
+    pub collected: Option<u16>,
+    loot_slot: Option<(i32, usize)>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -249,6 +253,18 @@ pub struct Directory {
     max_players: usize,
 }
 impl Directory {
+    pub fn competitive_characters(&self) -> Vec<Character> {
+        self.worlds
+            .values()
+            .flat_map(|w| w.players.values())
+            .filter(|p| {
+                p.controller == Controller::Human
+                    && !p.death_pending
+                    && p.persistence_failure.is_none()
+            })
+            .map(|p| p.character.clone())
+            .collect()
+    }
     pub fn health(&self, started: Instant) -> serde_json::Value {
         let players: usize = self.worlds.values().map(|w| w.players.len()).sum();
         let qa_actors: usize = self
@@ -755,6 +771,7 @@ impl World {
                         size: 100,
                         condition: 0,
                         items: o.equipment.clone(),
+                        drop_slots: BTreeSet::new(),
                         extra_stats: if o.class == "Portal" {
                             vec![(37, 1)]
                         } else {
@@ -894,6 +911,7 @@ impl World {
                 size: 100,
                 condition: 0,
                 items,
+                drop_slots: BTreeSet::new(),
                 extra_stats,
                 reserved: false,
                 published: true,
@@ -1517,6 +1535,8 @@ impl World {
             mana: 0,
             vault: None,
             dropped: None,
+            collected: None,
+            loot_slot: None,
         }
     }
     pub fn drop_item(&mut self, id: i32, slot: Slot) -> Result<InventoryPlan> {
@@ -1571,6 +1591,9 @@ impl World {
             let mut vault = vault.clone();
             vault.items = items.clone();
             plan.vault = Some(vault);
+        }
+        if slot.object != id {
+            plan.loot_slot = Some((slot.object, slot.slot));
         }
         plan.dropped = Some(dropped);
         Ok(plan)
@@ -1656,6 +1679,17 @@ impl World {
         }
         self.players.get_mut(&id).unwrap().pending = true;
         let mut plan = self.plan(id, items, bag_id.map(|b| (b, bag)), 0);
+        if let Some(container) = bag_id {
+            let source = if from.object == container { &from } else { &to };
+            plan.loot_slot = Some((container, source.slot));
+            if source.kind >= 0
+                && self.entities[&container].drop_slots.contains(&source.slot)
+                && self.players[&id].controller == Controller::Human
+                && self.content.get(source.kind as u16)?.class == "Equipment"
+            {
+                plan.collected = Some(source.kind as u16);
+            }
+        }
         if let (Some((container, vault)), Some((bag, items))) = (&self.vault, &plan.bag)
             && container == bag
         {
@@ -1695,6 +1729,13 @@ impl World {
                 .get_mut(id)
                 .context("reserved bag disappeared")?
                 .reserved = false;
+        }
+        if let Some((bag, slot)) = plan.loot_slot {
+            self.entities
+                .get_mut(&bag)
+                .context("reserved drop source disappeared")?
+                .drop_slots
+                .remove(&slot);
         }
         let mut o = Writer::new();
         match result {
@@ -2096,7 +2137,9 @@ impl World {
             }
         }
         for (owner, items) in drops {
-            self.loot_bag(defeated.pos, (owner >= 0).then_some(owner), items)?;
+            let slots = (0..items.len()).collect();
+            let bag = self.loot_bag(defeated.pos, (owner >= 0).then_some(owner), items)?;
+            self.entities.get_mut(&bag).unwrap().drop_slots = slots;
         }
         Ok(())
     }
@@ -3655,6 +3698,86 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn only_human_enemy_drop_pickups_stage_collection_and_player_drops_never_do() {
+        for controller in [Controller::Human, Controller::Qa, Controller::Autonomous] {
+            let (mut w, id, enemy) = encounter(0x683);
+            w.players.get_mut(&id).unwrap().controller = controller;
+            w.rng = rand::rngs::StdRng::seed_from_u64(5);
+            let mut defeated = w.remove_entity(enemy);
+            defeated.damage.insert(w.players[&id].character.id, 100);
+            for _ in 0..32 {
+                w.drop_loot(&defeated).unwrap();
+                if w.entities.values().any(|e| !e.drop_slots.is_empty()) {
+                    break;
+                }
+            }
+            let bag = w
+                .entities
+                .values()
+                .find(|e| !e.drop_slots.is_empty())
+                .unwrap()
+                .clone();
+            let slot = *bag.drop_slots.first().unwrap();
+            let kind = bag.items[slot];
+            w.players.get_mut(&id).unwrap().pos = bag.pos;
+            let plan = w
+                .swap(
+                    id,
+                    Slot {
+                        object: bag.id,
+                        slot,
+                        kind,
+                    },
+                    Slot {
+                        object: id,
+                        slot: 11,
+                        kind: -1,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                plan.collected,
+                if controller == Controller::Human {
+                    Some(kind as u16)
+                } else {
+                    None
+                }
+            );
+            assert!(w.entities[&bag.id].drop_slots.contains(&slot));
+            w.finish_inventory(plan, Ok(1)).unwrap();
+            assert!(!w.entities[&bag.id].drop_slots.contains(&slot));
+            let plan = w
+                .drop_item(
+                    id,
+                    Slot {
+                        object: id,
+                        slot: 11,
+                        kind,
+                    },
+                )
+                .unwrap();
+            let dropped = plan.dropped.unwrap();
+            assert_eq!(plan.collected, None);
+            w.finish_inventory(plan, Ok(2)).unwrap();
+            let plan = w
+                .swap(
+                    id,
+                    Slot {
+                        object: dropped,
+                        slot: 0,
+                        kind,
+                    },
+                    Slot {
+                        object: id,
+                        slot: 11,
+                        kind: -1,
+                    },
+                )
+                .unwrap();
+            assert_eq!(plan.collected, None);
+        }
     }
     #[test]
     fn dungeon_clear_counter_is_staged_until_progress_commit() {

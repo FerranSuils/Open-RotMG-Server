@@ -48,6 +48,8 @@ impl App {
     }
 }
 use tokio::sync::mpsc;
+mod hiscores;
+use hiscores::{collection, discord_link, hiscores};
 #[derive(Clone)]
 pub struct App {
     pub started: std::time::Instant,
@@ -64,6 +66,7 @@ pub struct App {
     pub requests: Arc<Mutex<HashMap<IpAddr, (std::time::Instant, u32)>>>,
     pub connections: Arc<tokio::sync::Semaphore>,
     pub control: Option<String>,
+    pub discord_link_token: Option<String>,
     pub owners: Arc<Mutex<BTreeSet<i32>>>,
     pub bots: Arc<Mutex<BTreeMap<i32, Owner>>>,
     pub quarantined: Arc<Mutex<Vec<Owner>>>,
@@ -335,7 +338,7 @@ fn slot(r: &mut Reader<'_>) -> Result<Slot> {
 pub(crate) async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
     let result = a
         .store
-        .exchange(
+        .exchange_collected(
             vec![InventoryWrite {
                 id: plan.character,
                 account: plan.account,
@@ -343,6 +346,7 @@ pub(crate) async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
                 items: plan.items.clone(),
             }],
             plan.vault.clone(),
+            plan.collected,
         )
         .await
         .and_then(|mut revisions| {
@@ -460,6 +464,7 @@ async fn handle(
             r.done()?;
             let id = a.store.authenticate(guid, password).await?;
             *account = Some(a.claim(id)?);
+            a.store.compete(id).await?;
             let (destination, character) = a
                 .world
                 .directory(move |d| {
@@ -573,7 +578,20 @@ async fn handle(
             let text = player_text(&mut r)?;
             let id = player.context("chat before character")?;
             let received = std::time::Instant::now();
-            if let Err(error) = a.world.directory(move |d| d.chat(id, text, received)).await {
+            if text.trim() == "/discord" {
+                let result = async {
+                    ensure!(a.discord_link_token.is_some(), "Discord linking is not configured");
+                    let owner = account.as_ref().context("authenticated session required")?.id;
+                    let code = a.store.issue_discord_code(owner).await?;
+                    Ok::<_, anyhow::Error>(format!("Use /link code:{code} with the official Discord bot within five minutes. This makes your Discord identity visible on hiscores. Keep this code private."))
+                }.await;
+                let reply = match result {
+                    Ok(text) => text,
+                    Err(error) => error.to_string(),
+                };
+                tx.send(crate::world::chat_private(&reply)).await?;
+            } else if let Err(error) = a.world.directory(move |d| d.chat(id, text, received)).await
+            {
                 tracing::warn!(player=id, error=%error, "local chat rejected");
                 tx.send(crate::world::chat_error(&error.to_string()))
                     .await?;
@@ -1154,7 +1172,10 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
         .nest_service("/sfx", tower_http::services::ServeDir::new(a.sfx.clone()))
         .route("/client.swf", get(swf))
         .route("/game", get(websocket))
-        .route("/health", get(health));
+        .route("/health", get(health))
+        .route("/api/hiscores", get(hiscores))
+        .route("/api/collection/{account}", get(collection))
+        .route("/internal/discord/link", post(discord_link));
     let app = app
         .route("/dev/join", post(bot_create))
         .route("/dev/action", post(bot_action))

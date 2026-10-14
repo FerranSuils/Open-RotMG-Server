@@ -5,6 +5,8 @@ After=network.target
 [Service]
 User=openrotmg
 Group=openrotmg
+LoadCredential=discord-link-token:/etc/openrotmg/discord-link-token
+Environment=DISCORD_LINK_TOKEN_FILE=%d/discord-link-token
 ExecStart=/opt/openrotmg/server/openrotmg --config /etc/openrotmg/config.json
 Restart=on-failure
 RestartSec=5

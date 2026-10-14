@@ -20,4 +20,6 @@ For hosting, build with `cargo build --release --locked` and run `openrotmg --co
 
 Native registration converts a guest without changing account ownership; subsequent login uses email/password rather than the guest GUID. SQLite stores Argon2id verifiers. Registered accounts can choose one free, unique 3–10-letter name through the original client; name changes after that, email verification and password recovery are not implemented.
 
+Hiscores, drop-collection provenance and the private `/discord` → Discord `/link` flow are described in `docs/hiscores.md`. `/kick` and `/recover` remain disabled.
+
 Independent credential-free backup and offline restore instructions are in `scripts/backups/OPERATIONS.md`.
