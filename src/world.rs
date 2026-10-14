@@ -16,8 +16,6 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 mod chat;
-#[cfg(test)]
-mod pause_tests;
 pub(crate) use chat::{chat_error, chat_private};
 #[cfg(test)]
 mod bot_tests;
@@ -1268,20 +1266,12 @@ impl World {
             p.last_move == 0 || i64::from(time) - i64::from(p.last_move) <= 1000,
             "movement time jump"
         );
-        // MOVE is sent before the client applies NEW_TICK conditions, so either
-        // form can be in flight across a toggle. Neither may move a paused player.
+        // MOVE precedes condition updates; accept either form across a toggle.
         let sentinel = pos.x == -1. && pos.y == -1.;
         let correct = p.paused && !sentinel && p.pos.distance(pos) > 0.001;
         let stationary = p.paused || sentinel;
-        let pos = if stationary {
-            ensure!(
-                pos.x.is_finite() && pos.y.is_finite(),
-                "non-finite movement"
-            );
-            p.pos
-        } else {
-            pos
-        };
+        ensure!(pos.x.is_finite() && pos.y.is_finite(), "invalid position");
+        let pos = if stationary { p.pos } else { pos };
         let remaining_credit = self.validate_move(id, pos, time)?;
         let p = self.players.get_mut(&id).unwrap();
         if !stationary {

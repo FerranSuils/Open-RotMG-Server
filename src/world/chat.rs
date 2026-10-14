@@ -41,6 +41,10 @@ fn validate(text: &str) -> Result<()> {
                 || matches!(c, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')),
         "Chat message contains control characters."
     );
+    ensure!(
+        !text.trim_start().starts_with('/') || text.trim().eq_ignore_ascii_case("/pause"),
+        "Unknown chat command."
+    );
     Ok(())
 }
 
@@ -58,37 +62,21 @@ impl Directory {
             "Dead, departing or quarantined players cannot chat."
         );
         if text.trim().eq_ignore_ascii_case("/pause") {
-            let paused = !sender.paused;
-            if paused {
-                // Historical reference-server policy; see docs/pause.md.
-                ensure!(
-                    !world.entities.values().any(|e| e.hp > 0
+            ensure!(
+                sender.paused
+                    || !world.entities.values().any(|e| e.hp > 0
                         && world.content.objects[&e.kind].enemy
                         && sender.pos.distance(e.pos) <= 8.),
-                    "Not safe enough to pause!"
-                );
-            }
-            let p = world.players.get_mut(&id).unwrap();
-            p.paused = paused;
-            p.last_move_at = world.now;
-            let reply = text_packet(
-                "",
-                -1,
-                0,
-                if paused {
-                    "Game paused."
-                } else {
-                    "Game resumed."
-                },
+                "Not safe enough to pause!"
             );
+            let p = world.players.get_mut(&id).unwrap();
+            p.paused = !p.paused;
+            p.last_move_at = world.now;
+            let text = format!("Game {}.", if p.paused { "paused" } else { "resumed" });
+            let reply = text_packet("", -1, 0, &text);
             send(p, reply.id, reply.body);
-            tracing::info!(player = id, paused, "player pause changed");
             return Ok(());
         }
-        ensure!(
-            !text.trim_start().starts_with('/'),
-            "Unknown chat command. Use /pause to pause or resume."
-        );
         let account = sender.character.account;
         let packet = text_packet(&sender.character.name, id, 5, &text);
         // Account budgets survive world transfers and reconnects without touching durable game saves.
