@@ -18,7 +18,7 @@ impl World {
         for e in self
             .entities
             .values_mut()
-            .filter(|e| e.parent == Some(parent) && e.kind == wave.kind)
+            .filter(|e| e.parent == Some(parent) && e.kind == wave.kind && e.expires.is_none())
         {
             e.expires = Some(self.now + wave.lifetime);
             e.activated.get_or_insert(self.now);
@@ -304,6 +304,49 @@ mod tests {
         let id = w.enter(ch, None).unwrap();
         w.players.get_mut(&id).unwrap().pos = pos;
         id
+    }
+    #[test]
+    fn replenishing_boss_waves_never_refresh_existing_child_lifetimes() {
+        let d = super::super::tests::directory();
+        let mut w = d
+            .make(finale::CHAMBER, "Oryx's Chamber", false, None)
+            .unwrap();
+        let boss = w.entities.values().find(|e| e.kind == ORYX).unwrap().id;
+        let wave = finale::Wave {
+            kind: 0x1749,
+            count: 5,
+            radius: 3.,
+            lifetime: 60_000,
+        };
+        w.finale_wave(boss, wave).unwrap();
+        let initial: BTreeMap<_, _> = w
+            .entities
+            .values()
+            .filter(|e| e.parent == Some(boss))
+            .map(|e| (e.id, e.expires.unwrap()))
+            .collect();
+        assert_eq!(initial.len(), 5);
+        w.now = 1500;
+        w.finale_wave(boss, wave).unwrap();
+        for (id, deadline) in &initial {
+            assert_eq!(w.entities[id].expires, Some(*deadline));
+        }
+        let defeated = *initial.keys().next().unwrap();
+        kill(&mut w, defeated);
+        w.finale_wave(boss, wave).unwrap();
+        let replacement = w
+            .entities
+            .values()
+            .find(|e| e.parent == Some(boss) && !initial.contains_key(&e.id))
+            .unwrap();
+        assert_eq!(replacement.expires, Some(61_500));
+        assert_eq!(
+            w.entities
+                .values()
+                .filter(|e| e.parent == Some(boss))
+                .count(),
+            5
+        );
     }
     #[test]
     fn oryx_minion_wanders_and_fires_both_xml_volleys_only_at_close_range() {
