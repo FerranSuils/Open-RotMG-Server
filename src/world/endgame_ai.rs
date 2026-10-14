@@ -473,6 +473,71 @@ mod tests {
         assert_eq!(w.entities.values().filter(|e| e.kind == 0x712).count(), 1);
     }
     #[test]
+    fn oryx_dance_preserves_all_ring_shots_without_overflowing_native_output() {
+        let d = super::super::tests::directory();
+        let mut w = d
+            .make(finale::CHAMBER, "Oryx's Chamber", false, None)
+            .unwrap();
+        let boss = w.entities.values().find(|e| e.kind == ORYX).unwrap().id;
+        let pos = w.entities[&boss].pos;
+        let id = player(&mut w, pos);
+        w.npc_step();
+        w.now = 20_000;
+        w.npc_step();
+        let fields: BTreeSet<_> = w
+            .entities
+            .values()
+            .filter(|e| e.kind == 0x1748)
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(fields.len(), 15);
+        let (packets, mut rx) = mpsc::channel(64);
+        let (lost, notice) = watch::channel(false);
+        let p = w.players.get_mut(&id).unwrap();
+        p.known = w.entities.keys().copied().collect();
+        p.tx = Some(Output { packets, lost });
+        w.apply_condition(id, condition::INVULNERABLE, 1000)
+            .unwrap();
+        w.step();
+        assert!(
+            !*notice.borrow(),
+            "one legitimate Dance tick exhausted native output"
+        );
+        let mut delivered = 0;
+        while let Ok(packet) = rx.try_recv() {
+            if packet.id != 19 {
+                continue;
+            }
+            let mut r = wire::Reader::new(&packet.body);
+            r.u8().unwrap();
+            let owner = r.i32().unwrap();
+            r.u8().unwrap();
+            r.f32().unwrap();
+            r.f32().unwrap();
+            r.f32().unwrap();
+            r.i16().unwrap();
+            let count = if packet.body.len() > 20 {
+                let count = r.u8().unwrap();
+                r.f32().unwrap();
+                count
+            } else {
+                1
+            };
+            r.done().unwrap();
+            if fields.contains(&owner) {
+                delivered += usize::from(count);
+            }
+        }
+        assert_eq!(delivered, 15 * 12);
+        assert_eq!(
+            w.bullets
+                .iter()
+                .filter(|b| fields.contains(&b.owner))
+                .count(),
+            15 * 12
+        );
+    }
+    #[test]
     fn authored_castle_summoners_can_place_each_complete_bounded_family() {
         let d = super::super::tests::directory();
         let mut w = d
