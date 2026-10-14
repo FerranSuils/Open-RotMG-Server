@@ -28,6 +28,30 @@ fn retained_exploration_can_outscore_a_clear_distant_enemy() {
 }
 
 #[test]
+fn strong_tomes_still_protect_low_level_companions() {
+    let c = content();
+    let mut v = view(&c);
+    v.character.class = crate::content::PRIEST;
+    v.character.items[0] = 2564;
+    v.character.items[1] = 2775;
+    v.character.mp = c.get(2775).unwrap().mana_cost;
+    assert!(c.get(2775).unwrap().heal > 100);
+    let mut peer = object(2, WIZARD, 12.5, 11.5);
+    peer.equipped = vec![2711, 2606, -1, -1];
+    peer.max_hp = 100;
+    peer.hp = 60;
+    v.objects.push(peer);
+    assert!(social::healing(&v, &c).unwrap().is_some());
+    v.objects[0].hp = 80;
+    assert!(social::healing(&v, &c).unwrap().is_none());
+    v.objects.clear();
+    v.character.hp = 60;
+    assert!(social::healing(&v, &c).unwrap().is_some());
+    v.character.hp = 80;
+    assert!(social::healing(&v, &c).unwrap().is_none());
+}
+
+#[test]
 fn bounded_waypoint_checks_its_actual_endpoint_not_a_distant_sampling_grid() {
     let mut v = view(&content());
     v.position = Pos {

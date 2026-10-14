@@ -123,8 +123,9 @@ INSERT INTO account_lists VALUES(1,0,2),(1,1,2),(2,0,1),(1,0,3);''')
     def test_social_native_count_limit_applies_per_owner_and_list(self):
         self.add_social()
         before = self.export()
-        before['game']['accounts'] += [{'id': i, 'name': f'Player{i}'} for i in range(5, 32770)]
-        before['game']['account_fame'] += [{'account': i, 'balance': 0, 'earned': 0} for i in range(5, 32770)]
+        next_account = max(row['id'] for row in before['game']['accounts']) + 1
+        before['game']['accounts'] += [{'id': i, 'name': f'Player{i}'} for i in range(next_account, 32770)]
+        before['game']['account_fame'] += [{'account': i, 'balance': 0, 'earned': 0} for i in range(next_account, 32770)]
         before['game']['account_lists'] = [{'account': 1, 'list_id': list_id, 'target': i} for list_id in (0, 1) for i in range(2, 32769)] + [{'account': 2, 'list_id': 0, 'target': 1}]
         backup.validate(before)
         before['game']['account_lists'].append({'account': 1, 'list_id': 0, 'target': 32769})

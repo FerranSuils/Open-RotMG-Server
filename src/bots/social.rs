@@ -27,11 +27,11 @@ pub(super) fn healing(v: &PlayerView, content: &Content) -> Result<Option<Action
         return Ok(None);
     }
     let own_need = v.character.stats[0] - v.character.hp;
-    let needs_healing = own_need >= (tome.heal as f32 * 0.35) as i32
+    let needs_healing = own_need >= (tome.heal.min(v.character.stats[0]) as f32 * 0.35) as i32
         || v.objects.iter().any(|o| {
             !o.equipped.is_empty()
                 && o.hp > 0
-                && o.max_hp - o.hp >= (tome.heal as f32 * 0.35) as i32
+                && o.max_hp - o.hp >= (tome.heal.min(o.max_hp) as f32 * 0.35) as i32
                 && v.position.distance(o.position) <= tome.heal_range
         });
     Ok(needs_healing.then_some(Action::Use {
