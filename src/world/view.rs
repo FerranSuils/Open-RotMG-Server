@@ -37,6 +37,7 @@ pub struct OwnCharacter {
     pub stats: [i32; 8],
     pub items: Vec<i32>,
     pub inventory_revision: i32,
+    pub condition_mask: i32,
 }
 #[derive(Serialize)]
 pub struct Lifecycle {
@@ -182,6 +183,7 @@ impl Directory {
                 stats: p.character.effective(&w.content)?,
                 items: p.character.items.clone(),
                 inventory_revision: p.character.revision,
+                condition_mask: p.conditions(w.now),
             },
             lifecycle: Lifecycle {
                 alive: p.character.alive,

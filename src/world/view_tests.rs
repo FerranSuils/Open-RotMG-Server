@@ -55,6 +55,70 @@ fn restricted_view_excludes_private_inventory_ai_and_undiscovered_collision() {
     }
 }
 #[test]
+fn own_condition_view_matches_native_stat29_without_exposing_other_statuses() {
+    let mut d = super::tests::directory();
+    let (a, _ar) = receive(&mut d, -2, 1, WIZARD);
+    let (b, _br) = receive(&mut d, -2, 2, WIZARD);
+    let effects = [
+        crate::condition::SLOWED,
+        crate::condition::SICK,
+        crate::condition::QUIET,
+    ];
+    let w = d.worlds.get_mut(&-2).unwrap();
+    for effect in effects {
+        w.apply_condition(a, effect, 2000).unwrap();
+    }
+    w.apply_condition(b, crate::condition::STUNNED, 5000)
+        .unwrap();
+    w.updates(a, false).unwrap();
+    for now in [0, 1000, 2000] {
+        let w = d.worlds.get_mut(&-2).unwrap();
+        w.now = now;
+        let before = w.players[&a].statuses.clone();
+        let bytes = w.stats(a).unwrap();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.i32().unwrap(), a);
+        r.f32().unwrap();
+        r.f32().unwrap();
+        let count = r.i16().unwrap();
+        let mut mask = None;
+        for _ in 0..count {
+            let kind = r.u8().unwrap();
+            if matches!(kind, 31 | 62) {
+                r.utf().unwrap();
+            } else {
+                let value = r.i32().unwrap();
+                if kind == 29 {
+                    mask = Some(value);
+                }
+            }
+        }
+        r.done().unwrap();
+        let view = d.player_view(a).unwrap();
+        assert_eq!(Some(view.character.condition_mask), mask);
+        assert_eq!(
+            view.character.condition_mask,
+            if now < 2000 {
+                effects
+                    .into_iter()
+                    .map(crate::condition::bit)
+                    .fold(0, |a, b| a | b)
+            } else {
+                0
+            }
+        );
+        let json = serde_json::to_value(view).unwrap();
+        assert!(
+            json["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|o| o.get("condition_mask").is_none())
+        );
+        assert_eq!(d.worlds[&-2].players[&a].statuses, before);
+    }
+}
+#[test]
 fn projectile_view_is_observed_trajectory_not_rng_hit_ledger_or_old_shots() {
     let mut d = super::tests::directory();
     let (a, _ar) = receive(&mut d, -2, 1, WIZARD);
