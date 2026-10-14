@@ -105,6 +105,11 @@ pub enum Controller {
     Qa,
     Autonomous,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttackSuppression {
+    ReceiveBudget,
+    EffectiveCooldown,
+}
 pub struct Player {
     pub character: Character,
     pub pos: Pos,
@@ -139,7 +144,7 @@ pub struct Player {
     last_attack_at: u64,
     attack_credit: f32,
     attack_count: i32,
-    attack_suppressed: bool,
+    attack_suppressed: Option<AttackSuppression>,
     last_move: i32,
     last_move_at: u64,
     goto_acks: VecDeque<(bool, Instant)>,
@@ -1160,7 +1165,7 @@ impl World {
                 last_attack_at: 0,
                 attack_credit: 1000.,
                 attack_count: 0,
-                attack_suppressed: false,
+                attack_suppressed: None,
                 last_move: 0,
                 last_move_at: self.now,
                 goto_acks: VecDeque::new(),
@@ -1665,9 +1670,9 @@ impl World {
         if self.discard_correcting_shot(id, time, bullet, kind, start, angle)? {
             return Ok(NativeInput::DiscardedUntilGotoAck);
         }
-        self.shoot_timed(id, (time, received, true), bullet, kind, start, angle)?;
+        let outcome = self.shoot_timed(id, (time, received, true), bullet, kind, start, angle)?;
         self.players.get_mut(&id).unwrap().discarded_attack = None;
-        Ok(NativeInput::Applied)
+        Ok(outcome)
     }
     // Fixture tests drive fixed ticks without sleeping, so script shots use simulation time.
     pub fn shoot(
@@ -1680,6 +1685,7 @@ impl World {
         angle: f32,
     ) -> Result<()> {
         self.shoot_timed(id, (time, self.now, false), bullet, kind, start, angle)
+            .map(|_| ())
     }
     fn shoot_timed(
         &mut self,
@@ -1689,7 +1695,7 @@ impl World {
         kind: u16,
         start: Pos,
         angle: f32,
-    ) -> Result<()> {
+    ) -> Result<NativeInput> {
         ensure!(angle.is_finite(), "invalid shot angle");
         ensure!(
             start.x.is_finite() && start.y.is_finite(),
@@ -1762,20 +1768,39 @@ impl World {
                 .checked_sub(p.last_attack_at)
                 .context("attack receive clock regressed")?;
             let credit = (p.attack_credit + elapsed as f32).min(cooldown * 2.);
+            let unfunded = credit < admission - 50.;
             ensure!(
-                credit >= admission - 50.,
+                native || !unfunded,
                 RejectedNativeShot(format!(
                     "attack exceeds server time budget: credit={credit} cooldown={cooldown} received_time={received} simulation_time={} last_received_time={} shot_time={time} last_shot_time={}",
                     self.now, p.last_attack_at, p.last_attack
                 ))
             );
-            // Reconcile pre-Dazed packets without firing or desynchronizing the native counter/RNG.
-            p.attack_suppressed = attack_elapsed < cooldown as i64 - 2 || credit < cooldown - 50.;
+            p.attack_suppressed = if unfunded {
+                tracing::warn!(
+                    player = id,
+                    credit,
+                    admission,
+                    cooldown,
+                    received_time = received,
+                    simulation_time = self.now,
+                    last_received_time = p.last_attack_at,
+                    shot_time = time,
+                    last_shot_time = p.last_attack,
+                    "native volley denied: attack exceeds server time budget"
+                );
+                Some(AttackSuppression::ReceiveBudget)
+            } else if attack_elapsed < cooldown as i64 - 2 || credit < cooldown - 50. {
+                Some(AttackSuppression::EffectiveCooldown)
+            } else {
+                None
+            };
+            // Denial accrues actual elapsed once but cannot debit or authorize an unfunded attack.
             p.attack_credit = credit
-                - if p.attack_suppressed {
-                    normal_cooldown
-                } else {
-                    cooldown
+                - match p.attack_suppressed {
+                    Some(AttackSuppression::ReceiveBudget) => 0.,
+                    Some(AttackSuppression::EffectiveCooldown) => normal_cooldown,
+                    None => cooldown,
                 };
             p.last_attack_at = received;
             p.last_attack = time;
@@ -1785,15 +1810,21 @@ impl World {
         p.attack_count += 1;
         let draw = p.roll_damage(&spec);
         // In-flight native SHOOT packets must still consume their counter/RNG draw.
-        if p.paused || condition & STUNNED != 0 || displaced || p.attack_suppressed {
+        if p.paused || condition & STUNNED != 0 || displaced || p.attack_suppressed.is_some() {
             tracing::debug!(
                 player = id,
                 condition,
                 displaced,
-                suppressed = p.attack_suppressed,
+                suppressed = ?p.attack_suppressed,
                 "condition suppressed shot"
             );
-            return Ok(());
+            return Ok(
+                if p.attack_suppressed == Some(AttackSuppression::ReceiveBudget) {
+                    NativeInput::DeniedAttackBudget
+                } else {
+                    NativeInput::Applied
+                },
+            );
         }
         p.character.shots += 1;
         let multiplier = if condition & crate::condition::bit(crate::condition::WEAK) != 0 {
@@ -1823,7 +1854,7 @@ impl World {
             }
         }
         tracing::debug!(player = id, bullet, damage, "player shot");
-        Ok(())
+        Ok(NativeInput::Applied)
     }
     pub fn use_item(&mut self, id: i32, slot: Slot, pos: Pos) -> Result<Option<InventoryPlan>> {
         self.cancel_trade(id, "Trade cancelled by inventory mutation.");
@@ -5073,26 +5104,37 @@ mod tests {
         p.last_attack_at = 1000;
         p.attack_credit = 0.;
         w.now = 1200;
-        assert!(
+        assert_eq!(
             w.shoot_timed(player, (1298, 1200, true), 1, 0xa97, start, 0.)
-                .is_err()
+                .unwrap(),
+            NativeInput::DeniedAttackBudget
         );
+        assert_eq!(
+            w.shoot_timed(player, (1298, 1298, true), 2, 0xa97, start, 0.)
+                .unwrap(),
+            NativeInput::DeniedAttackBudget
+        );
+        assert_eq!(w.players[&player].attack_credit, 200.);
+        assert_eq!(w.players[&player].last_attack_at, 1200);
         w.attack_epoch = Instant::now() - std::time::Duration::from_millis(1298);
-        w.native_shoot(player, 1298, 1, 0xa97, start, 0.).unwrap();
-        w.native_shoot(player, 1298, 2, 0xa97, start, 0.).unwrap();
+        for bullet in [3, 4] {
+            w.native_shoot(player, 1596, bullet, 0xa97, start, 0.)
+                .unwrap();
+        }
         assert_eq!(w.players[&player].character.shots, 2);
         w.now = 9000;
         let p = w.players.get_mut(&player).unwrap();
         p.last_attack_at = 1298;
         p.attack_credit = 0.;
-        assert!(
-            w.shoot_timed(player, (1596, 1400, true), 3, 0xa97, start, 0.)
-                .unwrap_err()
-                .to_string()
-                .contains("attack exceeds server time budget")
+        assert_eq!(
+            w.shoot_timed(player, (1894, 1400, true), 5, 0xa97, start, 0.)
+                .unwrap(),
+            NativeInput::DeniedAttackBudget
         );
+        assert_eq!(w.players[&player].attack_credit, 102.);
+        assert_eq!(w.players[&player].last_attack_at, 1400);
         assert!(
-            w.shoot_timed(player, (1596, 1200, true), 3, 0xa97, start, 0.)
+            w.shoot_timed(player, (2192, 1200, true), 6, 0xa97, start, 0.)
                 .unwrap_err()
                 .to_string()
                 .contains("attack receive clock regressed")

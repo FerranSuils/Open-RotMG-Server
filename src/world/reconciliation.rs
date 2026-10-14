@@ -8,6 +8,7 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum NativeInput {
     Applied,
     DiscardedUntilGotoAck,
+    DeniedAttackBudget,
 }
 
 #[derive(Debug)]
