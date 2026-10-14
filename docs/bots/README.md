@@ -12,7 +12,7 @@ Wizards predict visible projectile paths, lead an observed target, kite within w
 
 The flag remains default-off and separate from QA control. Reserve at least seven slots for six bots and a human. Living saves resume unchanged. After committed permanent death, a fresh character receives normal starter gear; Bayleaf/Juniper choose Priest only if that same account earned its Wizard-level-five unlock. Dead inventory is never inherited. Trade negotiation and language services remain outside this slice.
 
-Current-main qualification and the demo/PR remain unfinished. Earlier endgame-backed campaigns verified earned Priests, peer healing, legal reunions, cave trips and permanent-death/restart continuity, not current-main readiness. This branch does not require unfinished endgame. Prepared fixtures prove mechanics, not earned journeys or historical fidelity.
+Main-based campaigns verify separate crews and a whole-crew Cave clear/ordinary return. Earlier campaigns earned both Priests, received peer healing and preserved permanent-death/restart continuity. Native footage shows combat, healing and recovery. Fixtures and one paired combat run do not establish causal survival/accuracy superiority or historical fidelity.
 
 ## Approved north star
 
