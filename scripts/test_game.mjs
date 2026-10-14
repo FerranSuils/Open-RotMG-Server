@@ -37,6 +37,7 @@ async function fixture(t) {
       constructor(){queueMicrotask(()=>this.onopen());}
       send(raw){const row=JSON.parse(raw);appendFileSync(process.env.FIXTURE_LOG,JSON.stringify(row)+'\\n');
         let value=true,error;
+        if(row.method==='Runtime.evaluate'&&row.params.expression.endsWith(')(null)'))value={initialized:false,paused:true,clock_ms:100};
         if(row.method==='Runtime.evaluate'&&row.params.expression.includes('getBoundingClientRect'))value={x:0,y:0,width:800,height:600,viewportWidth:800,viewportHeight:600};
         if(process.env.FIXTURE_FAULT==='input'&&row.method==='Input.dispatchKeyEvent'&&row.params.type==='keyDown')error={message:'fixture keydown failure'};
         if(process.env.FIXTURE_FAULT==='pause'&&row.method==='Runtime.evaluate'&&row.params.expression.endsWith(')(true)'))error={message:'fixture native pause failure'};

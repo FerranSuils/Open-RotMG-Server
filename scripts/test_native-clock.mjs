@@ -4,18 +4,21 @@ import vm from 'node:vm';
 import {nativeClock} from './native-clock.mjs';
 
 function fixture(playing=true) {
-  let wall=100;
+  let wall=100, frame;
   class WallDate extends Date {static now(){return 1000000+wall;}}
   const api={isPlaying:playing,suspend(){this.isPlaying=false;},resume(){this.isPlaying=true;}};
-  const context=vm.createContext({Date:WallDate,performance:{now:()=>wall},document:{querySelector:()=>({ruffle:()=>api})}});
+  const context=vm.createContext({Date:WallDate,performance:{now:()=>wall},requestAnimationFrame:callback=>{frame=callback;return 1;},document:{querySelector:()=>({ruffle:()=>api})}});
   const call=arg=>JSON.parse(JSON.stringify(vm.runInContext(`(${nativeClock.toString()})(${JSON.stringify(arg)})`,context)));
   const clocks=()=>JSON.parse(vm.runInContext('JSON.stringify([performance.now(),Date.now(),new Date().getTime()])',context));
-  return {call,clocks,api,advance:ms=>{wall+=ms;},context};
+  return {call,clocks,api,advance:ms=>{wall+=ms;},frame:()=>frame(wall),context};
 }
 test('twenty seconds paused funds neither performance nor Date clocks on resume',()=>{
   const f=fixture();f.call(null);const before=f.clocks();f.call(true);f.advance(20000);
   const paused=f.clocks();f.call(false);const resumed=f.clocks();f.advance(40);
   assert.deepEqual([before,paused,resumed,f.clocks()],[[100,1000100,1000100],[100,1000100,1000100],[100,1000100,1000100],[140,1000140,1000140]]);
+});
+test('animation callbacks cannot fund paused time after ten minutes without frames',()=>{
+  const f=fixture();f.call(null);vm.runInContext('requestAnimationFrame(t=>globalThis.frameTime=t)',f.context);f.call(true);f.advance(600000);f.call(false);f.frame();assert.equal(vm.runInContext('frameTime',f.context),100);
 });
 test('Date.now preserves integer milliseconds during active page time',()=>{
   const f=fixture();f.call(null);f.advance(0.25);assert.deepEqual(f.clocks(),[100.25,1000100,1000100]);
@@ -34,7 +37,7 @@ test('stopping after an untracked pause cannot silently clear clock invalidation
   const f=fixture(false);for(const op of [null,true])try{f.call(op);}catch{}f.api.resume();assert.throws(()=>f.call(false),/Native clock invalid/);
 });
 test('cleanup suspends out of band playback but still refuses native acceptance',()=>{
-  const f=fixture();f.call(true);f.api.resume();try{f.call(true);}catch{}assert.deepEqual([f.api.isPlaying,vm.runInContext('globalThis[Symbol.for("openrotmg.testing.native-clock.v1")].invalid',f.context)],[false,true]);
+  const f=fixture();f.call(true);f.api.resume();try{f.call(true);}catch{}assert.deepEqual([f.api.isPlaying,vm.runInContext('globalThis[Symbol.for("openrotmg.testing.native-clock.v2")].invalid',f.context)],[false,true]);
 });
 test('explicit Date construction, static methods and callable Date remain compatible',()=>{
   const f=fixture();f.call(null);
