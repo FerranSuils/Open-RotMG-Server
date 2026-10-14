@@ -36,6 +36,7 @@ fn view(content: &Content) -> PlayerView {
             stats: [100, 100, 12, 0, 10, 15, 12, 12],
             items: class.equipment.clone(),
             inventory_revision: 0,
+            condition_mask: 0,
         },
         lifecycle: Lifecycle {
             alive: true,
