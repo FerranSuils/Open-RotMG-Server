@@ -1,6 +1,6 @@
 use crate::{
     content::{Content, DAZED, Map, PARALYZED, Projectile, SLOWED, SPEEDY, STUNNED},
-    store::{Character, Vault},
+    store::{AccountLists, Character, Vault},
     wire::{self, Packet, Writer},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -16,7 +16,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 mod chat;
-pub(crate) use chat::{chat_error, chat_private};
+pub(crate) use chat::{chat_error, chat_info, chat_private, validate as validate_chat};
 #[cfg(test)]
 mod bot_tests;
 mod cooperative;
@@ -87,6 +87,7 @@ pub struct Player {
     pub pos: Pos,
     pub tx: Option<Output>,
     pub departing: bool,
+    account_lists: AccountLists,
     paused: bool,
     conditions: BTreeMap<i32, (u64, u64)>,
     controller: Controller,
@@ -997,6 +998,7 @@ impl World {
                 character: ch,
                 pos: Pos { x, y },
                 departing: false,
+                account_lists: AccountLists::default(),
                 paused: false,
                 conditions: BTreeMap::new(),
                 controller: if tx.is_none() {
