@@ -1820,7 +1820,8 @@ impl World {
                     let bullet = p.server_bullet;
                     p.server_bullet = 128 + (bullet.wrapping_add(1) % 128);
                     let angle = i as f32 * std::f32::consts::TAU / 20.;
-                    let damage = spec.min;
+                    // Server-created abilities must not consume the client's mirrored weapon stream.
+                    let damage = self.rng.gen_range(spec.min..=spec.max);
                     self.bullets.push(Bullet {
                         owner: id,
                         source_kind: p.character.class,
