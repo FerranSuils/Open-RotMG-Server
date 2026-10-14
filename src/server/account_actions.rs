@@ -125,4 +125,4 @@ pub(super) async fn reset_password(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

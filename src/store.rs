@@ -150,6 +150,10 @@ pub struct InventoryWrite {
     pub items: Vec<i32>,
 }
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
+enum Creation {
+    Normal(Vec<(u16, i32)>),
+    Prepared(Option<String>),
+}
 #[derive(Clone)]
 pub struct Store {
     tx: mpsc::Sender<Job>,
@@ -396,13 +400,40 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             matches!(class.kind, WIZARD | PRIEST) && class.class == "Player",
             "playable class is not implemented"
         );
-        let kind = class.kind;
         let requirements = self
             .classes
-            .get(&kind)
+            .get(&class.kind)
             .context("class metadata missing")?
             .requires
             .clone();
+        self.create_character(account, class, Creation::Normal(requirements))
+            .await
+    }
+    pub(crate) async fn create_prepared(
+        &self,
+        account: i32,
+        class: &Object,
+        name: Option<String>,
+    ) -> Result<Character> {
+        tracing::info!(
+            account,
+            class = class.kind,
+            "explicit prepared creation requested; no prerequisite progress granted"
+        );
+        self.create_character(account, class, Creation::Prepared(name))
+            .await
+    }
+    async fn create_character(
+        &self,
+        account: i32,
+        class: &Object,
+        creation: Creation,
+    ) -> Result<Character> {
+        ensure!(
+            matches!(class.kind, WIZARD | PRIEST) && class.class == "Player",
+            "playable class is not implemented"
+        );
+        let kind = class.kind;
         let base = [
             class.hp,
             class.mp,
@@ -418,12 +449,23 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         let items = class.equipment.clone();
         self.call(move |c| {
             let tx = c.transaction()?;
+            let (requirements, prepared_name) = match creation {
+                Creation::Normal(requirements) => (requirements, None),
+                Creation::Prepared(name) => {
+                    let count: i64 = tx.query_row("SELECT count(*) FROM characters WHERE account=?1", [account], |r| r.get(0))?;
+                    ensure!(count == 0, "prepared creation requires a fresh account, not a replacement character");
+                    (Vec::new(), name)
+                }
+            };
             for (required_class, required_level) in requirements {
                 let best: Option<i32> = tx.query_row(
                     "SELECT max(json_extract(stats,\'$.level\')) FROM characters WHERE account=?1 AND json_extract(stats,\'$.class\')=?2",
                     params![account, required_class], |r| r.get(0),
                 )?;
                 ensure!(best.is_some_and(|level| level >= required_level), "class {kind:#x} is locked: requires {required_class:#x} level {required_level}");
+            }
+            if let Some(name) = prepared_name {
+                tx.execute("UPDATE accounts SET name=?1 WHERE id=?2", params![name,account])?;
             }
             let name: String =
                 tx.query_row("SELECT name FROM accounts WHERE id=?1", [account], |r| {
@@ -667,6 +709,48 @@ impl Account {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn prepared_priest_does_not_grant_unlocks_or_replace_a_character() {
+        let content = Content::load(Path::new("data")).unwrap();
+        let store = Store::open(Path::new(":memory:"), &content).unwrap();
+        let account = store.list("prepared-priest-only".into()).await.unwrap();
+        assert!(
+            store
+                .create(account.id, content.get(PRIEST).unwrap())
+                .await
+                .is_err()
+        );
+        let priest = store
+            .create_prepared(
+                account.id,
+                content.get(PRIEST).unwrap(),
+                Some("Juniper".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!((priest.class, priest.name.as_str()), (PRIEST, "Juniper"));
+        assert!(
+            store
+                .create(account.id, content.get(PRIEST).unwrap())
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .create_prepared(account.id, content.get(WIZARD).unwrap(), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .list("prepared-priest-only".into())
+                .await
+                .unwrap()
+                .characters
+                .len(),
+            1
+        );
+    }
     #[tokio::test]
     async fn cooperative_progress_batch_rolls_back_every_stale_participant() {
         let content = Content::load(Path::new("data")).unwrap();
