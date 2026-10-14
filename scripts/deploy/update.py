@@ -113,6 +113,7 @@ def backup_module(stage):
 
 
 def install_backups(stage):
+    require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'ActiveState', '--value'], text=True).strip() == 'inactive', 'Backup already active; retry after it finishes')
     run('runuser', '-u', 'openrotmg', '--', sys.executable, '-B', '-W', 'error::ResourceWarning',
         '-m', 'unittest', 'discover', '-s', str(stage / 'scripts/backups'), '-p', 'test_*.py')
     for name in ['backup.py', 'test_backup.py', 'test_backup_credential.py']:
@@ -164,6 +165,7 @@ def deploy(stage, work, metadata, config):
     install_backups(stage)
     rehearse(stage, work, config)
     require(files(stage) == metadata['manifest'], 'Rehearsal changed release files')
+    require(main_revision() == metadata['revision'], 'Main advanced during rehearsal; no cutover performed')
     run('systemctl', 'stop', 'openrotmg.service')
     require(subprocess.check_output(['systemctl', 'show', 'openrotmg', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Shutdown save failed; no source exchange performed')
     frozen = work / 'cutover'
@@ -186,11 +188,16 @@ def deploy(stage, work, metadata, config):
     require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Post-release GitHub backup failed')
 
 
+def main_revision():
+    revision = subprocess.check_output(['git', 'ls-remote', '--exit-code', REPO + '.git', 'refs/heads/main'], text=True, timeout=30).split()[0]
+    require(re.fullmatch('[0-9a-f]{40}', revision), 'Invalid main revision')
+    return revision
+
+
 def main():
     os.umask(0o077)
     ROOT.mkdir(mode=0o700, exist_ok=True)
-    desired = subprocess.check_output(['git', 'ls-remote', '--exit-code', REPO + '.git', 'refs/heads/main'], text=True, timeout=30).split()[0]
-    require(re.fullmatch('[0-9a-f]{40}', desired), 'Invalid main revision')
+    desired = main_revision()
     if (LIVE / 'REVISION').read_text().strip() == desired:
         ready(int(json.loads(CONFIG.read_text())['bind'].rsplit(':', 1)[1]))
         previous = ROOT / 'status.json'

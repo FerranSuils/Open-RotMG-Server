@@ -94,9 +94,10 @@ class UpdateTest(unittest.TestCase):
             with patch.object(update, 'run'), patch.object(update, 'install_backups'), \
                     patch.object(update, 'rehearse'), patch.object(update, 'files', return_value={}), \
                     patch.object(update.subprocess, 'check_output', return_value='failed'), \
+                    patch.object(update, 'main_revision', return_value='a' * 40), \
                     patch.object(update.ctypes, 'CDLL') as exchange:
                 with self.assertRaisesRegex(RuntimeError, 'Shutdown save failed'):
-                    update.deploy(root, root, {'manifest': {}}, {'state': str(root)})
+                    update.deploy(root, root, {'manifest': {}, 'revision': 'a' * 40}, {'state': str(root)})
                 exchange.assert_not_called()
 
 
