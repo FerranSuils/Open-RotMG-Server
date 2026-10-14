@@ -599,7 +599,9 @@ impl Brain {
         {
             choices.push((70., Goal::Follow(id), position));
         }
-        if let Some(place) = self.hunting
+        // Dungeon encounters do not respawn; revisiting cleared rooms interrupts exploration.
+        if v.map.name == "Realm"
+            && let Some(place) = self.hunting
             && v.time_ms.saturating_sub(self.last_encounter)
                 > (240000. / self.profile.resources) as u64
         {

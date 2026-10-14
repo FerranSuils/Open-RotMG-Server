@@ -986,6 +986,14 @@ fn quiet_exploration_revisits_only_an_actually_observed_hunting_ground() {
     v.time_ms += 200;
     let fresh = Brain::new(PROFILES[1], &v).decide(&v, &content).unwrap();
     assert!(matches!(fresh.goal, Goal::Explore(..)));
+    v.map.name = "Pirate Cave".into();
+    v.tick += 4;
+    v.time_ms += 200;
+    brain.goal = Goal::Revisit(15, 11);
+    assert!(matches!(
+        brain.decide(&v, &content).unwrap().goal,
+        Goal::Explore(..)
+    ));
 }
 
 #[test]
