@@ -1,6 +1,6 @@
 # Gameplay bots: vision and research
 
-The three-Wizard shore prototype is deployed. The selected combat and cooperative Priest-adventuring extension below is an unmerged candidate, not the production population.
+The combat and cooperative adventuring extension is merged and deployed. Priest creation still requires the ordinary unlock and permanent-death rules below.
 
 The two video reports record observations and limits; `research/decision-spike.md` records the earlier offline experiment.
 
@@ -10,7 +10,7 @@ Run `./run.sh 18923 --release`, then enter the Realm normally. Mossy leads Bayle
 
 Wizards predict visible projectile paths, lead an observed target, kite within weapon range, cast equipped spells and commit to recovery. Crews remember recent contacts, explore reachable known terrain, revisit observed Realm hunting grounds and respond to Pirate Cave calls. Visible crewmates regroup through normal teleports; separated crews can arrange a Nexus meeting through public chat. Priests cast equipped tomes for actual nearby injury, MP and accepted cooldowns.
 
-This candidate inherits main's default-on startup; `--no-shore-bots` or explicit `"shore_bots": false` disables it. Reserve seven slots for six bots and a human; QA control remains separate. Living saves resume unchanged. After committed permanent death, a fresh character receives normal starter gear; Bayleaf/Juniper choose Priest only if that same account earned its Wizard-level-five unlock. Dead inventory is never inherited. Trade negotiation and language services remain outside this slice.
+The population runs by default; `--no-shore-bots` or explicit `"shore_bots": false` disables it. Reserve seven slots for six bots and a human; QA control remains separate. Living saves resume unchanged. After committed permanent death, a fresh character receives normal starter gear; Bayleaf/Juniper choose Priest only if that same account earned its Wizard-level-five unlock. Dead inventory is never inherited. Trade negotiation and language services remain outside this slice.
 
 Main-based campaigns verify separate crews and a whole-crew Cave clear/ordinary return. Earlier campaigns earned both Priests, received peer healing and preserved permanent-death/restart continuity. Native footage shows combat, healing and recovery. Fixtures and one paired combat run do not establish causal survival/accuracy superiority or historical fidelity.
 
