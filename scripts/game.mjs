@@ -82,16 +82,17 @@ async function connect(spec) {
     if(r.exceptionDetails) throw new Error(JSON.stringify(r.exceptionDetails));
     return r.result.value;
   };
-  const clock=async paused=>{
-    const status=await evaluate(`(${nativeClock.toString()})(null)`);
-    if(typeof status?.initialized!=='boolean')throw new Error('Native clock returned invalid initialization evidence');
-    if(status.initialized)await evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(true))))');
-    return evaluate(`(${nativeClock.toString()})(${paused})`);
-  };
+  const clock=paused=>evaluate(`(${nativeClock.toString()})(${JSON.stringify(paused)})`);
   return {...spec,call,evaluate,clock,close:()=>ws.close()};
+}
+async function initializeClock(c) {
+  const status=await c.clock(null);
+  if(typeof status?.initialized!=='boolean')throw new Error('Native clock returned invalid initialization evidence');
+  if(status.initialized)await c.evaluate('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(true))))');
 }
 async function pauseAll() {
   const errors=[], confirmed=[];
+  for(const c of clients)try{await initializeClock(c);await c.clock('drain');}catch(e){errors.push(String(e));}
   if(clients.length)try{await api({op:'native_sync',actors:clients.map(c=>c.actor)});}catch(e){errors.push(String(e));}
   for (const c of clients) {
     try {
@@ -106,7 +107,7 @@ async function pauseAll() {
 }
 async function resumeAll() {
   mayProgress=true;
-  for (const c of clients) await c.clock(null);
+  for (const c of clients) await initializeClock(c);
   await api({op:'resume'});
   for (const c of clients) await c.clock(false);
 }
