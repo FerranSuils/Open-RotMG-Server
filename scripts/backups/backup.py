@@ -18,11 +18,13 @@ GAME = {**LEGACY_GAME, 'vaults': ('account', 'items', 'revision')}
 SHORE_GAME = {**GAME, 'shore_bots': ('name', 'account')}
 HISCORES_GAME = {**SHORE_GAME, 'competitors': ('account',), 'collections': ('account', 'item', 'found_at'), 'discord_links': ('account', 'discord_id')}
 ACTIONS_GAME = {**HISCORES_GAME, 'account_fame': ('account', 'balance', 'earned'), 'discord_recovery': ('account', 'enabled_at', 'last_issued_at')}
-GAME_SCHEMAS = {1: LEGACY_GAME, 2: GAME, 3: SHORE_GAME, 4: HISCORES_GAME, 5: ACTIONS_GAME}
+SOCIAL_GAME = {**ACTIONS_GAME, 'account_lists': ('account', 'list_id', 'target')}
+GAME_SCHEMAS = {1: LEGACY_GAME, 2: GAME, 3: SHORE_GAME, 4: HISCORES_GAME, 5: ACTIONS_GAME, 6: SOCIAL_GAME}
 AUTH_GAME = {**GAME, 'credentials': ('account', 'email', 'password_hash')}
 AUTH_SHORE_GAME = {**SHORE_GAME, 'credentials': AUTH_GAME['credentials']}
 AUTH_HISCORES_GAME = {**HISCORES_GAME, 'credentials': AUTH_GAME['credentials'], 'discord_codes': ('account', 'hash', 'issued_at', 'expires_at')}
 AUTH_ACTIONS_GAME = {**ACTIONS_GAME, 'credentials': AUTH_GAME['credentials'], **{t: AUTH_HISCORES_GAME['discord_codes'] for t in ['discord_codes', 'recovery_codes', 'password_resets']}}
+AUTH_SOCIAL_GAME = {**AUTH_ACTIONS_GAME, 'account_lists': SOCIAL_GAME['account_lists']}
 DISCORD = {'levels': ('guild_id', 'user_id', 'username', 'xp', 'last_xp_at', 'last_message_id')}
 CHARACTER = {'id', 'account', 'name', 'level', 'exp', 'fame', 'hp', 'mp', 'items', 'revision',
              'alive', 'created_at', 'shots', 'hits', 'kills', 'quests', 'tiles'}
@@ -123,13 +125,23 @@ def validate(bundle):
         identities = [(row['account'], row['item']) if table == 'collections' else row['account'] for row in rows]
         if len(set(identities)) != len(rows) or (table == 'discord_links' and len({r['discord_id'] for r in rows}) != len(rows)):
             raise ValueError('Duplicate hiscores identity: ' + table)
-    if bundle['schema'] == 5 and {r['account'] for r in bundle['game']['account_fame']} != accounts:
+    lists = {}
+    for row in bundle['game'].get('account_lists', []):
+        if any(type(row[key]) is not int or not 0 < row[key] <= 2147483647 or row[key] not in accounts for key in ['account', 'target']) or type(row['list_id']) is not int or row['list_id'] not in (0, 1) or row['account'] == row['target']:
+            raise ValueError('Invalid account list entry')
+        targets = lists.setdefault((row['account'], row['list_id']), set())
+        if row['target'] in targets:
+            raise ValueError('Duplicate account list entry')
+        targets.add(row['target'])
+        if len(targets) > 32767:
+            raise ValueError('Account list exceeds native count limit')
+    if bundle['schema'] >= 5 and {r['account'] for r in bundle['game']['account_fame']} != accounts:
         raise ValueError('Every account requires a fame wallet')
     return bundle
 
 
 def export(game, discord, output, server_revision, bot_revision):
-    game_data = snapshot(game, [*GAME_SCHEMAS.values(), AUTH_GAME, AUTH_SHORE_GAME, AUTH_HISCORES_GAME, AUTH_ACTIONS_GAME])
+    game_data = snapshot(game, [*GAME_SCHEMAS.values(), AUTH_GAME, AUTH_SHORE_GAME, AUTH_HISCORES_GAME, AUTH_ACTIONS_GAME, AUTH_SOCIAL_GAME])
     version = next(version for version, schema in GAME_SCHEMAS.items() if set(schema) == set(game_data))
     bundle = validate({
         'schema': version, 'created_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -170,12 +182,14 @@ CREATE TABLE discord_links(account INTEGER PRIMARY KEY REFERENCES accounts(id),d
         definitions['game'] += '''
 CREATE TABLE account_fame(account INTEGER PRIMARY KEY REFERENCES accounts(id),balance INTEGER NOT NULL CHECK(balance BETWEEN 0 AND 2147483647),earned INTEGER NOT NULL CHECK(earned BETWEEN balance AND 2147483647));
 CREATE TABLE discord_recovery(account INTEGER PRIMARY KEY REFERENCES discord_links(account),enabled_at INTEGER NOT NULL,last_issued_at INTEGER NOT NULL);'''
+    if bundle['schema'] >= 6:
+        definitions['game'] += '\nCREATE TABLE account_lists(account INTEGER NOT NULL REFERENCES accounts(id),list_id INTEGER NOT NULL CHECK(list_id IN (0,1)),target INTEGER NOT NULL REFERENCES accounts(id),PRIMARY KEY(account,list_id,target),CHECK(account<>target));'
     for name, filename in [('game', 'game.db'), ('discord', 'levels.sqlite')]:
         with closing(sqlite3.connect(':memory:')) as db, db:
             db.execute('PRAGMA foreign_keys=ON')
             db.executescript(definitions[name])
             if name == 'game' and bundle['schema'] >= 5:
-                db.execute('PRAGMA user_version=5')
+                db.execute('PRAGMA user_version=' + str(bundle['schema']))
             for table, fields in (GAME_SCHEMAS[bundle['schema']] if name == 'game' else DISCORD).items():
                 rows = bundle[name][table]
                 columns = tuple(c for c in fields if c != 'guid')
