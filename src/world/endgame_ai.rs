@@ -369,6 +369,18 @@ mod tests {
             .id;
         assert!(d.worlds[&50].entities[&portal].published);
         let chamber = d.portals[&portal].destination;
+        for _ in 0..3 {
+            d.step();
+        }
+        assert!(d.worlds[&50].entities.contains_key(&portal));
+        assert!(!d.worlds[&50].bag_expiry.contains_key(&portal));
+        let deadline = d.portals[&portal].expires;
+        d.worlds.get_mut(&50).unwrap().now += 120_000;
+        d.tick = deadline - 1;
+        d.step();
+        assert!(!d.worlds[&50].entities.contains_key(&portal));
+        assert!(!d.portals.contains_key(&portal));
+        d.step();
         assert_eq!(d.worlds[&chamber].name, "Oryx's Chamber");
         assert_eq!(
             d.worlds[&chamber]

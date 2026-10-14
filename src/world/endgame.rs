@@ -159,7 +159,6 @@ impl Directory {
             .context("committed Cellar portal lost")?;
         e.reserved = false;
         e.published = true;
-        w.bag_expiry.insert(opened, w.now + 120_000);
         self.portals.get_mut(&opened).unwrap().expires = self.tick + 2400;
         tracing::info!(
             player,
@@ -213,7 +212,6 @@ impl Directory {
                 );
                 let w = self.worlds.get_mut(&origin).unwrap();
                 w.remove_entity(marker);
-                w.bag_expiry.insert(portal, w.now + 120_000);
                 w.oryx_notice("You have defeated my Guardians. Face me in my Chamber!");
                 tracing::info!(
                     origin,
@@ -595,7 +593,6 @@ impl World {
         e.name = dungeon.clone();
         e.published = false;
         e.reserved = true;
-        self.bag_expiry.insert(opened, self.now + 120_000);
         self.entities.get_mut(&locked).unwrap().reserved = true;
         self.players.get_mut(&id).unwrap().pending = true;
         let mut plan = self.plan(id, items, None, 0);
@@ -611,7 +608,6 @@ impl World {
         );
         self.entities.get_mut(&opened).unwrap().reserved = false;
         self.remove_entity(opened);
-        self.bag_expiry.remove(&opened);
         self.entities
             .get_mut(&locked)
             .context("reserved locked portal lost")?
@@ -780,6 +776,43 @@ mod tests {
         assert_eq!(d.destination(a, Some(opened)).unwrap().2, cellar);
         assert_eq!(d.destination(b, Some(opened)).unwrap().2, cellar);
         assert!(incantation(d.worlds.get_mut(&-3).unwrap(), b).is_err());
+    }
+    #[test]
+    fn locked_portal_survives_empty_inventory_until_deadline_and_reservation_release() {
+        let (mut d, _, _, locked) = cellar_fixture();
+        let w = d.worlds.get_mut(&-3).unwrap();
+        w.bag_expiry.insert(locked, w.now + 120_000);
+        w.step();
+        assert!(
+            w.entities.contains_key(&locked),
+            "empty portal is not an empty loot bag"
+        );
+        w.entities.get_mut(&locked).unwrap().reserved = true;
+        w.now = 119_950;
+        w.step();
+        assert!(w.entities.contains_key(&locked));
+        w.entities.get_mut(&locked).unwrap().reserved = false;
+        w.step();
+        assert!(!w.entities.contains_key(&locked));
+    }
+    #[test]
+    fn committed_cellar_portal_survives_ticks_and_has_one_directory_expiry_owner() {
+        let (mut d, a, _, _) = cellar_fixture();
+        let plan = incantation(d.worlds.get_mut(&-3).unwrap(), a).unwrap();
+        let plan = d.stage_unlock(plan).unwrap();
+        let (_, opened) = plan.unlock.unwrap();
+        d.finish_inventory(plan, Ok(1)).unwrap();
+        for _ in 0..3 {
+            d.step();
+        }
+        assert!(d.worlds[&-3].entities.contains_key(&opened));
+        assert!(!d.worlds[&-3].bag_expiry.contains_key(&opened));
+        d.tick = d.portals[&opened].expires - 1;
+        d.worlds.get_mut(&-3).unwrap().now += 120_000;
+        d.step();
+        assert!(!d.worlds[&-3].entities.contains_key(&opened));
+        assert!(!d.portals.contains_key(&opened));
+        d.step();
     }
     #[test]
     fn failed_cellar_save_or_instance_preflight_conserves_keys_and_removes_unpublished_worlds() {

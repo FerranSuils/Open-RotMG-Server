@@ -3076,13 +3076,15 @@ impl World {
             .filter(|(id, deadline)| {
                 let bag = &self.entities[id];
                 !bag.reserved
-                    && (**deadline <= self.now || bag.items.iter().all(|item| *item == -1))
+                    && (**deadline <= self.now
+                        || (self.content.objects[&bag.kind].class == "Container"
+                            && bag.items.iter().all(|item| *item == -1)))
             })
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
             self.remove_entity(id);
-            tracing::debug!(entity = id, "empty or expired transient loot bag removed");
+            tracing::debug!(entity = id, "expired transient or empty container removed");
         }
         self.mechanic_expiry();
         let shots = self.npc_step();
