@@ -1,6 +1,7 @@
 import {readFile, writeFile, readdir, rename, open} from 'node:fs/promises';
 import {pathToFileURL} from 'node:url';
 import {setTimeout as wait} from 'node:timers/promises';
+import {nativeClock} from './native-clock.mjs';
 
 const help=`Usage: node scripts/game.mjs CONFIG.json REQUEST.json
 Start a new isolated prepared server with ./run.sh PORT --test-state NEW_DIRECTORY.
@@ -11,7 +12,7 @@ Read operations: capabilities; catalog {search,limit}; world_info {world}; obser
 Spawn: {op:"spawn",spec:{guid,class,level,seed,equipment:[weapon,ability,armor,ring],backpack:[eight explicit slots],world,position:{x,y},controller:"direct"|"native"|"game_bot",stats:null|[eight explicit stats]}}. Empty slot is -1. IDs and names come from catalog. Spawn never chooses class, level, gear or a world for you.
 Direct act: {op:"act",actor,action:{command:...},duration_ms,pauseAfter:true} uses ordinary server actions. run {actor,goal,max_game_ms,pauseAfter:true} delegates only advertised goals to the actual gameplay bot; unsupported classes/goals fail.
 Native CONFIG also requires browserTools:"/absolute/managed/direct-cdp.mjs" and native:[{port,target,actor}] for EVERY connected native actor. Native act uses input:{keys:["d"],duration_ms:600,mouse:{x:450,y:300}}; mouse is optional left firing in the unclipped 800x600 client. Keys and durations are bounded. No desktop activation.
-pauseAfter defaults to true: the whole isolated session does not progress while you inspect and think. Native pause requires confirmed Ruffle suspension plus server pause; simulation-only pause is not native acceptance. Set false explicitly for continuous real-time checks.
+pauseAfter defaults to true: the whole isolated session does not progress while you inspect and think. Native pause requires Ruffle suspension, pause-adjusted page clocks and server pause; simulation-only pause is not native acceptance. Initialize while Ruffle is playing; an earlier untracked pause requires normal reconnection of the same living character. Set false explicitly for continuous real-time checks.
 Explicit paused mutations: world {template}; cheat {actor,change:{kind:"stats",values}|{kind:"item",slot,item}|{kind:"teleport",position}}. These are recorded cheats, never earned gameplay.
 A reached time window is not a dungeon clear. Inspect actual effects and goal_reached. cancel {request} addresses a running server request by stable id. Compact receipts point to bounded evidence in STATE/testing; preserve failed receipts and dead characters.
 `;
@@ -87,7 +88,7 @@ async function pauseAll() {
   const errors=[], confirmed=[];
   for (const c of clients) {
     try {
-      await c.evaluate(`(()=>{const p=document.querySelector('ruffle-player');if(!p)throw Error('Ruffle missing');p.ruffle().suspend();if(p.ruffle().isPlaying)throw Error('Ruffle did not pause');return true})()`);
+      await c.evaluate(`(${nativeClock.toString()})(true)`);
       confirmed.push(c.actor);
     } catch(e) {errors.push(String(e));}
   }
@@ -97,9 +98,10 @@ async function pauseAll() {
   return {...result,pause_scope:clients.length?'server_and_native':'server'};
 }
 async function resumeAll() {
+  for (const c of clients) await c.evaluate(`(${nativeClock.toString()})(null)`);
   mayProgress=true;
   await api({op:'resume'});
-  for (const c of clients) await c.evaluate(`(()=>{const p=document.querySelector('ruffle-player');if(!p)throw Error('Ruffle missing');p.ruffle().resume();if(!p.ruffle().isPlaying)throw Error('Ruffle did not resume');return true})()`);
+  for (const c of clients) await c.evaluate(`(${nativeClock.toString()})(false)`);
 }
 const bindings = {
   w:['KeyW',87],a:['KeyA',65],s:['KeyS',83],d:['KeyD',68],
@@ -145,7 +147,7 @@ async function nativeAct(value) {
   if(primary||cleanup.length) throw new Error(JSON.stringify({primary:primary?String(primary):null,cleanup}));
   const after=await api({op:'observe',actor:value.actor});
   const effects={distance:Math.hypot(after.position.x-before.position.x,after.position.y-before.position.y),shots:after.verification.shots-before.verification.shots,hp:after.character.hp-before.character.hp,mp:after.character.mp-before.character.mp,inventory_changed:JSON.stringify(after.character.items)!==JSON.stringify(before.character.items),world_changed:after.session.world!==before.session.world};
-  return {id,status:'input_complete',execution:'native',effects,paused:after.paused,pause_scope:value.pauseAfter===false?'unpaused':'server_and_native',actor:value.actor,state:after};
+  return {id,status:'input_complete',execution:'native',effects,paused:after.paused,pause_scope:value.pauseAfter===false?'unpaused':'server_and_native',native_clock:'pause_adjusted_page_time',actor:value.actor,state:after};
 }
 let result;
 try {

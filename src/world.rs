@@ -863,10 +863,14 @@ impl World {
                 p.character.id
             );
         }
-        Ok(self
-            .players
-            .values()
-            .all(|p| !p.pending && !p.progress_started && !p.death_pending && !p.departing))
+        Ok(self.players.values().all(|p| {
+            !p.pending
+                && p.experience_queued == 0
+                && p.caves_queued == 0
+                && !p.progress_started
+                && !p.death_pending
+                && !p.departing
+        }))
     }
     pub fn load_vault(&mut self, vault: Vault) -> Result<()> {
         ensure!(
@@ -4156,6 +4160,18 @@ mod tests {
             );
             assert!(w.bullets.is_empty());
         }
+    }
+    #[test]
+    fn queued_progress_must_settle_before_pause_is_confirmed() {
+        let mut w = world();
+        let character = ch(&w);
+        let player = w.enter(character, None).unwrap();
+        w.players.get_mut(&player).unwrap().experience_queued = 20;
+        assert!(!w.settled().unwrap());
+        let (id, progress) = w.pending_progress().unwrap().pop().unwrap();
+        assert!(!w.settled().unwrap());
+        w.finish_progress(id, progress).unwrap();
+        assert!(w.settled().unwrap());
     }
     #[test]
     fn paused_wall_time_cannot_fund_native_attack_credit() {
