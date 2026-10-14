@@ -1920,6 +1920,16 @@ impl World {
                 if plan.mana > 0 && !p.death_pending {
                     p.character.mp = (p.character.mp + plan.mana).min(values[1]);
                 }
+                if self.prepared_seed.is_some()
+                    && let Some((bag, slot)) = plan.loot_slot
+                {
+                    let item = self
+                        .entities
+                        .get(&bag)
+                        .and_then(|bag| bag.items.get(slot))
+                        .context("committed loot identity missing")?;
+                    tracing::info!(player=plan.player,character=p.character.id,bag,slot,item=*item,world=%self.name,"loot slot committed");
+                }
                 if let Some((id, items)) = plan.bag {
                     self.entities.get_mut(&id).unwrap().items = items;
                 }
@@ -2307,7 +2317,10 @@ impl World {
         }
         for (owner, items) in drops {
             let slots = (0..items.len()).collect();
-            let bag = self.loot_bag(defeated.pos, (owner >= 0).then_some(owner), items)?;
+            let bag = self.loot_bag(defeated.pos, (owner >= 0).then_some(owner), items.clone())?;
+            if self.prepared_seed.is_some() {
+                tracing::info!(enemy=defeated.kind,bag,owner,?items,world=%self.name,privileged=true,"earned encounter reward published");
+            }
             self.entities.get_mut(&bag).unwrap().drop_slots = slots;
         }
         Ok(())
