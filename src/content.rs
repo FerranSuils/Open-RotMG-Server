@@ -5,6 +5,10 @@ use std::{collections::BTreeMap, io::Read, path::Path};
 
 pub const WIZARD: u16 = 0x030e;
 pub const PRIEST: u16 = 0x0310;
+pub const SLOWED: i32 = 1 << 3;
+pub const STUNNED: i32 = 1 << 6;
+pub const PARALYZED: i32 = 1 << 13;
+pub const SPEEDY: i32 = 1 << 14;
 pub const STATS: [(u8, &str); 8] = [
     (0, "MaxHitPoints"),
     (3, "MaxMagicPoints"),

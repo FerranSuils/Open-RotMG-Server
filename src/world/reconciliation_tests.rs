@@ -107,7 +107,7 @@ fn restrictive_native_condition_queues_real_stat29_before_one_owned_goto() {
         .get_mut(&id)
         .unwrap()
         .statuses
-        .insert(crate::condition::PARALYZED, w.now + 1000);
+        .insert(crate::condition::PARALYZED, (w.now, w.now + 1000));
     w.step();
     w.step();
     let mut gotos = 0;
@@ -127,6 +127,91 @@ fn restrictive_native_condition_queues_real_stat29_before_one_owned_goto() {
             "Slowed cannot lower an already Paralyzed motor"
         );
     }
+}
+#[test]
+fn speedy_expiry_synchronizes_the_lower_native_coefficient_after_real_stat29() {
+    let (mut w, id, mut rx, _loss) = native();
+    w.safe = true;
+    while rx.try_recv().is_ok() {}
+    w.apply_condition(id, 15, 200).unwrap();
+    w.step();
+    w.step();
+    while let Ok(p) = rx.try_recv() {
+        assert_ne!(p.id, wire::GOTO, "Speedy only raises the coefficient");
+    }
+    w.step();
+    w.step();
+    let mut ids = vec![];
+    while let Ok(p) = rx.try_recv() {
+        ids.push(p.id);
+    }
+    let tick = ids.iter().position(|id| *id == wire::NEW_TICK).unwrap();
+    let go = ids.iter().position(|id| *id == wire::GOTO).unwrap();
+    assert!(tick < go);
+    assert_eq!(ids.iter().filter(|id| **id == wire::GOTO).count(), 1);
+    assert!(w.players[&id].correcting().unwrap());
+}
+#[test]
+fn native_dazed_and_goto_discards_conserve_rng_without_authorizing_bullets() {
+    let (mut w, id, _rx, _loss) = native();
+    let weapon = w.players[&id].character.items[0] as u16;
+    let item = w.content.get(weapon).unwrap().clone();
+    assert!(item.projectiles[&0].min < item.projectiles[&0].max);
+    let rate =
+        0.0015 + 0.0065 * w.players[&id].character.effective(&w.content).unwrap()[5] as f64 / 75.;
+    let normal = (1. / rate / item.rate as f64).floor() as i32;
+    let start = Pos {
+        x: w.players[&id].pos.x + 0.3,
+        y: w.players[&id].pos.y,
+    };
+    let seed = w.players[&id].seed;
+    let mut expected = seed;
+    let mut next = 1;
+    w.apply_condition(id, crate::condition::DAZED, 2000)
+        .unwrap();
+    for (time, discard) in [
+        (2100, false),
+        (2100 + normal, false),
+        (2100 + 2 * normal, true),
+    ] {
+        if discard {
+            w.correct_position(id, time, "prepared RNG conservation")
+                .unwrap();
+        }
+        let before = w.players[&id].character.shots;
+        for _ in 0..item.shots {
+            w.native_shoot_received(
+                id,
+                (time, w.attack_epoch + Duration::from_millis(time as u64)),
+                next,
+                weapon,
+                start,
+                0.,
+            )
+            .unwrap();
+            expected = ((expected as u64 * 16807) % 2147483647) as u32;
+            next = (next + 1) % 128;
+        }
+        assert_eq!(w.players[&id].seed, expected);
+        if time != 2100 {
+            assert_eq!(w.players[&id].character.shots, before);
+        }
+    }
+    assert_eq!(w.bullets.len(), item.shots as usize);
+    w.acknowledge_goto(id, 3000).unwrap();
+    w.now = 3000;
+    w.native_shoot_received(
+        id,
+        (4000, w.attack_epoch + Duration::from_millis(4000)),
+        next,
+        weapon,
+        start,
+        0.,
+    )
+    .unwrap();
+    expected = ((expected as u64 * 16807) % 2147483647) as u32;
+    assert_eq!(w.players[&id].seed, expected);
+    assert_eq!(w.bullets.len(), item.shots as usize + 1);
 }
 #[test]
 fn predicted_origin_failure_is_typed_and_correction_never_authorizes_the_shot() {
@@ -249,7 +334,12 @@ fn received_attack_burst_is_rejected_without_funding_and_recovers_after_ack() {
         );
     }
     let p = &w.players[&id];
-    assert_eq!(p.seed, seed);
+    assert!(item.projectiles[&0].min < item.projectiles[&0].max);
+    let mut discarded_seed = seed;
+    for _ in 0..item.shots {
+        discarded_seed = ((discarded_seed as u64 * 16807) % 2147483647) as u32;
+    }
+    assert_eq!(p.seed, discarded_seed);
     assert_eq!(p.character.shots, shots);
     assert_eq!(p.attack_credit, 0.);
     assert_eq!(p.last_attack_at, 1000);

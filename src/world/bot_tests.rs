@@ -158,3 +158,56 @@ fn autonomous_motor_obeys_observed_ground_and_shared_conditions() {
     w.step();
     assert_eq!((w.players[&id].pos.x, w.players[&id].pos.y), (pos.x, pos.y));
 }
+
+#[test]
+fn bounded_bot_output_holds_a_full_six_wizard_nova_burst() {
+    let mut w = world();
+    let mut actors = Vec::new();
+    for account in 1..=6 {
+        let mut character = ch(&w);
+        character.id = account;
+        character.account = account;
+        character.class = 0x30e;
+        character.items[0] = 2711;
+        character.items[1] = 2606;
+        character.mp = 100;
+        let (packets, rx) = mpsc::channel(crate::bots::OUTPUT_CAPACITY);
+        let (lost, _) = watch::channel(false);
+        let id = w
+            .enter_autonomous(character, Output { packets, lost })
+            .unwrap();
+        actors.push((id, rx));
+    }
+    w.now = 1000;
+    w.step();
+    for (_, rx) in &mut actors {
+        while rx.try_recv().is_ok() {}
+    }
+    for (id, _) in &actors {
+        let position = w.players[id].pos;
+        w.autonomous_action(
+            *id,
+            Action::Use {
+                slot: 1,
+                x: position.x,
+                y: position.y,
+            },
+        )
+        .unwrap();
+    }
+    for (id, rx) in &mut actors {
+        assert!(!*w.players[id].tx.as_ref().unwrap().lost.borrow());
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert!(received >= 120, "nova burst receipt count: {received}");
+    }
+    let ready = w.now + w.content.get(2606).unwrap().cooldown_ms;
+    let mut d = tests::directory();
+    d.worlds.clear();
+    d.worlds.insert(-2, w);
+    for (id, _) in actors {
+        assert_eq!(d.player_view(id).unwrap().character.ability_ready_ms, ready);
+    }
+}

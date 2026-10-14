@@ -29,6 +29,7 @@ pub struct MapInfo {
 }
 #[derive(Serialize)]
 pub struct OwnCharacter {
+    pub conditions: i32,
     pub class: u16,
     pub level: i32,
     pub experience: i32,
@@ -37,7 +38,8 @@ pub struct OwnCharacter {
     pub stats: [i32; 8],
     pub items: Vec<i32>,
     pub inventory_revision: i32,
-    pub condition_mask: i32,
+    pub pirate_caves: u64,
+    pub ability_ready_ms: u64,
 }
 #[derive(Serialize)]
 pub struct Lifecycle {
@@ -69,6 +71,7 @@ pub struct VisibleObject {
     pub name: String,
     pub position: Pos,
     pub hp: i32,
+    pub max_hp: i32,
     pub equipped: Vec<i32>,
     pub contents: Vec<i32>,
     pub blocks: bool,
@@ -99,13 +102,14 @@ impl Directory {
             .intersection(&p.known)
             .filter(|entity| **entity != id)
             .map(|entity| {
-                if let Some(q) = w.players.get(entity) {
+                Ok(if let Some(q) = w.players.get(entity) {
                     VisibleObject {
                         id: *entity,
                         kind: q.character.class,
                         name: q.character.name.clone(),
                         position: q.pos,
                         hp: q.character.hp,
+                        max_hp: q.character.effective(&w.content)?[0],
                         equipped: q.character.items[..4].to_vec(),
                         contents: vec![],
                         blocks: false,
@@ -119,14 +123,15 @@ impl Directory {
                         name: e.name.clone(),
                         position: e.pos,
                         hp: e.hp,
+                        max_hp: w.content.objects[&e.kind].hp,
                         equipped: vec![],
                         contents: e.items.clone(),
                         blocks: w.content.objects[&e.kind].blocks,
                         condition_mask: Some(e.conditions(w.now)),
                     }
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let tiles = p
             .tiles
             .iter()
@@ -179,6 +184,7 @@ impl Directory {
                 height: w.map.height,
             },
             character: OwnCharacter {
+                conditions: p.conditions(w.now) | if p.paused { 1 << 20 } else { 0 },
                 class: p.character.class,
                 level: p.character.level,
                 experience: p.character.exp,
@@ -187,7 +193,14 @@ impl Directory {
                 stats: p.character.effective(&w.content)?,
                 items: p.character.items.clone(),
                 inventory_revision: p.character.revision,
-                condition_mask: p.conditions(w.now) | if p.paused { 1 << 20 } else { 0 },
+                pirate_caves: p.character.pirate_caves,
+                ability_ready_ms: if p.character.items[1] >= 0 {
+                    p.last_ability
+                        .checked_add(w.content.get(p.character.items[1] as u16)?.cooldown_ms)
+                        .context("own ability cooldown overflow")?
+                } else {
+                    0
+                },
             },
             lifecycle: Lifecycle {
                 alive: p.character.alive,

@@ -13,13 +13,13 @@ pub const INVINCIBLE: u8 = 24;
 pub const INVULNERABLE: u8 = 25;
 pub const ARMORED: u8 = 26;
 pub const ARMOR_BROKEN: u8 = 27;
-pub fn bit(index: u8) -> i32 {
+pub const fn bit(index: u8) -> i32 {
     1 << (index - 1)
 }
-pub fn mask(timers: &BTreeMap<u8, u64>, now: u64) -> i32 {
+pub fn mask(timers: &BTreeMap<u8, (u64, u64)>, now: u64) -> i32 {
     timers
         .iter()
-        .filter(|(_, deadline)| **deadline > now)
+        .filter(|(_, (_, deadline))| *deadline > now)
         .fold(0, |mask, (index, _)| mask | bit(*index))
 }
 pub fn projectile_effect(name: &str) -> Result<u8> {

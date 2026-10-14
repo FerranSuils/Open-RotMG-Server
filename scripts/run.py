@@ -87,7 +87,9 @@ def main():
     parser.add_argument("--client", "--local-client", dest="local_client", type=Path, metavar="DIR", help="Use your own client checkout instead of downloading the pinned client")
     parser.add_argument("--state", type=Path, default=ROOT / ".local", metavar="DIR", help="Isolate saves, keys, client cache and logs in this directory")
     parser.add_argument("--dev-control", action="store_true", help="Enable loopback-only QA control")
-    parser.add_argument("--shore-bots", action="store_true", help="Run three autonomous starter Wizards in the local Realm")
+    bots = parser.add_mutually_exclusive_group()
+    bots.add_argument("--shore-bots", action="store_true", help="Enable the three default autonomous Wizards explicitly")
+    bots.add_argument("--no-shore-bots", action="store_true", help="Disable autonomous Wizards for isolated testing")
     parser.add_argument("--release", action="store_true", help="Build optimized gameplay")
     args = parser.parse_args()
     if shutil.which("cargo") is None:
@@ -126,6 +128,8 @@ def main():
                 command.append("--dev-control")
             if args.shore_bots:
                 command.append("--shore-bots")
+            if args.no_shore_bots:
+                command.append("--no-shore-bots")
             code = run(command, ROOT, log)
             if code:
                 raise RuntimeError(f"Server exited with status {code}. See the error above and {LOG}.")

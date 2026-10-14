@@ -1,0 +1,294 @@
+use super::*;
+use crate::{
+    server::{self, App},
+    store::Character,
+    world::Output,
+};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, watch};
+
+async fn enter(
+    app: &App,
+    profile: Profile,
+    character: Character,
+    world: i32,
+) -> Result<(i32, mpsc::Receiver<Packet>, mpsc::Sender<Packet>, Brain)> {
+    let world = if world == -3 {
+        app.world.directory(|d| d.initial(-3)).await?
+    } else {
+        world
+    };
+    tracing::info!(name = profile.name, saved = %serde_json::to_string(&character)?,
+        "autonomous saved character loaded");
+    // Concurrent novas and hit receipts must fit between bounded perception updates.
+    let (packets, output) = mpsc::channel(OUTPUT_CAPACITY);
+    let sender = packets.clone();
+    let (lost, _) = watch::channel(false);
+    let id = app
+        .world
+        .in_world(world)
+        .call(move |w| w.enter_autonomous(character, Output { packets, lost }))
+        .await?;
+    let view = app.world.directory(move |d| d.player_view(id)).await?;
+    tracing::info!(
+        player = id,
+        name = profile.name,
+        class = view.character.class,
+        level = view.character.level,
+        character = view.session.character,
+        account = view.session.account,
+        experience = view.character.experience,
+        hp = view.character.hp,
+        mp = view.character.mp,
+        items = ?view.character.items,
+        revision = view.character.inventory_revision,
+        "autonomous character entered"
+    );
+    Ok((id, output, sender, Brain::new(profile, &view)))
+}
+
+async fn continue_character(
+    store: &crate::store::Store,
+    content: &Content,
+    profile: Profile,
+    session: &crate::world::view::Session,
+    destination: i32,
+) -> Result<(Character, i32)> {
+    // Departure can commit a death after the transfer was requested.
+    let character = store
+        .shore_character(profile.name.into(), content, profile.healer)
+        .await?;
+    ensure!(
+        character.account == session.account,
+        "departed autonomous account binding changed"
+    );
+    let destination = if character.id == session.character {
+        destination
+    } else {
+        -3
+    };
+    Ok((character, destination))
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn death_committed_during_departure_rebuilds_in_realm_without_resurrection() {
+    let content = Content::load(std::path::Path::new("data")).unwrap();
+    let store = crate::store::Store::open(std::path::Path::new(":memory:"), &content).unwrap();
+    let profile = PROFILES[0];
+    let mut wizard = store
+        .shore_character(profile.name.into(), &content, true)
+        .await
+        .unwrap();
+    wizard.level = 5;
+    wizard.exp = crate::store::level_start(5).unwrap();
+    store.progress(wizard.clone()).await.unwrap();
+    let session = crate::world::view::Session {
+        world: -3,
+        player: 1,
+        account: wizard.account,
+        character: wizard.id,
+    };
+    let (living, destination) = continue_character(&store, &content, profile, &session, -2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (living.id, living.class, destination),
+        (wizard.id, crate::content::WIZARD, -2)
+    );
+    wizard.hp = 0;
+    wizard.alive = false;
+    store
+        .death(wizard.clone(), "prepared departure race fixture".into())
+        .await
+        .unwrap();
+    assert!(
+        store
+            .load(session.account, session.character)
+            .await
+            .is_err()
+    );
+    let (replacement, destination) = continue_character(&store, &content, profile, &session, -2)
+        .await
+        .unwrap();
+    assert_eq!(destination, -3);
+    assert_eq!(replacement.account, session.account);
+    assert_ne!(replacement.id, session.character);
+    assert_eq!(
+        (replacement.class, replacement.level, replacement.exp),
+        (crate::content::PRIEST, 1, 0)
+    );
+    assert_eq!(
+        replacement.items,
+        content.get(crate::content::PRIEST).unwrap().equipment
+    );
+    let replacement_id = replacement.id;
+    let (same, _) = continue_character(&store, &content, profile, &session, -2)
+        .await
+        .unwrap();
+    assert_eq!(same.id, replacement_id);
+    assert!(
+        store
+            .load(session.account, session.character)
+            .await
+            .is_err()
+    );
+}
+
+pub async fn start(app: &App) -> Result<()> {
+    for profile in PROFILES {
+        let character = app
+            .store
+            .shore_character(profile.name.into(), &app.content, profile.healer)
+            .await?;
+        let account = character.account;
+        let owner = app.claim(account)?;
+        let (mut id, mut output, mut sender, mut brain) =
+            enter(app, profile, character, -3).await?;
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut shutdown = app.shutdown.subscribe();
+            let result: Result<()> = async {
+                loop {
+                    tokio::select! {
+                        _=tokio::time::sleep(Duration::from_millis(50))=>{},
+                        _=shutdown.changed()=>break,
+                    }
+                    if let Some(transfer) = server::automatic_transfer(&app, id).await? {
+                        ensure!(transfer.player == id && transfer.output.packets.same_channel(&sender), "collective transfer does not belong to autonomous output");
+                        while output.try_recv().is_ok() {}
+                        let destination = transfer.destination;
+                        let character_id = app.world.directory(move |d| d.consume(account, destination, transfer.key_time, transfer.key)).await?;
+                        ensure!(character_id == brain.session.2, "collective transfer character binding changed");
+                        let character = app.store.load(account, character_id).await?;
+                        (id, output, sender, brain) = enter(&app, profile, character, destination).await?;
+                        tracing::info!(player=id,account,character=character_id,destination,"autonomous collective transfer completed");
+                        continue;
+                    }
+                    let view = app.world.directory(move |d| d.player_view(id)).await?;
+                    ensure!(view.session.account == account, "autonomous account binding changed");
+                    if view.lifecycle.death_pending {
+                        while output.try_recv().is_ok() {}
+                        continue;
+                    }
+                    if !view.lifecycle.alive {
+                        server::depart(&app, id).await?;
+                        tokio::select! {
+                            _=tokio::time::sleep(Duration::from_secs(3))=>{},
+                            _=shutdown.changed()=>return Ok(()),
+                        }
+                        let character = app.store.shore_character(profile.name.into(), &app.content, profile.healer).await?;
+                        ensure!(character.account == account && character.id != view.session.character,
+                            "replacement did not preserve account and replace the dead character");
+                        (id, output, sender, brain) = enter(&app, profile, character, -3).await?;
+                        continue;
+                    }
+                    ensure!(matches!(view.lifecycle.output, OutputState::Live)
+                        && !view.lifecycle.departing && !view.lifecycle.quarantined, "controller is not live");
+                    while let Ok(packet) = output.try_recv() {
+                        if packet.id == crate::wire::GOTO {
+                            app.world.for_player(id).call(move |w| w.acknowledge_autonomous_goto(id)).await?;
+                            continue;
+                        }
+                        if brain.receive(packet, &view)? {
+                            if let Err(error) = app.world.directory(move |d| d.chat(id, "omw".into(), Instant::now())).await {
+                                tracing::warn!(player=id,%error,"invitation acknowledgement rejected");
+                            }
+                            tracing::info!(player=id, companion=brain.companion, "visible invitation accepted");
+                        }
+                    }
+                    if view.lifecycle.busy || view.tick < brain.next_decision { continue; }
+                    let decision = brain.decide(&view, &app.content)?;
+                    if let Some(text) = decision.chat {
+                        match app.world.directory(move |d| d.chat(id, text.into(), Instant::now())).await {
+                            Ok(()) => tracing::info!(player=id,text,"autonomous public call delivered"),
+                            Err(error) => tracing::warn!(player=id,text,%error,"autonomous public call rejected"),
+                        }
+                    }
+                    if decision.goal != brain.goal {
+                        tracing::info!(player=id,name=profile.name,tick=view.tick,hp=view.character.hp,
+                            experience=view.character.experience,x=view.position.x,y=view.position.y,
+                            goal=?decision.goal,"autonomous decision");
+                    }
+                    brain.goal = decision.goal;
+                    brain.destination = decision.movement;
+                    let mut actions = vec![Action::Stop];
+                    if decision.journey.is_none() {
+                        if let Some(pos) = decision.movement { actions.push(Action::Move { x:pos.x, y:pos.y }); }
+                        if let Some(angle) = decision.aim { actions.push(Action::Shoot { angle }); }
+                        if let Some(action) = decision.item { actions.push(action); }
+                    }
+                    let diagnostic = format!("{actions:?}");
+                    match app.world.for_player(id).call(move |w| {
+                        let mut plan = None;
+                        for action in actions {
+                            if let Some(item) = w.autonomous_action(id, action)? { plan = Some(item); }
+                        }
+                        Ok(plan)
+                    }).await {
+                        Ok(Some(plan)) => server::persist(&app, plan).await?,
+                        Ok(None) => {},
+                        Err(error) => {
+                            if let Some(pos) = brain.destination { brain.blocked.insert(tile(pos), view.tick + 100); }
+                            tracing::warn!(player=id,%error,actions=diagnostic,"autonomous commands rejected; route excluded and will reassess");
+                            continue;
+                        }
+                    }
+                    if let Some(journey) = decision.journey {
+                        match journey {
+                            Journey::Regroup(target) => {
+                                if let Err(error) = app.world.directory(move |d| d.teleport(id, target, Instant::now())).await {
+                                    tracing::warn!(player=id,target,%error,"autonomous regroup rejected");
+                                }
+                            }
+                            Journey::Portal(_) | Journey::Nexus => {
+                                let portal = match journey { Journey::Portal(portal) => Some(portal), Journey::Nexus => None, Journey::Regroup(_) => unreachable!() };
+                                let request = app.world.directory(move |d| {
+                                    let (account, character, destination) = d.destination(id, portal)?;
+                                    let (time, key, _) = d.issue(account, character, destination)?;
+                                    Ok((destination, time, key))
+                                }).await;
+                                let (destination, time, key) = match request {
+                                    Ok(request) => request,
+                                    Err(error) => {
+                                        brain.portal = None;
+                                        tracing::warn!(player=id,?portal,%error,"autonomous transfer rejected before departure");
+                                        continue;
+                                    }
+                                };
+                                server::depart(&app, id).await?;
+                                let character_id = app.world.directory(move |d| d.consume(account, destination, time, key)).await?;
+                                ensure!(character_id == view.session.character, "transfer character binding changed");
+                                let (character, destination) = continue_character(&app.store, &app.content, profile, &view.session, destination).await?;
+                                let current_character = character.id;
+                                if current_character != character_id {
+                                    tracing::info!(account,character=character_id,replacement=current_character,"autonomous transfer interrupted by permanent death");
+                                }
+                                (id, output, sender, brain) = enter(&app, profile, character, destination).await?;
+                                tracing::info!(player=id,account,character=current_character,destination,?portal,"autonomous durable transfer completed");
+                            }
+                        }
+                    }
+                }
+                server::depart(&app, id).await
+            }.await;
+            if let Err(error) = result {
+                tracing::error!(player=id,name=profile.name,%error,"autonomous controller stopped; account retained for diagnosis");
+                let reason = error.to_string();
+                if let Err(error) = app
+                    .world
+                    .for_player(id)
+                    .call(move |w| w.poison(id, reason))
+                    .await
+                {
+                    tracing::error!(player=id,%error,"autonomous quarantine failed");
+                }
+                app.quarantined
+                    .lock()
+                    .expect("quarantine registry poisoned")
+                    .push(owner);
+            }
+        });
+    }
+    Ok(())
+}

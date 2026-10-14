@@ -1,6 +1,6 @@
 use crate::{
-    content::{Content, Map, Projectile},
-    store::{Character, Vault},
+    content::{Content, Map, PARALYZED, Projectile, SLOWED, SPEEDY, STUNNED},
+    store::{AccountLists, Character, Vault},
     wire::{self, Packet, Writer},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -19,7 +19,7 @@ mod chat;
 mod endgame;
 mod endgame_ai;
 mod enemy_shots;
-pub(crate) use chat::{chat_error, chat_private};
+pub(crate) use chat::{chat_error, chat_info, chat_private, validate as validate_chat};
 pub use endgame::ForcedTransfer;
 #[cfg(test)]
 mod bot_tests;
@@ -66,7 +66,7 @@ pub struct Entity {
     pub hp: i32,
     pub size: i32,
     pub condition: i32,
-    statuses: BTreeMap<u8, u64>,
+    statuses: BTreeMap<u8, (u64, u64)>,
     pub items: Vec<i32>,
     #[serde(skip)]
     drop_slots: BTreeSet<usize>,
@@ -110,11 +110,12 @@ pub struct Player {
     pub pos: Pos,
     pub tx: Option<Output>,
     pub departing: bool,
+    account_lists: AccountLists,
     paused: bool,
     controller: Controller,
     pub known: BTreeSet<i32>,
     quest: Option<i32>,
-    statuses: BTreeMap<u8, u64>,
+    statuses: BTreeMap<u8, (u64, u64)>,
     native_motion_condition: i32,
     known_since: BTreeMap<i32, u64>,
     tiles: BTreeSet<(i16, i16)>,
@@ -138,12 +139,34 @@ pub struct Player {
     last_attack_at: u64,
     attack_credit: f32,
     attack_count: i32,
+    attack_suppressed: bool,
     last_move: i32,
     last_move_at: u64,
     goto_acks: VecDeque<(bool, Instant)>,
     discarded_attack: Option<(i32, i32)>,
     tick: i32,
     last_ability: u64,
+}
+impl Player {
+    fn roll_damage(&mut self, spec: &Projectile) -> i32 {
+        if spec.min == spec.max {
+            spec.min
+        } else {
+            self.seed = ((self.seed as u64 * 16807) % 2147483647) as u32;
+            spec.min + (self.seed % (spec.max - spec.min) as u32) as i32
+        }
+    }
+    fn speed(&self, content: &Content, now: u64) -> Result<f32> {
+        let condition = self.conditions(now);
+        Ok(if condition & PARALYZED != 0 {
+            0.
+        } else if condition & SLOWED != 0 {
+            0.004
+        } else {
+            (0.004 + (0.0096 - 0.004) * self.character.effective(content)?[4] as f32 / 75.)
+                * if condition & SPEEDY != 0 { 1.5 } else { 1. }
+        })
+    }
 }
 #[derive(Clone)]
 pub struct Bullet {
@@ -1103,6 +1126,7 @@ impl World {
                 character: ch,
                 pos: Pos { x, y },
                 departing: false,
+                account_lists: AccountLists::default(),
                 paused: false,
                 controller: if tx.is_none() {
                     Controller::Qa
@@ -1136,6 +1160,7 @@ impl World {
                 last_attack_at: 0,
                 attack_credit: 1000.,
                 attack_count: 0,
+                attack_suppressed: false,
                 last_move: 0,
                 last_move_at: self.now,
                 goto_acks: VecDeque::new(),
@@ -1288,8 +1313,8 @@ impl World {
         };
         timers
             .entry(index)
-            .and_modify(|old| *old = (*old).max(deadline))
-            .or_insert(deadline);
+            .and_modify(|old| *old = (self.now, old.1.max(deadline)))
+            .or_insert((self.now, deadline));
         tracing::debug!(
             entity = id,
             condition = index,
@@ -1445,14 +1470,7 @@ impl World {
             .map
             .cell(p.pos.x, p.pos.y)
             .context("player outside map")?;
-        let flags = p.conditions(self.now);
-        let speed = if flags & crate::condition::bit(crate::condition::PARALYZED) != 0 {
-            0.
-        } else if flags & crate::condition::bit(crate::condition::SLOWED) != 0 {
-            0.004
-        } else {
-            0.004 + (0.0096 - 0.004) * p.character.effective(&self.content)?[4] as f32 / 75.
-        } * self.content.grounds[&cell.ground];
+        let speed = p.speed(&self.content, self.now)? * self.content.grounds[&cell.ground];
         let push = self.content.pushes[&cell.ground];
         let distance = p.pos.distance(pos);
         let input_distance = |delta| {
@@ -1461,6 +1479,10 @@ impl World {
                 y: pos.y - push.1 * delta,
             })
         };
+        ensure!(
+            p.conditions(self.now) & PARALYZED == 0 || distance <= 0.001,
+            "paralyzed movement"
+        );
         ensure!(
             input_distance(elapsed) <= speed * elapsed + 0.3,
             "movement exceeds speed: from=({}, {}) to=({}, {}) distance={distance} allowed={} speed={speed} client_elapsed_ms={elapsed}",
@@ -1553,8 +1575,9 @@ impl World {
         );
         // MOVE precedes condition updates; accept either form across a toggle.
         let sentinel = pos.x == -1. && pos.y == -1.;
-        let correct = p.paused && !sentinel && p.pos.distance(pos) > 0.001;
-        let stationary = p.paused || sentinel;
+        let immobile = p.paused || p.conditions(self.now) & PARALYZED != 0;
+        let correct = immobile && !sentinel && p.pos.distance(pos) > 0.001;
+        let stationary = immobile || sentinel;
         ensure!(pos.x.is_finite() && pos.y.is_finite(), "invalid position");
         let pos = if stationary { p.pos } else { pos };
         let remaining_credit = self.validate_move_at(id, pos, time, received)?;
@@ -1566,7 +1589,7 @@ impl World {
         p.last_move = time;
         p.last_move_at = received;
         if correct {
-            self.correct_position(id, time, "paused movement")?;
+            self.correct_position(id, time, "immobilized movement")?;
         }
         Ok(())
     }
@@ -1642,7 +1665,7 @@ impl World {
         if self.discard_correcting_shot(id, time, bullet, kind, start, angle)? {
             return Ok(NativeInput::DiscardedUntilGotoAck);
         }
-        self.shoot_timed(id, (time, received), bullet, kind, start, angle)?;
+        self.shoot_timed(id, (time, received, true), bullet, kind, start, angle)?;
         self.players.get_mut(&id).unwrap().discarded_attack = None;
         Ok(NativeInput::Applied)
     }
@@ -1656,12 +1679,12 @@ impl World {
         start: Pos,
         angle: f32,
     ) -> Result<()> {
-        self.shoot_timed(id, (time, self.now), bullet, kind, start, angle)
+        self.shoot_timed(id, (time, self.now, false), bullet, kind, start, angle)
     }
     fn shoot_timed(
         &mut self,
         id: i32,
-        (time, received): (i32, u64),
+        (time, received, native): (i32, u64, bool),
         bullet: u8,
         kind: u16,
         start: Pos,
@@ -1680,11 +1703,7 @@ impl World {
                 && p.persistence_failure.is_none(),
             "dead, departing or quarantined player cannot shoot"
         );
-        let flags = p.conditions(self.now);
-        ensure!(
-            flags & crate::condition::bit(crate::condition::STUNNED) == 0,
-            "stunned player cannot shoot"
-        );
+
         ensure!(
             p.character.items[0] == kind as i32,
             "weapon does not match equipped item"
@@ -1704,55 +1723,80 @@ impl World {
             x: start.x - 0.3 * aim.cos(),
             y: start.y - 0.3 * aim.sin(),
         };
-        if !p.paused && p.pos.distance(center) > 0.001 {
+        let condition = p.conditions(self.now);
+        let origin = if !p.paused && p.pos.distance(center) > 0.001 {
             self.validate_move_at(id, center, time, received)
-                .with_context(|| RejectedNativeShot(format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at)))?;
+        } else {
+            Ok(0.)
+        };
+        // Drop stale predicted shots for one MOVE time-jump window around movement changes.
+        let displaced = origin.is_err()
+            && (condition & PARALYZED != 0
+                || p.statuses.iter().any(|(effect, (since, until))| {
+                    crate::condition::bit(*effect) & (SLOWED | SPEEDY | PARALYZED) != 0
+                        && (self.now - since < 1000
+                            || self.now >= *until && self.now - until < 1000)
+                }));
+        if !displaced {
+            origin.with_context(|| RejectedNativeShot(format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at)))?;
         }
         let spec = item
             .projectiles
             .get(&0)
             .cloned()
             .context("weapon has no projectile zero")?;
+        // The selected client's integer attack period cannot fund a fractional charge indefinitely.
+        let frequency =
+            0.0015 + (0.008 - 0.0015) * p.character.effective(&self.content)?[5] as f64 / 75.;
+        let normal_cooldown = (1. / frequency / f64::from(item.rate)).floor() as f32;
         let cooldown = reconciliation::attack_cooldown(p, &self.content, self.now, item.rate)?;
+        let admission = if native { normal_cooldown } else { cooldown };
         let p = self.players.get_mut(&id).unwrap();
         ensure!(time >= 0, "negative shot time");
         ensure!(shot_index < item.shots, "too many projectiles in attack");
         ensure!(bullet == p.next_bullet, "unexpected player bullet counter");
         if time != p.last_attack {
-            ensure!(
-                i64::from(time) - i64::from(p.last_attack) >= cooldown as i64 - 2,
-                "attack too fast"
-            );
+            let attack_elapsed = i64::from(time) - i64::from(p.last_attack);
+            ensure!(attack_elapsed >= admission as i64 - 2, "attack too fast");
             let elapsed = received
                 .checked_sub(p.last_attack_at)
                 .context("attack receive clock regressed")?;
             let credit = (p.attack_credit + elapsed as f32).min(cooldown * 2.);
             ensure!(
-                credit >= cooldown - 50.,
+                credit >= admission - 50.,
                 RejectedNativeShot(format!(
                     "attack exceeds server time budget: credit={credit} cooldown={cooldown} received_time={received} simulation_time={} last_received_time={} shot_time={time} last_shot_time={}",
                     self.now, p.last_attack_at, p.last_attack
                 ))
             );
-            p.attack_credit = credit - cooldown;
+            // Reconcile pre-Dazed packets without firing or desynchronizing the native counter/RNG.
+            p.attack_suppressed = attack_elapsed < cooldown as i64 - 2 || credit < cooldown - 50.;
+            p.attack_credit = credit
+                - if p.attack_suppressed {
+                    normal_cooldown
+                } else {
+                    cooldown
+                };
             p.last_attack_at = received;
             p.last_attack = time;
             p.attack_count = 0;
         }
         p.next_bullet = (bullet + 1) % 128;
         p.attack_count += 1;
-        let draw = if spec.min == spec.max {
-            spec.min
-        } else {
-            p.seed = ((p.seed as u64 * 16807) % 2147483647) as u32;
-            spec.min + (p.seed % (spec.max - spec.min) as u32) as i32
-        };
+        let draw = p.roll_damage(&spec);
         // In-flight native SHOOT packets must still consume their counter/RNG draw.
-        if p.paused {
+        if p.paused || condition & STUNNED != 0 || displaced || p.attack_suppressed {
+            tracing::debug!(
+                player = id,
+                condition,
+                displaced,
+                suppressed = p.attack_suppressed,
+                "condition suppressed shot"
+            );
             return Ok(());
         }
         p.character.shots += 1;
-        let multiplier = if flags & crate::condition::bit(crate::condition::WEAK) != 0 {
+        let multiplier = if condition & crate::condition::bit(crate::condition::WEAK) != 0 {
             0.5
         } else {
             0.5 + 1.5 * p.character.effective(&self.content)?[2] as f32 / 75.
@@ -3005,7 +3049,8 @@ impl World {
                 .effective(&self.content)
                 .expect("validated player equipment and base stats");
             let flags = p.conditions(self.now);
-            p.statuses.retain(|_, deadline| *deadline > self.now);
+            p.statuses
+                .retain(|_, (_, deadline)| deadline.saturating_add(1000) > self.now);
             if p.character.hp < values[0]
                 && flags
                     & (crate::condition::bit(crate::condition::SICK)
@@ -3043,15 +3088,13 @@ impl World {
                     let ground = self
                         .map
                         .cell(p.pos.x, p.pos.y)
-                        .expect("live player is on map")
+                        .expect("player inside map")
                         .ground;
-                    let step = if flags & crate::condition::bit(crate::condition::PARALYZED) != 0 {
-                        0.
-                    } else if flags & crate::condition::bit(crate::condition::SLOWED) != 0 {
-                        0.004 * 50.
-                    } else {
-                        (0.004 + (0.0096 - 0.004) * values[4] as f32 / 75.) * 50.
-                    } * self.content.grounds[&ground];
+                    let step = p
+                        .speed(&self.content, self.now)
+                        .expect("valid player equipment")
+                        * self.content.grounds[&ground]
+                        * 50.;
                     let n = d.min(step);
                     let pos = Pos {
                         x: p.pos.x + (goal.x - p.pos.x) / d * n,
@@ -3418,11 +3461,23 @@ impl World {
                 let p = self.players.get_mut(&id).unwrap();
                 let slow = crate::condition::bit(crate::condition::SLOWED);
                 let paralyzed = crate::condition::bit(crate::condition::PARALYZED);
-                let motion_condition = p.conditions(self.now) & (slow | paralyzed);
-                let restricts_motion = (motion_condition & paralyzed != 0
-                    && p.native_motion_condition & paralyzed == 0)
-                    || (motion_condition & slow != 0
-                        && p.native_motion_condition & (slow | paralyzed) == 0);
+                let motion_condition = p.conditions(self.now) & (slow | paralyzed | SPEEDY);
+                let base = 0.004
+                    + 0.0056
+                        * p.character
+                            .effective(&self.content)
+                            .expect("valid player equipment")[4] as f32
+                        / 75.;
+                let speed = |flags: i32| {
+                    if flags & paralyzed != 0 {
+                        0.
+                    } else if flags & slow != 0 {
+                        0.004
+                    } else {
+                        base * if flags & SPEEDY != 0 { 1.5 } else { 1. }
+                    }
+                };
+                let restricts_motion = speed(motion_condition) < speed(p.native_motion_condition);
                 if p.controller == Controller::Human
                     && p.character.alive
                     && !p.death_pending
@@ -4928,7 +4983,7 @@ mod tests {
         let error = w
             .shoot_timed(
                 player,
-                (1200, received),
+                (1200, received, true),
                 1,
                 0xa97,
                 Pos {
@@ -5018,7 +5073,7 @@ mod tests {
         p.attack_credit = 0.;
         w.now = 1200;
         assert!(
-            w.shoot_timed(player, (1298, 1200), 1, 0xa97, start, 0.)
+            w.shoot_timed(player, (1298, 1200, true), 1, 0xa97, start, 0.)
                 .is_err()
         );
         w.attack_epoch = Instant::now() - std::time::Duration::from_millis(1298);
@@ -5030,13 +5085,13 @@ mod tests {
         p.last_attack_at = 1298;
         p.attack_credit = 0.;
         assert!(
-            w.shoot_timed(player, (1596, 1400), 3, 0xa97, start, 0.)
+            w.shoot_timed(player, (1596, 1400, true), 3, 0xa97, start, 0.)
                 .unwrap_err()
                 .to_string()
                 .contains("attack exceeds server time budget")
         );
         assert!(
-            w.shoot_timed(player, (1596, 1200), 3, 0xa97, start, 0.)
+            w.shoot_timed(player, (1596, 1200, true), 3, 0xa97, start, 0.)
                 .unwrap_err()
                 .to_string()
                 .contains("attack receive clock regressed")

@@ -60,6 +60,78 @@ INSERT INTO discord_recovery VALUES(1,123,124);
 INSERT INTO recovery_codes VALUES(1,'NEVER_EXPORT_RECOVERY_CODE_HASH',100,400);
 INSERT INTO password_resets VALUES(1,'NEVER_EXPORT_RESET_TOKEN_HASH',100,1000);""")
 
+    def add_social(self):
+        self.add_actions()
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.executescript('''
+CREATE TABLE account_lists(account INTEGER NOT NULL REFERENCES accounts(id),list_id INTEGER NOT NULL CHECK(list_id IN (0,1)),target INTEGER NOT NULL REFERENCES accounts(id),PRIMARY KEY(account,list_id,target),CHECK(account<>target));
+INSERT INTO account_lists VALUES(1,0,2),(1,1,2),(2,0,1),(1,0,3);''')
+
+    def test_social_roundtrip_preserves_lists_without_credentials(self):
+        self.add_social()
+        before = self.export()
+        self.assertEqual(before['schema'], 6)
+        raw = gzip.decompress(self.output.read_bytes())
+        for secret in [b'NEVER_EXPORT', b'LOGIN_MUST_NEVER_BE_UPLOADED', b'"guid"', b'password_resets', b'recovery_codes', b'credentials', b'discord_codes']:
+            self.assertNotIn(secret, raw)
+        directory = self.root / 'social-restored'
+        backup.restore(self.output, directory)
+        self.assertEqual(backup.snapshot(directory / 'game.db', backup.SOCIAL_GAME), before['game'])
+        with closing(sqlite3.connect(directory / 'game.db')) as db:
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone(), (6,))
+            self.assertTrue(all(r[0] is None for r in db.execute('SELECT guid FROM accounts')))
+            db.execute('PRAGMA foreign_keys=ON')
+            for entry in [(1,0,2), (1,0,1), (1,2,2), (999,0,2), (1,0,999), (None,0,2), (1,None,2), (1,0,None)]:
+                with self.subTest(entry=entry), self.assertRaises(sqlite3.IntegrityError):
+                    db.execute('INSERT INTO account_lists VALUES(?,?,?)', entry)
+
+    def test_social_invalid_entries_and_unknown_fields_fail_closed(self):
+        self.add_social()
+        before = self.export()
+        for field, values in [('account', [True, '1', 1.0, 0, -1, 2147483648, 999, 2]), ('target', [True, '2', 2.0, 0, -1, 2147483648, 999, 1]), ('list_id', [True, '0', 0.0, -1, 2])]:
+            for value in values:
+                malformed = deepcopy(before)
+                malformed['game']['account_lists'][0][field] = value
+                if value == 2147483648:
+                    malformed['game']['accounts'].append({'id': value, 'name': 'Invalid'})
+                    malformed['game']['account_fame'].append({'account': value, 'balance': 0, 'earned': 0})
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, 'account list'):
+                    backup.validate(malformed)
+        malformed = deepcopy(before)
+        malformed['game']['account_lists'].append(malformed['game']['account_lists'][0])
+        with self.assertRaisesRegex(ValueError, 'Duplicate account list'):
+            backup.validate(malformed)
+        malformed = deepcopy(before)
+        malformed['game']['account_fame'] = []
+        with self.assertRaisesRegex(ValueError, 'wallet'):
+            backup.validate(malformed)
+        malformed = deepcopy(before)
+        del malformed['game']['account_lists']
+        with self.assertRaisesRegex(ValueError, 'tables'):
+            backup.validate(malformed)
+        malformed = deepcopy(before)
+        malformed['game']['account_lists'][0]['token'] = 'NEVER_EXPORT'
+        self.output.write_bytes(gzip.compress(json.dumps(malformed).encode()))
+        with self.assertRaisesRegex(ValueError, 'fields'):
+            backup.restore(self.output, self.root / 'invalid-social')
+        self.assertFalse((self.root / 'invalid-social').exists())
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.execute('ALTER TABLE account_lists ADD COLUMN token TEXT')
+        with self.assertRaisesRegex(ValueError, 'columns'):
+            self.export()
+
+    def test_social_native_count_limit_applies_per_owner_and_list(self):
+        self.add_social()
+        before = self.export()
+        next_account = max(row['id'] for row in before['game']['accounts']) + 1
+        before['game']['accounts'] += [{'id': i, 'name': f'Player{i}'} for i in range(next_account, 32770)]
+        before['game']['account_fame'] += [{'account': i, 'balance': 0, 'earned': 0} for i in range(next_account, 32770)]
+        before['game']['account_lists'] = [{'account': 1, 'list_id': list_id, 'target': i} for list_id in (0, 1) for i in range(2, 32769)] + [{'account': 2, 'list_id': 0, 'target': 1}]
+        backup.validate(before)
+        before['game']['account_lists'].append({'account': 1, 'list_id': 0, 'target': 32769})
+        with self.assertRaisesRegex(ValueError, 'count limit'):
+            backup.validate(before)
+
     def test_actions_roundtrip_preserves_wallet_and_consent_without_reset_authority(self):
         self.add_actions()
         before = self.export()
@@ -295,7 +367,7 @@ INSERT INTO password_resets VALUES(1,'NEVER_EXPORT_RESET_TOKEN_HASH',100,1000);"
         self.add_latest_state()
         with closing(sqlite3.connect(self.game)) as db, db:
             db.execute('CREATE TABLE shore_bots(name TEXT PRIMARY KEY,account INTEGER NOT NULL UNIQUE REFERENCES accounts(id))')
-            for account, name in enumerate(['Cautious', 'Confident', 'Greedy'], 2):
+            for account, name in enumerate(['Cautious', 'Confident', 'Greedy', 'Healer', 'Leader', 'Social'], 2):
                 db.execute('INSERT INTO accounts VALUES(?,?,?)', (account, f'BOT_LOGIN_MUST_NEVER_BE_UPLOADED_{account}', name))
                 db.execute('INSERT INTO shore_bots VALUES(?,?)', (name, account))
                 stats = dict(self.stats, id=account, account=account, name=name, alive=account != 2,
@@ -311,7 +383,8 @@ INSERT INTO password_resets VALUES(1,'NEVER_EXPORT_RESET_TOKEN_HASH',100,1000);"
         before = self.export()
         self.assertEqual(before['schema'], 3)
         self.assertEqual(before['game']['shore_bots'], [{'name': name, 'account': account}
-                         for name, account in [('Cautious', 2), ('Confident', 3), ('Greedy', 4)]])
+                         for name, account in [('Cautious', 2), ('Confident', 3), ('Greedy', 4),
+                                               ('Healer', 5), ('Leader', 6), ('Social', 7)]])
         raw = gzip.decompress(self.output.read_bytes())
         for credential in [b'GUEST_LOGIN_MUST_NEVER_BE_UPLOADED', b'BOT_LOGIN_MUST_NEVER_BE_UPLOADED', b'"guid"']:
             self.assertNotIn(credential, raw)
@@ -321,7 +394,7 @@ INSERT INTO password_resets VALUES(1,'NEVER_EXPORT_RESET_TOKEN_HASH',100,1000);"
         self.assertEqual(backup.snapshot(restored / 'game.db', backup.SHORE_GAME), before['game'])
         self.assertEqual(backup.snapshot(restored / 'levels.sqlite', backup.DISCORD), before['discord'])
         with closing(sqlite3.connect(restored / 'game.db')) as db:
-            self.assertEqual(db.execute('SELECT guid FROM accounts ORDER BY id').fetchall(), [(None,)] * 4)
+            self.assertEqual(db.execute('SELECT guid FROM accounts ORDER BY id').fetchall(), [(None,)] * 7)
             self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
             self.assertEqual(db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
             db.execute('PRAGMA foreign_keys=ON')
@@ -352,7 +425,7 @@ INSERT INTO password_resets VALUES(1,'NEVER_EXPORT_RESET_TOKEN_HASH',100,1000);"
             del malformed['game'][table]
             with self.subTest(missing=table), self.assertRaisesRegex(ValueError, 'tables'):
                 backup.validate(malformed)
-        for version in [6, True, '3']:
+        for version in [7, True, '3']:
             with self.subTest(version=version), self.assertRaisesRegex(ValueError, 'envelope'):
                 backup.validate(dict(before, schema=version))
 

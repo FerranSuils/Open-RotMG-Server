@@ -622,13 +622,16 @@ async fn handle(
             } else {
                 None
             };
+            let lists = a.store.account_lists(account).await?;
             *player = Some(
                 a.world
                     .call(move |w| {
                         if let Some(vault) = vault {
                             w.load_vault(vault)?;
                         }
-                        w.enter(ch, Some(output))
+                        let id = w.enter(ch, Some(output))?;
+                        w.sync_account_lists(id, Some(lists))?;
+                        Ok(id)
                     })
                     .await?,
             );
@@ -721,9 +724,89 @@ async fn handle(
                     Err(error) => error.to_string(),
                 };
                 tx.send(crate::world::chat_private(&reply)).await?;
+            } else if matches!(
+                text.split_whitespace()
+                    .next()
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("/ignore" | "/unignore")
+            ) {
+                let result = async {
+                    crate::world::validate_chat(&text)?;
+                    a.world
+                        .directory(move |d| d.chat_permit(id, received))
+                        .await?;
+                    let args: Vec<_> = text.split_whitespace().collect();
+                    ensure!(
+                        args.len() == 2,
+                        "Usage: /ignore <player> or /unignore <player>"
+                    );
+                    let owner = account
+                        .as_ref()
+                        .context("authenticated session required")?
+                        .id;
+                    let target = a.store.account_named(args[1].into()).await?;
+                    let add = args[0].eq_ignore_ascii_case("/ignore");
+                    let lists = a.store.edit_account_list(owner, 1, add, target).await?;
+                    a.world
+                        .call(move |w| w.sync_account_lists(id, Some(lists)))
+                        .await?;
+                    Ok::<_, anyhow::Error>(if add {
+                        "Player ignored."
+                    } else {
+                        "Player unignored."
+                    })
+                }
+                .await;
+                let reply = match result {
+                    Ok(text) => crate::world::chat_info(text),
+                    Err(error) => crate::world::chat_error(&error.to_string()),
+                };
+                tx.send(reply).await?;
             } else if let Err(error) = a.world.directory(move |d| d.chat(id, text, received)).await
             {
                 tracing::warn!(player=id, error=%error, "local chat rejected");
+                tx.send(crate::world::chat_error(&error.to_string()))
+                    .await?;
+            }
+        }
+        wire::EDIT_ACCOUNT_LIST => {
+            let list = r.i32()?;
+            let add = r.u8()?;
+            ensure!(add <= 1, "invalid account list operation");
+            let target = r.i32()?;
+            r.done()?;
+            let id = player.context("account list edit before character")?;
+            let owner = account
+                .as_ref()
+                .context("authenticated session required")?
+                .id;
+            let result = async {
+                ensure!((0..=1).contains(&list), "invalid account list");
+                let target = a
+                    .world
+                    .call(move |w| w.account_list_target(id, target))
+                    .await?;
+                let lists = a
+                    .store
+                    .edit_account_list(owner, list, add != 0, target)
+                    .await?;
+                a.world
+                    .call(move |w| w.sync_account_lists(id, Some(lists)))
+                    .await
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(player=id, list, target, error=%error, "account list edit rejected");
+                // The selected client only adds to ACCOUNTLIST 0; a fresh session clears an optimistic lock.
+                if list == 0 && add != 0 {
+                    return Err(
+                        error.context("Lock change failed; reconnect to refresh your player list")
+                    );
+                }
+                a.world
+                    .call(move |w| w.sync_account_lists(id, None))
+                    .await?;
                 tx.send(crate::world::chat_error(&error.to_string()))
                     .await?;
             }

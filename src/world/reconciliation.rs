@@ -139,7 +139,8 @@ impl World {
         let item = self.content.get(kind)?;
         let count = if time == last { count } else { 0 };
         if time != last {
-            let cooldown = attack_cooldown(p, &self.content, self.now, item.rate)?;
+            let rate = 0.0015 + 0.0065 * p.character.effective(&self.content)?[5] as f64 / 75.;
+            let cooldown = (1. / (rate * f64::from(item.rate))).floor() as f32;
             ensure!(
                 i64::from(time) - i64::from(last) >= cooldown as i64 - 2,
                 "discarded attack too fast"
@@ -152,6 +153,26 @@ impl World {
         Ok(count)
     }
 
+    fn consume_native_discard(
+        &mut self,
+        id: i32,
+        time: i32,
+        bullet: u8,
+        kind: u16,
+        count: i32,
+    ) -> Result<()> {
+        let spec = self
+            .content
+            .get(kind)?
+            .projectiles
+            .get(&0)
+            .context("weapon has no projectile zero")?;
+        let p = self.players.get_mut(&id).context("player missing")?;
+        // Ruffle allocated the shot before the correction, even though no authoritative bullet survives.
+        p.roll_damage(spec);
+        p.consume_discarded_shot(id, time, bullet, count);
+        Ok(())
+    }
     pub fn correct_native_shot(
         &mut self,
         id: i32,
@@ -162,11 +183,7 @@ impl World {
     ) -> Result<()> {
         let count = self.validate_discarded_shot(id, time, bullet, kind)?;
         self.correct_position(id, time, reason)?;
-        self.players
-            .get_mut(&id)
-            .unwrap()
-            .consume_discarded_shot(id, time, bullet, count);
-        Ok(())
+        self.consume_native_discard(id, time, bullet, kind, count)
     }
 
     pub(super) fn discard_correcting_move(&self, id: i32, pos: Pos, time: i32) -> Result<bool> {
@@ -209,10 +226,7 @@ impl World {
             "invalid correcting SHOOT"
         );
         let count = self.validate_discarded_shot(id, time, bullet, kind)?;
-        self.players
-            .get_mut(&id)
-            .unwrap()
-            .consume_discarded_shot(id, time, bullet, count);
+        self.consume_native_discard(id, time, bullet, kind, count)?;
         Ok(true)
     }
 
