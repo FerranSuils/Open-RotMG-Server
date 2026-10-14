@@ -12,9 +12,9 @@ from urllib.request import urlopen
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
-REVISION = "7e3f4b83df7f65ea2a7b57b10c2288ef02c5ae8c"
+REVISION = "c798581b8bfec72b28a2b845881b3381d7cf6784"
 URL = f"https://codeload.github.com/OpenRotMG/Open-RotMG-Client/zip/{REVISION}"
-SHA256 = "228b163d22b087ead417a1f3d6bc8dbadb13e7c598386239cea9fd26be04fe8c"
+SHA256 = "3bb6121f53c28f2ccf67ee03ddbdd6efdc1f014dd631ad8d611339841b66c1da"
 LOG = ROOT / ".local/server.log"
 
 
@@ -46,7 +46,11 @@ def prepare_client():
             archive.extractall(stage)
             (stage / prefix).rename(client)
             stage.rmdir()
-        for name in ["client.swf", "index.html", "scripts/run.py", "run.sh"]:
+        inputs = ["client.swf", "index.html", "run.sh"] + [
+            name[len(prefix) + 1:] for name in archive.namelist()
+            if name.startswith((f"{prefix}/scripts/", f"{prefix}/ruffle/")) and not name.endswith("/")
+        ]
+        for name in inputs:
             path = client / name
             if path.is_symlink() or not path.is_file() or path.read_bytes() != archive.read(f"{prefix}/{name}"):
                 raise RuntimeError(f"Cached client asset is missing or modified: {path}. Remove {client} and rerun.")

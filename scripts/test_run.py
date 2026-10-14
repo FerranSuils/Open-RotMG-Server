@@ -73,6 +73,22 @@ class LauncherTests(unittest.TestCase):
             launcher.prepare_client()
         self.assertEqual((self.client / 'index.html').read_text(), 'modified')
 
+    def test_cached_runtime_lock_and_source_patch_modifications_fail(self):
+        files = {'client.swf': b'reference', 'index.html': b'page', 'scripts/run.py': b'prepare',
+                 'run.sh': b'#!/bin/sh\n', 'ruffle/lock.json': b'locked',
+                 'ruffle/patches/fix.patch': b'source fix'}
+        data = self.archive(files)
+        with patch.object(launcher, 'SHA256', hashlib.sha256(data).hexdigest()), \
+                patch.object(launcher, 'urlopen', return_value=io.BytesIO(data)):
+            launcher.prepare_client()
+            for name in ['ruffle/lock.json', 'ruffle/patches/fix.patch']:
+                path = self.client / name
+                path.write_bytes(b'modified')
+                with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, 'missing or modified'):
+                    launcher.prepare_client()
+                self.assertEqual(path.read_bytes(), b'modified')
+                path.write_bytes(files[name])
+
     def test_archive_traversal_and_symlinks_are_rejected(self):
         stream = io.BytesIO()
         with ZipFile(stream, 'w') as archive:
