@@ -10,7 +10,7 @@ openrotmg.org {
     }
     @recovery path /recover /recover/* /api/account/recover
     header @recovery Cache-Control "no-store"
-    header @recovery Referrer-Policy "no-referrer"
+    header @recovery >Referrer-Policy "no-referrer"
     header @recovery Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     @private path /dev /dev/* /internal /internal/*
     handle @private {
