@@ -218,11 +218,17 @@ async fn resolve(a: &App, actor: i32) -> Result<i32> {
         .await
 }
 async fn snapshot(a: &App, actor: i32, detail: bool) -> Result<Value> {
+    a.testing
+        .as_ref()
+        .context("test session missing")?
+        .registration(actor)?;
     let id = resolve(a, actor).await?;
     let content = a.content.clone();
     a.world.directory(move |d| {
         let view = d.player_view(id)?;
-        let ch = &d.worlds[&view.session.world].players[&id].character;
+        let player = &d.worlds[&view.session.world].players[&id];
+        let ch = &player.character;
+        let controller = match player.controller { crate::world::Controller::Human => Controller::Native, crate::world::Controller::Qa => Controller::Direct, crate::world::Controller::Autonomous => Controller::GameBot };
         if detail { return Ok(json!({"view":view,"diagnostic":d.worlds[&view.session.world].observe(id)?,"privileged":true,"paused":d.clock.paused(),"pause_scope":"server","provenance":"prepared"})); }
         let item = |kind: i32| -> Result<Value> { if kind == -1 { Ok(Value::Null) } else { Ok(json!({"id":kind,"name":content.get(u16::try_from(kind)?)?.name})) } };
         let mut relevant = Vec::new();
@@ -234,7 +240,7 @@ async fn snapshot(a: &App, actor: i32, detail: bool) -> Result<Value> {
         let nearby = relevant.iter().take(8).map(|o| Ok(json!({"id":o.id,"kind":o.kind,"name":if o.name.is_empty(){&content.get(o.kind)?.name}else{&o.name},"hp":o.hp,"position":o.position}))).collect::<Result<Vec<_>>>()?;
         let mut character = serde_json::to_value(&view.character)?;
         character["stats"] = json!({"max_hp":view.character.stats[0],"max_mp":view.character.stats[1],"attack":view.character.stats[2],"defense":view.character.stats[3],"speed":view.character.stats[4],"dexterity":view.character.stats[5],"vitality":view.character.stats[6],"wisdom":view.character.stats[7]});
-        Ok(json!({"actor":actor,"session":view.session,"world":view.map.name,"tick":view.tick,"game_ms":view.time_ms,"position":view.position,"character":character,"equipment":ch.items[..4].iter().map(|i|item(*i)).collect::<Result<Vec<_>>>()?,"lifecycle":view.lifecycle,"verification":{"shots":ch.shots,"kills":ch.kills,"pirate_caves":ch.pirate_caves},"nearby":nearby,"omitted_relevant_objects":relevant.len().saturating_sub(8),"paused":d.clock.paused(),"pause_scope":"server","knowledge_scope":"client_known_and_server_visible","provenance":"prepared"}))
+        Ok(json!({"actor":actor,"controller":controller,"session":view.session,"world":view.map.name,"tick":view.tick,"game_ms":view.time_ms,"position":view.position,"character":character,"equipment":ch.items[..4].iter().map(|i|item(*i)).collect::<Result<Vec<_>>>()?,"lifecycle":view.lifecycle,"verification":{"shots":ch.shots,"kills":ch.kills,"pirate_caves":ch.pirate_caves},"nearby":nearby,"omitted_relevant_objects":relevant.len().saturating_sub(8),"paused":d.clock.paused(),"pause_scope":"server","knowledge_scope":"client_known_and_server_visible","provenance":"prepared"}))
     }).await
 }
 async fn pause(a: &App, native: &[i32]) -> Result<()> {

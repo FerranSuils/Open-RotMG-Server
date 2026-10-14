@@ -66,6 +66,7 @@ async fn explicit_spawn_idempotency_and_compact_observations() {
     let actor = created["result"]["actor"].as_i64().unwrap();
     let view = request(&app, "view", json!({"op":"observe","actor":actor})).await;
     assert_eq!(view["character"]["level"], 8);
+    assert_eq!(view["controller"], "direct");
     assert_eq!(view["equipment"][0]["name"], "Firebrand Staff");
     assert!(view.get("tiles").is_none());
     assert!(serde_json::to_vec(&view).unwrap().len() < 6000);
@@ -182,6 +183,7 @@ async fn actual_gameplay_controller_can_run_a_bounded_time_goal() {
     )
     .await;
     assert_eq!(result["result"]["goal_reached"], true);
+    assert_eq!(result["result"]["state"]["controller"], "game_bot");
     assert_eq!(result["paused"], true);
     assert_eq!(result["result"]["state"]["lifecycle"]["output"], "live");
     app.shutdown.send_replace(true);
