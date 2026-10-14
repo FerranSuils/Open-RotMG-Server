@@ -17,6 +17,118 @@ fn native() -> (World, i32, mpsc::Receiver<Packet>, watch::Receiver<bool>) {
 }
 
 #[test]
+fn restrictive_native_condition_queues_real_stat29_before_one_owned_goto() {
+    let (mut w, id, mut rx, loss) = native();
+    w.safe = true;
+    while rx.try_recv().is_ok() {}
+    w.apply_condition(id, crate::condition::SLOWED, 2000)
+        .unwrap();
+    let authority = {
+        let p = &w.players[&id];
+        (
+            p.seed,
+            p.next_bullet,
+            p.attack_credit,
+            p.movement_credit,
+            p.character.shots,
+            p.last_move,
+        )
+    };
+    w.step();
+    w.step();
+    let mut packets = vec![];
+    while let Ok(packet) = rx.try_recv() {
+        packets.push(packet);
+    }
+    assert_eq!(packets.iter().filter(|p| p.id == wire::GOTO).count(), 1);
+    let tick = packets.iter().position(|p| p.id == wire::NEW_TICK).unwrap();
+    let go = packets.iter().position(|p| p.id == wire::GOTO).unwrap();
+    assert!(tick < go);
+    let mut r = crate::wire::Reader::new(&packets[tick].body);
+    r.i32().unwrap();
+    assert_eq!(r.i32().unwrap(), 100);
+    let count = r.i16().unwrap();
+    let mut mask = None;
+    for _ in 0..count {
+        let entity = r.i32().unwrap();
+        r.f32().unwrap();
+        r.f32().unwrap();
+        let stats = r.i16().unwrap();
+        for _ in 0..stats {
+            let kind = r.u8().unwrap();
+            if matches!(kind, 31 | 62) {
+                r.utf().unwrap();
+            } else {
+                let value = r.i32().unwrap();
+                if entity == id && kind == 29 {
+                    mask = Some(value);
+                }
+            }
+        }
+    }
+    r.done().unwrap();
+    assert_eq!(
+        mask.unwrap() & crate::condition::bit(crate::condition::SLOWED),
+        crate::condition::bit(crate::condition::SLOWED)
+    );
+    let p = &w.players[&id];
+    assert_eq!(
+        (
+            p.seed,
+            p.next_bullet,
+            p.attack_credit,
+            p.movement_credit,
+            p.character.shots,
+            p.last_move
+        ),
+        authority
+    );
+    assert!(p.correcting().unwrap());
+    assert!(!*loss.borrow());
+    w.acknowledge_goto(id, 1100).unwrap();
+    w.apply_condition(id, crate::condition::SLOWED, 2000)
+        .unwrap();
+    w.step();
+    w.step();
+    while let Ok(packet) = rx.try_recv() {
+        assert_ne!(packet.id, wire::GOTO, "refresh must not reanchor again");
+    }
+    w.now = 2500;
+    w.step();
+    w.step();
+    while let Ok(packet) = rx.try_recv() {
+        assert_ne!(
+            packet.id,
+            wire::GOTO,
+            "expiry only raises the admitted movement coefficient"
+        );
+    }
+    w.players
+        .get_mut(&id)
+        .unwrap()
+        .statuses
+        .insert(crate::condition::PARALYZED, w.now + 1000);
+    w.step();
+    w.step();
+    let mut gotos = 0;
+    while let Ok(packet) = rx.try_recv() {
+        gotos += usize::from(packet.id == wire::GOTO);
+    }
+    assert_eq!(gotos, 1);
+    w.acknowledge_goto(id, 1200).unwrap();
+    w.apply_condition(id, crate::condition::SLOWED, 2000)
+        .unwrap();
+    w.step();
+    w.step();
+    while let Ok(packet) = rx.try_recv() {
+        assert_ne!(
+            packet.id,
+            wire::GOTO,
+            "Slowed cannot lower an already Paralyzed motor"
+        );
+    }
+}
+#[test]
 fn predicted_origin_failure_is_typed_and_correction_never_authorizes_the_shot() {
     let (mut w, id, _rx, _loss) = native();
     let pos = w.players[&id].pos;
