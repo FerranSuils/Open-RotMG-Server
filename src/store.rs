@@ -6,6 +6,7 @@ use std::{path::Path, sync::mpsc};
 use tokio::sync::oneshot;
 
 mod accounts;
+mod hiscores;
 mod legends;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -191,6 +192,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_living_character ON characters(account) WH
 CREATE TABLE IF NOT EXISTS deaths(character INTEGER PRIMARY KEY REFERENCES characters(id),snapshot TEXT NOT NULL,killed_by TEXT NOT NULL,died_at INTEGER NOT NULL DEFAULT(unixepoch()));
 CREATE TABLE IF NOT EXISTS vaults(account INTEGER PRIMARY KEY REFERENCES accounts(id),items TEXT NOT NULL CHECK(json_array_length(items)=8),revision INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS credentials(account INTEGER PRIMARY KEY REFERENCES accounts(id),email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS competitors(account INTEGER PRIMARY KEY REFERENCES accounts(id));
+CREATE TABLE IF NOT EXISTS collections(account INTEGER NOT NULL REFERENCES accounts(id),item INTEGER NOT NULL CHECK(item BETWEEN 0 AND 65535),found_at INTEGER NOT NULL,PRIMARY KEY(account,item));
+CREATE TABLE IF NOT EXISTS discord_links(account INTEGER PRIMARY KEY REFERENCES accounts(id),discord_id TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS discord_codes(account INTEGER PRIMARY KEY REFERENCES accounts(id),hash TEXT NOT NULL UNIQUE,issued_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         let migration = c.transaction()?;
         let records = {
@@ -425,6 +430,19 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         writes: Vec<InventoryWrite>,
         vault: Option<Vault>,
     ) -> Result<Vec<i32>> {
+        self.exchange_collected(writes, vault, None).await
+    }
+    pub async fn exchange_collected(
+        &self,
+        writes: Vec<InventoryWrite>,
+        vault: Option<Vault>,
+        collected: Option<u16>,
+    ) -> Result<Vec<i32>> {
+        ensure!(
+            collected.is_none() || writes.len() == 1,
+            "collection requires one pickup owner"
+        );
+        let collector = writes.first().context("missing inventory owner")?.account;
         ensure!(
             (1..=2).contains(&writes.len()),
             "exchange must contain one or two characters"
@@ -462,6 +480,9 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 let n = tx.execute("UPDATE characters SET items=?4,revision=revision+1 WHERE id=?1 AND account=?2 AND revision=?3 AND alive=1", params![write.id, write.account, write.revision, serde_json::to_string(&write.items)?])?;
                 ensure!(n == 1, "inventory conflict: character {}, account {}, expected revision {}", write.id, write.account, write.revision);
                 revisions.push(write.revision + 1);
+            }
+            if let Some(item) = collected {
+                tx.execute("INSERT OR IGNORE INTO collections(account,item,found_at) VALUES(?1,?2,unixepoch())", params![collector,item])?;
             }
             if let Some(vault) = vault {
                 let n = tx.execute("UPDATE vaults SET items=?3,revision=revision+1 WHERE account=?1 AND revision=?2", params![vault.account, vault.revision, serde_json::to_string(&vault.items)?])?;

@@ -50,6 +50,16 @@ fn candidates(content: &Content, pick: Pick) -> Vec<u16> {
             .collect(),
     }
 }
+pub fn collectibles(content: &Content) -> std::collections::BTreeSet<u16> {
+    [0x600, 0x60e, 0x687, 0x68a, 0x68f, 0x683, 0x927]
+        .into_iter()
+        .flat_map(|kind| {
+            table(kind)
+                .iter()
+                .flat_map(|(_, pick)| candidates(content, *pick))
+        })
+        .collect()
+}
 pub fn validate(content: &Content, kind: u16) -> Result<()> {
     for (_, pick) in table(kind) {
         let items = candidates(content, *pick);
