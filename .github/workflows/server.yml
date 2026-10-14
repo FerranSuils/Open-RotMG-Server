@@ -50,5 +50,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "server-$GITHUB_SHA" dist/server.tar.gz dist/release.json \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest=false \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest=false --draft \
             --title "Server ${GITHUB_SHA:0:7}" --notes "Tested server build for $GITHUB_SHA"
+          gh release edit "server-$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
