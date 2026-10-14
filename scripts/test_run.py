@@ -107,11 +107,15 @@ class LauncherTests(unittest.TestCase):
         (self.client / 'scripts').mkdir(parents=True)
         (self.client / 'scripts/run.py').touch()
         state = self.root / 'bots'
-        with patch('sys.argv', ['run.py', '8081', '--client', str(self.client), '--state', str(state), '--shore-bots', '--release']), \
-                patch.object(launcher.shutil, 'which', return_value='/cargo'), \
-                patch.object(launcher, 'run', return_value=0) as run:
-            self.assertEqual(launcher.main(), 0)
-        self.assertEqual(run.call_args.args[0], ['cargo', 'run', '--locked', '--release', '--', '--client', str(self.client), '--port', '8081', '--state', str(state), '--shore-bots'])
+        for flag in ['--shore-bots', '--no-shore-bots']:
+            with self.subTest(flag=flag), patch('sys.argv', ['run.py', '8081', '--client', str(self.client), '--state', str(state), flag, '--release']), \
+                    patch.object(launcher.shutil, 'which', return_value='/cargo'), \
+                    patch.object(launcher, 'run', return_value=0) as run:
+                self.assertEqual(launcher.main(), 0)
+            self.assertEqual(run.call_args.args[0], ['cargo', 'run', '--locked', '--release', '--', '--client', str(self.client), '--port', '8081', '--state', str(state), flag])
+        with patch('sys.argv', ['run.py', '8081', '--shore-bots', '--no-shore-bots']), self.assertRaises(SystemExit) as error:
+            launcher.main()
+        self.assertEqual(error.exception.code, 2)
 
     def test_explicit_state_is_used_for_saves_cache_and_logs(self):
         state = self.root / 'isolated'
