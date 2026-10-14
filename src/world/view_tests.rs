@@ -109,10 +109,81 @@ fn own_condition_view_matches_native_stat29_without_exposing_other_statuses() {
                 .as_array()
                 .unwrap()
                 .iter()
+                .filter(|o| o["kind"] == WIZARD)
                 .all(|o| o.get("condition_mask").is_none())
         );
         assert_eq!(d.worlds[&-2].players[&a].statuses, before);
     }
+}
+#[test]
+fn known_visible_npc_condition_view_matches_native29_without_hidden_entities() {
+    let mut d = super::tests::directory();
+    let (a, _ar) = receive(&mut d, -2, 1, WIZARD);
+    let w = d.worlds.get_mut(&-2).unwrap();
+    let pos = w.players[&a].pos;
+    let npc = w.spawn_entity(0x600, pos, vec![]).unwrap();
+    let hidden = w.spawn_entity(0x600, pos, vec![]).unwrap();
+    w.entities.get_mut(&hidden).unwrap().published = false;
+    w.entities.get_mut(&npc).unwrap().condition =
+        crate::condition::bit(crate::condition::INVULNERABLE);
+    w.apply_condition(npc, crate::condition::STUNNED, 2000)
+        .unwrap();
+    w.updates(a, false).unwrap();
+    for now in [0, 2000] {
+        let w = d.worlds.get_mut(&-2).unwrap();
+        w.now = now;
+        let before = w.entities[&npc].statuses.clone();
+        let bytes = w.stats(npc).unwrap();
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.i32().unwrap(), npc);
+        r.f32().unwrap();
+        r.f32().unwrap();
+        let count = r.i16().unwrap();
+        let mut native_mask = None;
+        for _ in 0..count {
+            let kind = r.u8().unwrap();
+            if kind == 31 {
+                r.utf().unwrap();
+            } else {
+                let value = r.i32().unwrap();
+                if kind == 29 {
+                    native_mask = Some(value);
+                }
+            }
+        }
+        r.done().unwrap();
+        let view = d.player_view(a).unwrap();
+        assert_eq!(
+            view.objects
+                .iter()
+                .find(|o| o.id == npc)
+                .unwrap()
+                .condition_mask,
+            native_mask
+        );
+        assert!(native_mask.unwrap() & crate::condition::bit(crate::condition::INVULNERABLE) != 0);
+        assert_eq!(
+            native_mask.unwrap() & crate::condition::bit(crate::condition::STUNNED) != 0,
+            now == 0
+        );
+        assert!(!view.objects.iter().any(|o| o.id == hidden));
+        assert_eq!(d.worlds[&-2].entities[&npc].statuses, before);
+    }
+    d.worlds
+        .get_mut(&-2)
+        .unwrap()
+        .players
+        .get_mut(&a)
+        .unwrap()
+        .known
+        .remove(&npc);
+    assert!(
+        !d.player_view(a)
+            .unwrap()
+            .objects
+            .iter()
+            .any(|o| o.id == npc)
+    );
 }
 #[test]
 fn projectile_view_is_observed_trajectory_not_rng_hit_ledger_or_old_shots() {

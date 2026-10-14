@@ -70,6 +70,7 @@ fn object(id: i32, kind: u16, x: f32, y: f32) -> VisibleObject {
         equipped: vec![],
         contents: vec![],
         blocks: false,
+        condition_mask: None,
     }
 }
 #[test]
