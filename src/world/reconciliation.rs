@@ -11,8 +11,8 @@ pub enum NativeInput {
 }
 
 #[derive(Debug)]
-pub struct InvalidShotOrigin(pub String);
-impl std::fmt::Display for InvalidShotOrigin {
+pub struct RejectedNativeShot(pub String);
+impl std::fmt::Display for RejectedNativeShot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
@@ -135,7 +135,7 @@ impl World {
         Ok(count)
     }
 
-    pub fn correct_shot_origin(
+    pub fn correct_native_shot(
         &mut self,
         id: i32,
         time: i32,
