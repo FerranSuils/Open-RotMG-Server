@@ -17,6 +17,9 @@ test('twenty seconds paused funds neither performance nor Date clocks on resume'
   const paused=f.clocks();f.call(false);const resumed=f.clocks();f.advance(40);
   assert.deepEqual([before,paused,resumed,f.clocks()],[[100,1000100,1000100],[100,1000100,1000100],[100,1000100,1000100],[140,1000140,1000140]]);
 });
+test('Date.now preserves integer milliseconds during active page time',()=>{
+  const f=fixture();f.call(null);f.advance(0.25);assert.deepEqual(f.clocks(),[100.25,1000100,1000100]);
+});
 test('repeated pauses do not double subtract and active time remains real time',()=>{
   const f=fixture();f.call(true);f.advance(20);f.call(true);f.advance(30);f.call(false);f.advance(60);f.call(false);
   assert.deepEqual(f.clocks(),[160,1000160,1000160]);

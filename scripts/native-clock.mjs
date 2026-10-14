@@ -15,7 +15,7 @@ export function nativeClock(paused) {
       return Reflect.construct(NativeDate,args.length?args:[epoch+now()],new.target);
     }
     Object.setPrototypeOf(PausableDate,NativeDate);PausableDate.prototype=NativeDate.prototype;
-    Object.defineProperty(PausableDate,'now',{value:()=>epoch+now()});globalThis.Date=PausableDate;
+    Object.defineProperty(PausableDate,'now',{value:()=>Math.trunc(epoch+now())});globalThis.Date=PausableDate;
     clock=globalThis[key]={pause:()=>{if(stopped===null)stopped=raw();},resume:()=>{if(stopped!==null){excluded+=raw()-stopped;stopped=null;}},read:()=>({paused:stopped!==null,clock_ms:now()})};
   }
   if(paused===true) {
