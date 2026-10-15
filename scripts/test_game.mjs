@@ -110,6 +110,17 @@ test('unknown input and changed id reuse fail without resuming',async t=>{
   const before=f.calls.length, conflict=await f.run('valid',{...move,pauseAfter:false});
   assert.equal(conflict.code,1);assert.match(conflict.stderr,/different command/);assert.equal(f.calls.length,before);
 });
+test('credentialed origin fails at the origin gate before token, intent, or dispatch',async t=>{
+  const f=await fixture(t),config=JSON.parse(await readFile(join(f.dir,'config.json'),'utf8'));
+  await writeFile(join(f.dir,'config.json'),JSON.stringify({...config,origin:config.origin.replace('http://','http://synthetic-user:synthetic-pass@')}));
+  const before=f.calls.length,result=await f.run('bad-origin',{op:'pause'});
+  assert.equal(result.code,1);
+  const output=`${result.stdout||''}${result.stderr||''}`;
+  assert.match(output,/Testing origin must not carry credentials/);
+  assert.doesNotMatch(output,/synthetic-pass/);
+  assert.equal(f.calls.length,before);
+  await assert.rejects(readFile(join(f.dir,'testing','bad-origin.client.json')),{code:'ENOENT'});
+});
 test('real-controller wrapper retains stable run id and refreshes post-pause state',async t=>{
   const f=await fixture(t), result=await f.run('bounded-goal',{op:'run',actor:1,goal:{kind:'time',ms:100},max_game_ms:1000});
   assert.equal(result.code,0,result.stderr);

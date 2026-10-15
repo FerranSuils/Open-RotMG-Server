@@ -24,6 +24,7 @@ const config = JSON.parse(await readFile(configPath, 'utf8'));
 const {id, command} = JSON.parse(await readFile(commandPath, 'utf8'));
 if(typeof id!=='string'||!id.length||id.length>64||!/^[A-Za-z0-9_-]+$/.test(id)||!command||typeof command!=='object') throw new Error('Command file requires {id,command}; id must be 1–64 ASCII letters, digits, hyphens or underscores and remain stable on retry');
 const origin = new URL(config.origin);
+if (origin.username || origin.password) throw new Error('Testing origin must not carry credentials; the control token file authenticates the loopback session');
 if (origin.protocol !== 'http:' || !['127.0.0.1', 'localhost', '[::1]'].includes(origin.hostname) || origin.pathname !== '/' || origin.search || origin.hash) throw new Error('Testing requires an explicit loopback HTTP origin');
 const token = (await readFile(`${config.state}/control.token`, 'utf8')).trim();
 const marker=JSON.parse(await readFile(`${config.state}/testing.json`,'utf8'));
