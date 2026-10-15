@@ -29,6 +29,9 @@ mod cooperative_tests;
 mod mechanics;
 #[cfg(test)]
 mod mechanics_tests;
+mod native_hits;
+#[cfg(test)]
+mod native_hits_tests;
 mod reconciliation;
 #[cfg(test)]
 mod reconciliation_tests;
@@ -107,7 +110,6 @@ pub enum Controller {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AttackSuppression {
-    ReceiveBudget,
     EffectiveCooldown,
 }
 pub struct Player {
@@ -124,6 +126,8 @@ pub struct Player {
     statuses: BTreeMap<u8, (u64, u64)>,
     native_motion_condition: i32,
     known_since: BTreeMap<i32, u64>,
+    shoot_acks: VecDeque<(Instant, Vec<Bullet>)>,
+    visible_projectiles: BTreeMap<(i32, u8), native_hits::VisibleProjectile>,
     tiles: BTreeSet<(i16, i16)>,
     pub death_started: bool,
     killer: String,
@@ -1276,6 +1280,8 @@ impl World {
                 statuses: BTreeMap::new(),
                 native_motion_condition: 0,
                 known_since: BTreeMap::new(),
+                shoot_acks: VecDeque::new(),
+                visible_projectiles: BTreeMap::new(),
                 tiles: BTreeSet::new(),
                 death_started: false,
                 killer: String::new(),
@@ -1700,7 +1706,18 @@ impl World {
         if self.discard_correcting_move(id, pos, time)? {
             return Ok(NativeInput::DiscardedUntilGotoAck);
         }
-        self.move_timed(id, pos, time, received)?;
+        let sentinel = pos.x == -1. && pos.y == -1.;
+        if !sentinel {
+            self.validate_native_position(id, pos, time)?;
+        }
+        let p = self.players.get_mut(&id).context("native player missing")?;
+        ensure!(time >= p.last_move, "native movement clock regressed");
+        ensure!(received >= p.last_move_at, "native ingress clock regressed");
+        if !sentinel {
+            p.pos = pos;
+        }
+        p.last_move = time;
+        p.last_move_at = received;
         Ok(NativeInput::Applied)
     }
     pub fn move_to(&mut self, id: i32, pos: Pos, time: i32) -> Result<()> {
@@ -1762,20 +1779,7 @@ impl World {
             })
         })
     }
-    #[cfg(test)]
-    pub fn native_shoot(
-        &mut self,
-        id: i32,
-        time: i32,
-        bullet: u8,
-        kind: u16,
-        start: Pos,
-        angle: f32,
-    ) -> Result<()> {
-        // Skipped actor ticks must not charge real client attacks against a slower simulation clock.
-        self.native_shoot_received(id, (time, self.clock.now()), bullet, kind, start, angle)
-            .map(|_| ())
-    }
+
     pub fn native_shoot_received(
         &mut self,
         id: i32,
@@ -1864,7 +1868,9 @@ impl World {
             y: start.y - 0.3 * aim.sin(),
         };
         let condition = p.conditions(self.now);
-        let origin = if !p.paused && p.pos.distance(center) > 0.001 {
+        let origin = if native {
+            self.validate_native_position(id, center, time).map(|_| 0.)
+        } else if !p.paused && p.pos.distance(center) > 0.001 {
             self.validate_move_at(id, center, time, received)
         } else {
             Ok(0.)
@@ -1901,38 +1907,28 @@ impl World {
             let elapsed = received
                 .checked_sub(p.last_attack_at)
                 .context("attack receive clock regressed")?;
-            let credit = (p.attack_credit + elapsed as f32).min(cooldown * 2.);
-            let unfunded = credit < admission - 50.;
+            // Delivery can batch correctly spaced native shots; their clock, not ingress spacing, funds cadence.
+            let funding = if native {
+                attack_elapsed as f32
+            } else {
+                elapsed as f32
+            };
+            let credit = (p.attack_credit + funding).min(cooldown * 2.);
             ensure!(
-                native || !unfunded,
+                native || credit >= admission - 50.,
                 RejectedNativeShot(format!(
                     "attack exceeds server time budget: credit={credit} cooldown={cooldown} received_time={received} simulation_time={} last_received_time={} shot_time={time} last_shot_time={}",
                     self.now, p.last_attack_at, p.last_attack
                 ))
             );
-            p.attack_suppressed = if unfunded {
-                tracing::warn!(
-                    player = id,
-                    credit,
-                    admission,
-                    cooldown,
-                    received_time = received,
-                    simulation_time = self.now,
-                    last_received_time = p.last_attack_at,
-                    shot_time = time,
-                    last_shot_time = p.last_attack,
-                    "native volley denied: attack exceeds server time budget"
-                );
-                Some(AttackSuppression::ReceiveBudget)
-            } else if attack_elapsed < cooldown as i64 - 2 || credit < cooldown - 50. {
-                Some(AttackSuppression::EffectiveCooldown)
-            } else {
-                None
-            };
-            // Denial accrues actual elapsed once but cannot debit or authorize an unfunded attack.
+            p.attack_suppressed =
+                if attack_elapsed < cooldown as i64 - 2 || (!native && credit < cooldown - 50.) {
+                    Some(AttackSuppression::EffectiveCooldown)
+                } else {
+                    None
+                };
             p.attack_credit = credit
                 - match p.attack_suppressed {
-                    Some(AttackSuppression::ReceiveBudget) => 0.,
                     Some(AttackSuppression::EffectiveCooldown) => normal_cooldown,
                     None => cooldown,
                 };
@@ -1952,13 +1948,7 @@ impl World {
                 suppressed = ?p.attack_suppressed,
                 "condition suppressed shot"
             );
-            return Ok(
-                if p.attack_suppressed == Some(AttackSuppression::ReceiveBudget) {
-                    NativeInput::DeniedAttackBudget
-                } else {
-                    NativeInput::Applied
-                },
-            );
+            return Ok(NativeInput::Applied);
         }
         p.character.shots += 1;
         let multiplier = if condition & crate::condition::bit(crate::condition::WEAK) != 0 {
@@ -2128,8 +2118,10 @@ impl World {
                     messages.push(o.0);
                 }
                 for body in messages {
-                    for p in self.players.values() {
-                        if p.known.contains(&id) {
+                    for (peer, p) in &mut self.players {
+                        if p.known.contains(&id)
+                            && (*peer != id || native_hits::expect_shoot_ack(p, vec![]))
+                        {
                             send(p, 13, body.clone());
                         }
                     }
@@ -3208,6 +3200,7 @@ impl World {
         self.tick += 1;
         self.trade_step();
         self.expire_goto_acks();
+        self.expire_native_projectiles();
         let ids: Vec<_> = self.players.keys().copied().collect();
         for id in &ids {
             let p = &self.players[id];
@@ -3338,9 +3331,7 @@ impl World {
             }
         }
         for (owner, shot) in shots {
-            for p in self.players.values().filter(|p| p.known.contains(&owner)) {
-                send(p, 19, shot.clone());
-            }
+            self.send_enemy_shot(owner, shot);
         }
         let guns: Vec<_> = self
             .entities
@@ -3384,12 +3375,8 @@ impl World {
                 .f32(b.start.y)
                 .f32(angle)
                 .i16(b.damage as i16);
-            for p in self.players.values() {
-                if p.known.contains(&id) {
-                    send(p, 19, o.0.clone());
-                }
-            }
             self.bullets.push(b);
+            self.send_enemy_shot(id, o.0);
         }
         let mut bullets = std::mem::take(&mut self.bullets);
         for b in &mut bullets {
@@ -3552,49 +3539,13 @@ impl World {
                             && !p.paused
                             && !p.departing
                             && !p.death_pending
+                            && p.controller != Controller::Human
                             && !b.hit.contains(id)
                             && inside_box(p.pos, b.pos)
                         {
-                            let damage = crate::condition::damage(
-                                b.damage,
-                                self.defense(*id).expect("valid player equipment"),
-                                p.conditions(self.now),
-                                b.spec.armor_piercing,
-                            );
-                            if damage > 0 {
-                                for (index, duration) in &b.spec.effects {
-                                    self.apply_condition(*id, *index, *duration)
-                                        .expect("validated projectile condition");
-                                }
-                            }
-                            let p = self.players.get_mut(id).unwrap();
-                            p.character.hp = (p.character.hp - damage).max(0);
-                            if p.character.hp == 0 {
-                                p.death_pending = true;
-                                p.killer = self.content.objects[&b.source_kind].name.clone();
-                                p.bot_goal = None;
-                                p.bot_aim = None;
-                            }
-                            let mut o = Writer::new();
-                            o.i32(*id).u8(if damage > 0 {
-                                b.spec.effects.len() as u8
-                            } else {
-                                0
-                            });
-                            if damage > 0 {
-                                for (index, _) in &b.spec.effects {
-                                    o.u8(*index);
-                                }
-                            }
-                            o.i16(damage as i16).u8(0).u8(b.id).i32(b.owner);
-                            send(p, 47, o.0);
+                            self.damage_player(*id, b, true)
+                                .expect("validated projectile damage");
                             b.hit.insert(*id);
-                            tracing::debug!(
-                                player = id,
-                                damage,
-                                hp = p.character.hp,
-                                "player damaged"
-                            );
                             if !b.spec.multi_hit {
                                 break;
                             }
@@ -5242,33 +5193,16 @@ mod tests {
         }
     }
     #[test]
-    fn native_movement_and_shot_origin_use_receive_time_without_funding_client_time() {
+    fn native_movement_and_shot_origin_follow_client_positions_without_funding_scripts() {
         let mut w = world();
         let player = w.enter(ch(&w), None).unwrap();
-        let pos = w
-            .map
-            .cells
-            .iter()
-            .enumerate()
-            .map(|(i, _)| Pos {
-                x: (i % w.map.width as usize) as f32 + 0.5,
-                y: (i / w.map.width as usize) as f32 + 0.5,
-            })
-            .find(|p| {
-                w.walkable(*p)
-                    && w.walkable(Pos {
-                        x: p.x + 2.,
-                        y: p.y,
-                    })
-            })
-            .unwrap();
+        let pos = w.players[&player].pos;
+        w.attack_epoch = Instant::now() - std::time::Duration::from_millis(2000);
         let p = w.players.get_mut(&player).unwrap();
-        p.pos = pos;
         p.last_move = 1000;
         p.last_move_at = 1000;
         p.movement_credit = 0.;
         w.now = 1000;
-        w.attack_epoch = Instant::now() - std::time::Duration::from_millis(2000);
         let next = Pos {
             x: pos.x + 0.4,
             y: pos.y,
@@ -5277,43 +5211,30 @@ mod tests {
         w.native_move_to(player, next, 1100).unwrap();
         let received = w.players[&player].last_move_at;
         assert!(received >= 2000);
-        w.players.get_mut(&player).unwrap().movement_credit = 0.;
-        let forged = Pos {
+        let predicted = Pos {
             x: next.x + 0.4,
             y: next.y,
         };
-        assert!(
-            w.move_timed(player, forged, 1200, received)
-                .unwrap_err()
-                .to_string()
-                .contains("server time budget")
-        );
-        let error = w
-            .shoot_timed(
-                player,
-                (1200, received, true),
-                1,
-                0xa97,
-                Pos {
-                    x: forged.x + 0.3,
-                    y: forged.y,
-                },
-                0.,
-            )
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("server time budget"));
+        assert!(w.move_timed(player, predicted, 1200, received).is_err());
+        w.shoot_timed(
+            player,
+            (1200, received, true),
+            1,
+            0xa97,
+            Pos {
+                x: predicted.x + 0.3,
+                y: predicted.y,
+            },
+            0.,
+        )
+        .unwrap();
         assert_eq!(w.players[&player].movement_credit, 0.);
         assert_eq!(w.players[&player].pos.x, next.x);
-        assert!(
-            w.move_timed(player, next, 1200, received - 1)
-                .unwrap_err()
-                .to_string()
-                .contains("server clock regressed")
-        );
+        assert_eq!(w.bullets.len(), 1);
     }
 
     #[test]
-    fn queued_native_receipt_does_not_borrow_later_actor_processing_time() {
+    fn native_positions_preserve_actual_ingress_without_rejecting_actor_or_network_delay() {
         let mut w = world();
         let player = w.enter(ch(&w), None).unwrap();
         let pos = w.players[&player].pos;
@@ -5323,47 +5244,38 @@ mod tests {
         p.last_move = 1000;
         p.last_move_at = 1000;
         p.movement_credit = 0.;
-        let forged = Pos {
+        let next = Pos {
             x: pos.x + 0.7,
             y: pos.y,
         };
-        assert!(
-            w.native_move_received(player, forged, (1100, received))
-                .unwrap_err()
-                .to_string()
-                .contains("server time budget")
-        );
-        assert!(
-            format!(
-                "{:#}",
-                w.native_shoot_received(
-                    player,
-                    (1100, received),
-                    1,
-                    0xa97,
-                    Pos {
-                        x: forged.x + 0.3,
-                        y: forged.y
-                    },
-                    0.
-                )
-                .unwrap_err()
-            )
-            .contains("server time budget")
-        );
-        assert_eq!(w.players[&player].movement_credit, 0.);
-        assert_eq!(w.players[&player].pos.x, pos.x);
-        w.native_move_received(
+        w.native_move_received(player, next, (1100, received))
+            .unwrap();
+        w.native_shoot_received(
             player,
-            Pos {
-                x: pos.x + 0.4,
-                y: pos.y,
-            },
             (1100, received),
+            1,
+            0xa97,
+            Pos {
+                x: next.x + 0.3,
+                y: next.y,
+            },
+            0.,
         )
         .unwrap();
-        assert_eq!(w.players[&player].last_move_at, 1100);
+        let p = &w.players[&player];
+        assert_eq!((p.last_move_at, p.last_attack_at), (1100, 1100));
+        assert_eq!(p.pos.x, next.x);
+        assert_eq!(p.movement_credit, 0.);
+        assert!(
+            w.native_move_received(
+                player,
+                next,
+                (1200, received - std::time::Duration::from_millis(1))
+            )
+            .is_err()
+        );
     }
+
     #[test]
     fn queued_progress_must_settle_before_pause_is_confirmed() {
         let mut w = world();
@@ -5377,7 +5289,7 @@ mod tests {
         assert!(w.settled().unwrap());
     }
     #[test]
-    fn paused_wall_time_cannot_fund_native_attack_credit() {
+    fn paused_ingress_clock_stays_frozen_while_client_cadence_funds_native_shots() {
         let mut w = world();
         let mut character = ch(&w);
         character.base[5] = 26;
@@ -5393,23 +5305,26 @@ mod tests {
         p.attack_credit = 0.;
         w.attack_epoch = w.clock.now() - std::time::Duration::from_millis(1000);
         w.clock.set_paused(true);
+        let paused = w.clock.now();
         std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(w.clock.now(), paused);
         assert_eq!(
             w.native_shoot_received(player, (1298, w.clock.now()), 1, 0xa97, start, 0.)
                 .unwrap(),
-            NativeInput::DeniedAttackBudget
+            NativeInput::Applied
         );
         w.clock.set_paused(false);
         assert_eq!(
             w.native_shoot_received(player, (1596, w.clock.now()), 2, 0xa97, start, 0.)
                 .unwrap(),
-            NativeInput::DeniedAttackBudget
+            NativeInput::Applied
         );
-        assert_eq!(w.players[&player].character.shots, 0);
-        assert!(w.bullets.is_empty());
+        assert!(w.players[&player].last_attack_at < 1100);
+        assert_eq!(w.players[&player].character.shots, 2);
+        assert_eq!(w.bullets.len(), 2);
     }
     #[test]
-    fn native_attack_credit_uses_receive_time_not_skipped_simulation_ticks() {
+    fn native_attack_cadence_uses_client_time_but_keeps_real_ingress_metadata() {
         let mut w = world();
         let mut character = ch(&w);
         character.base[5] = 26;
@@ -5423,42 +5338,29 @@ mod tests {
         p.last_attack = 1000;
         p.last_attack_at = 1000;
         p.attack_credit = 0.;
-        w.now = 1200;
-        assert_eq!(
-            w.shoot_timed(player, (1298, 1200, true), 1, 0xa97, start, 0.)
-                .unwrap(),
-            NativeInput::DeniedAttackBudget
-        );
-        assert_eq!(
-            w.shoot_timed(player, (1298, 1298, true), 2, 0xa97, start, 0.)
-                .unwrap(),
-            NativeInput::DeniedAttackBudget
-        );
-        assert_eq!(w.players[&player].attack_credit, 200.);
-        assert_eq!(w.players[&player].last_attack_at, 1200);
-        w.attack_epoch = Instant::now() - std::time::Duration::from_millis(1298);
-        for bullet in [3, 4] {
-            w.native_shoot(player, 1596, bullet, 0xa97, start, 0.)
-                .unwrap();
+        for (time, received) in [(1298, 1200), (1596, 1298)] {
+            for _ in 0..2 {
+                let bullet = w.players[&player].next_bullet;
+                assert_eq!(
+                    w.shoot_timed(player, (time, received, true), bullet, 0xa97, start, 0.)
+                        .unwrap(),
+                    NativeInput::Applied
+                );
+            }
         }
-        assert_eq!(w.players[&player].character.shots, 2);
         w.now = 9000;
-        let p = w.players.get_mut(&player).unwrap();
-        p.last_attack_at = 1298;
-        p.attack_credit = 0.;
-        assert_eq!(
-            w.shoot_timed(player, (1894, 1400, true), 5, 0xa97, start, 0.)
-                .unwrap(),
-            NativeInput::DeniedAttackBudget
-        );
-        assert_eq!(w.players[&player].attack_credit, 102.);
+        w.shoot_timed(player, (1894, 1400, true), 5, 0xa97, start, 0.)
+            .unwrap();
+        assert_eq!(w.players[&player].character.shots, 5);
         assert_eq!(w.players[&player].last_attack_at, 1400);
+        let seed = w.players[&player].seed;
         assert!(
             w.shoot_timed(player, (2192, 1200, true), 6, 0xa97, start, 0.)
                 .unwrap_err()
                 .to_string()
                 .contains("attack receive clock regressed")
         );
+        assert_eq!(w.players[&player].seed, seed);
     }
     #[test]
     fn native_integer_attack_period_keeps_the_bounded_server_credit() {

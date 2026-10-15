@@ -214,7 +214,7 @@ fn native_dazed_and_goto_discards_conserve_rng_without_authorizing_bullets() {
     assert_eq!(w.bullets.len(), item.shots as usize + 1);
 }
 #[test]
-fn budget_denied_native_volley_mirrors_allocation_without_authority_or_position_correction() {
+fn batched_native_volleys_preserve_ids_rng_peer_shots_and_position() {
     let (mut w, id, mut rx, _loss) = native();
     let mut peer_character = ch(&w);
     peer_character.account = 2;
@@ -231,7 +231,6 @@ fn budget_denied_native_volley_mirrors_allocation_without_authority_or_position_
     p.last_attack_at = 1000;
     p.attack_credit = 0.;
     let pos = p.pos;
-    let movement_credit = p.movement_credit;
     let mut seed = p.seed;
     let start = Pos {
         x: pos.x + 0.3,
@@ -239,129 +238,38 @@ fn budget_denied_native_volley_mirrors_allocation_without_authority_or_position_
     };
     let item = w.content.get(0xa97).unwrap().clone();
     assert_eq!(item.shots, 2);
-    let angle = |index: i32| (index as f32 - 0.5) * item.arc.to_radians();
-    let receive = |ms| w.attack_epoch + Duration::from_millis(ms);
-    let first = receive(1069);
-    let second = receive(1100);
-    let funded = receive(1138);
-    for (time, bullet, kind, origin, aim) in [
-        (1120, 1, 0xa97, start, angle(0)),
-        (1125, 99, 0xa97, start, angle(0)),
-        (1125, 1, 0x100, start, angle(0)),
-        (
-            1125,
-            1,
-            0xa97,
-            Pos {
-                x: pos.x + 20.,
-                y: pos.y,
-            },
-            angle(0),
-        ),
-        (1125, 1, 0xa97, start, f32::NAN),
-    ] {
-        assert!(
-            w.native_shoot_received(id, (time, first), bullet, kind, origin, aim)
-                .is_err()
-        );
-        let p = &w.players[&id];
-        assert_eq!(
-            (
-                p.seed,
-                p.next_bullet,
-                p.attack_credit,
-                p.last_attack_at,
-                p.last_attack
-            ),
-            (seed, 1, 0., 1000, 1000)
-        );
+    let received = w.attack_epoch + Duration::from_millis(1069);
+    for time in [1125, 1250, 1375] {
+        for index in 0..item.shots {
+            let bullet = w.players[&id].next_bullet;
+            let angle = (index as f32 - 0.5) * item.arc.to_radians();
+            assert_eq!(
+                w.native_shoot_received(id, (time, received), bullet, 0xa97, start, angle)
+                    .unwrap(),
+                NativeInput::Applied
+            );
+            seed = ((seed as u64 * 16807) % 2147483647) as u32;
+            assert_eq!(w.players[&id].seed, seed);
+            assert_eq!(peer_rx.try_recv().unwrap().id, 74);
+        }
     }
-    for (index, received) in [first, second].into_iter().enumerate() {
-        assert_eq!(
-            w.native_shoot_received(
-                id,
-                (1125, received),
-                index as u8 + 1,
-                0xa97,
-                start,
-                angle(index as i32)
-            )
-            .unwrap(),
-            NativeInput::DeniedAttackBudget
-        );
-        seed = ((seed as u64 * 16807) % 2147483647) as u32;
-        let p = &w.players[&id];
-        assert_eq!(p.seed, seed);
-        assert_eq!(
-            (p.attack_credit, p.last_attack_at, p.last_attack),
-            (69., 1069, 1125)
-        );
-        assert_eq!(
-            (p.pos.x, p.pos.y, p.movement_credit),
-            (pos.x, pos.y, movement_credit)
-        );
-        assert_eq!(p.character.shots, 0);
-        assert!(p.goto_acks.is_empty() && w.bullets.is_empty());
-        assert!(rx.try_recv().is_err() && peer_rx.try_recv().is_err());
-    }
-    assert!(
-        w.native_shoot_received(id, (1125, second), 3, 0xa97, start, angle(0))
-            .is_err()
-    );
-    assert!(
-        w.native_shoot_received(
-            id,
-            (1250, w.attack_epoch + Duration::from_millis(1000)),
-            3,
-            0xa97,
-            start,
-            angle(0)
-        )
-        .is_err()
-    );
-    assert_eq!(w.players[&id].seed, seed);
-    assert_eq!(w.players[&id].next_bullet, 3);
-    for index in 0..2 {
-        assert_eq!(
-            w.native_shoot_received(
-                id,
-                (1250, funded),
-                3 + index as u8,
-                0xa97,
-                start,
-                angle(index)
-            )
-            .unwrap(),
-            NativeInput::Applied
-        );
-        seed = ((seed as u64 * 16807) % 2147483647) as u32;
-        assert_eq!(peer_rx.try_recv().unwrap().id, 74);
-    }
-    assert_eq!(w.players[&id].seed, seed);
-    assert_eq!(w.players[&id].character.shots, 2);
-    assert_eq!(w.bullets.len(), 2);
-    assert_eq!(
-        (w.players[&id].attack_credit, w.players[&id].last_attack_at),
-        (13., 1138)
-    );
+    let p = &w.players[&id];
+    assert_eq!((p.character.shots, p.next_bullet), (6, 7));
+    assert_eq!(p.pos.distance(pos), 0.);
+    assert_eq!(p.movement_credit, 0.);
+    assert_eq!(p.last_attack_at, 1069);
+    assert!(p.goto_acks.is_empty());
+    assert!(rx.try_recv().is_err());
+    assert_eq!(w.bullets.len(), 6);
 }
+
 #[test]
 fn predicted_origin_failure_is_typed_and_correction_never_authorizes_the_shot() {
     let (mut w, id, _rx, _loss) = native();
     let pos = w.players[&id].pos;
     let received = w.attack_epoch + Duration::from_millis(100);
     let error = w
-        .native_shoot_received(
-            id,
-            (1100, received),
-            1,
-            0xa97,
-            Pos {
-                x: pos.x + 1.,
-                y: pos.y,
-            },
-            0.,
-        )
+        .native_shoot_received(id, (1100, received), 1, 0xa97, Pos { x: -2., y: pos.y }, 0.)
         .unwrap_err();
     assert!(error.downcast_ref::<RejectedNativeShot>().is_some());
     assert_eq!(w.players[&id].next_bullet, 1);
@@ -415,7 +323,7 @@ fn predicted_origin_failure_is_typed_and_correction_never_authorizes_the_shot() 
 }
 
 #[test]
-fn received_attack_burst_denies_authority_without_funding_or_position_reanchor() {
+fn receipt_burst_accepts_valid_client_cadence_without_borrowing_position_or_clock() {
     let (mut w, id, _rx, _loss) = native();
     w.players.get_mut(&id).unwrap().character.base[5] = 75;
     let item = w.content.get(0xa97).unwrap().clone();
@@ -424,64 +332,25 @@ fn received_attack_burst_denies_authority_without_funding_or_position_reanchor()
         x: pos.x + 0.3,
         y: pos.y,
     };
-    let angle = |index: i32| item.arc.to_radians() * (index as f32 - (item.shots - 1) as f32 / 2.);
     let received = w.attack_epoch + Duration::from_millis(1000);
-    assert_eq!(
-        reconciliation::attack_cooldown(&w.players[&id], &w.content, w.now, item.rate).unwrap(),
-        125.
-    );
-    for time in [1000, 1125] {
+    for time in (1000..2500).step_by(125) {
         for index in 0..item.shots {
             let bullet = w.players[&id].next_bullet;
+            let angle = item.arc.to_radians() * (index as f32 - 0.5);
             assert_eq!(
-                w.native_shoot_received(id, (time, received), bullet, 0xa97, start, angle(index))
+                w.native_shoot_received(id, (time, received), bullet, 0xa97, start, angle)
                     .unwrap(),
                 NativeInput::Applied
             );
         }
     }
     let p = &w.players[&id];
-    let (bullet, seed, shots) = (p.next_bullet, p.seed, p.character.shots);
-    assert_eq!(p.attack_credit, 0.);
+    assert_eq!(p.character.shots, 24);
     assert_eq!(p.last_attack_at, 1000);
-    assert_eq!(
-        w.native_shoot_received(id, (1250, received), bullet, 0xa97, start, angle(0))
-            .unwrap(),
-        NativeInput::DeniedAttackBudget
-    );
-    assert!(w.players[&id].goto_acks.is_empty());
-    for index in 1..item.shots {
-        let bullet = w.players[&id].next_bullet;
-        assert_eq!(
-            w.native_shoot_received(id, (1250, received), bullet, 0xa97, start, angle(index))
-                .unwrap(),
-            NativeInput::DeniedAttackBudget
-        );
-    }
-    let p = &w.players[&id];
-    assert!(item.projectiles[&0].min < item.projectiles[&0].max);
-    let mut discarded_seed = seed;
-    for _ in 0..item.shots {
-        discarded_seed = ((discarded_seed as u64 * 16807) % 2147483647) as u32;
-    }
-    assert_eq!(p.seed, discarded_seed);
-    assert_eq!(p.character.shots, shots);
-    assert_eq!(p.attack_credit, 0.);
-    assert_eq!(p.last_attack_at, 1000);
-    assert_eq!(p.last_attack, 1250);
-    assert_eq!(p.movement_credit, 0.);
     assert_eq!(p.pos.distance(pos), 0.);
-    assert_eq!(w.bullets.len(), shots as usize);
-    let bullet = w.players[&id].next_bullet;
-    let funded = w.attack_epoch + Duration::from_millis(1125);
-    assert_eq!(
-        w.native_shoot_received(id, (1375, funded), bullet, 0xa97, start, angle(0))
-            .unwrap(),
-        NativeInput::Applied
-    );
-    assert_eq!(w.players[&id].character.shots, shots + 1);
-    assert_eq!(w.players[&id].attack_credit, 0.);
-    assert_eq!(w.players[&id].last_attack_at, 1125);
+    assert_eq!(p.movement_credit, 0.);
+    assert!(p.goto_acks.is_empty());
+    assert_eq!(w.bullets.len(), 24);
 }
 
 #[test]
@@ -525,14 +394,11 @@ fn correction_discards_buffered_input_without_granting_authority() {
     let (mut w, id, _rx, _loss) = native();
     let pos = w.players[&id].pos;
     let received = w.attack_epoch + Duration::from_millis(100);
-    let forged = Pos {
-        x: pos.x + 0.7,
-        y: pos.y,
-    };
+    let forged = Pos { x: -2., y: pos.y };
     let error = w
         .native_move_received(id, forged, (1100, received))
         .unwrap_err();
-    assert!(error.to_string().contains("server time budget"));
+    assert!(error.to_string().contains("outside walkable terrain"));
     w.correct_position(id, 1100, &error.to_string()).unwrap();
     assert_eq!(w.players[&id].last_move, 1000);
     assert_eq!(
@@ -622,18 +488,8 @@ fn a_discarded_volley_stays_discarded_across_ack_and_sequence_recovers() {
     );
     assert_eq!(w.players[&id].next_bullet, 3);
     assert!(
-        w.native_shoot_received(
-            id,
-            (2100, received),
-            3,
-            0xa97,
-            Pos {
-                x: pos.x + 10.,
-                y: pos.y
-            },
-            0.
-        )
-        .is_err()
+        w.native_shoot_received(id, (2100, received), 3, 0xa97, Pos { x: -2., y: pos.y }, 0.)
+            .is_err()
     );
     assert_eq!(w.players[&id].next_bullet, 3);
     assert_eq!(w.players[&id].character.shots, 0);

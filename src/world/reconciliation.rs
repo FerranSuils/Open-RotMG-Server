@@ -8,7 +8,6 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 pub enum NativeInput {
     Applied,
     DiscardedUntilGotoAck,
-    DeniedAttackBudget,
 }
 
 #[derive(Debug)]
@@ -81,6 +80,30 @@ impl Player {
 }
 
 impl World {
+    pub(super) fn validate_native_position(&self, id: i32, pos: Pos, time: i32) -> Result<()> {
+        let p = self.players.get(&id).context("native player missing")?;
+        ensure!(
+            p.character.alive
+                && !p.death_pending
+                && !p.departing
+                && p.persistence_failure.is_none(),
+            "inactive native character"
+        );
+        ensure!(
+            time >= 0 && time >= p.last_move,
+            "native position clock regressed"
+        );
+        ensure!(
+            pos.x.is_finite() && pos.y.is_finite(),
+            "non-finite native position"
+        );
+        ensure!(
+            self.walkable(pos),
+            "native position is outside walkable terrain"
+        );
+        Ok(())
+    }
+
     pub fn acknowledge_autonomous_goto(&mut self, id: i32) -> Result<()> {
         ensure!(
             self.players
