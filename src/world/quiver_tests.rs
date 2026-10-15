@@ -103,7 +103,7 @@ fn quiver_failures_do_not_spend_mana_or_create_projectiles() {
             3 => w.players.get_mut(&id).unwrap().character.class = crate::content::WIZARD,
             4 => target.x = f32::NAN,
             5 => target.x += 20.,
-            6 => w.players.get_mut(&id).unwrap().character.items[1] = 0xc07,
+            6 => w.players.get_mut(&id).unwrap().character.items[1] = 0xa2e,
             _ => unreachable!(),
         }
         let p = &w.players[&id];

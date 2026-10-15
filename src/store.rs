@@ -1,6 +1,6 @@
-use crate::content::{
-    ARCHER, Class, Content, KNIGHT, Object, PALADIN, PRIEST, ROGUE, WARRIOR, WIZARD,
-};
+#[cfg(test)]
+use crate::content::{ARCHER, KNIGHT, PALADIN, ROGUE, WARRIOR};
+use crate::content::{Class, Content, Object, PRIEST, WIZARD};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -413,11 +413,8 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
     }
     pub async fn create(&self, account: i32, class: &Object) -> Result<Character> {
         ensure!(
-            matches!(
-                class.kind,
-                WIZARD | PRIEST | ARCHER | ROGUE | WARRIOR | KNIGHT | PALADIN
-            ) && class.class == "Player",
-            "playable class is not implemented"
+            self.classes.contains_key(&class.kind) && class.class == "Player",
+            "unknown playable class"
         );
         let requirements = self
             .classes
@@ -449,11 +446,8 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         creation: Creation,
     ) -> Result<Character> {
         ensure!(
-            matches!(
-                class.kind,
-                WIZARD | PRIEST | ARCHER | ROGUE | WARRIOR | KNIGHT | PALADIN
-            ) && class.class == "Player",
-            "playable class is not implemented"
+            self.classes.contains_key(&class.kind) && class.class == "Player",
+            "unknown playable class"
         );
         let kind = class.kind;
         let base = [
@@ -1304,7 +1298,7 @@ mod tests {
         assert!(s.create(a.id, c.get(0x0320).unwrap()).await.is_err());
     }
     #[tokio::test]
-    async fn four_classes_preserve_normal_unlock_death_starter_and_save_rules() {
+    async fn all_classes_preserve_normal_unlock_death_starter_and_save_rules() {
         let c = Content::load(Path::new("data")).unwrap();
         let s = Store::open(Path::new(":memory:"), &c).unwrap();
         for (class, requirements) in [
@@ -1312,6 +1306,12 @@ mod tests {
             (WARRIOR, vec![(ROGUE, 5)]),
             (KNIGHT, vec![(WARRIOR, 20)]),
             (PALADIN, vec![(KNIGHT, 20), (PRIEST, 20)]),
+            (0x320, vec![(ROGUE, 20), (WIZARD, 20)]),
+            (0x321, vec![(WIZARD, 20), (PRIEST, 20)]),
+            (0x322, vec![(ROGUE, 20), (ARCHER, 20)]),
+            (0x323, vec![(0x322, 20), (0x321, 20)]),
+            (0x324, vec![(0x320, 20), (PALADIN, 20)]),
+            (0x325, vec![(0x321, 20), (0x320, 20)]),
         ] {
             assert_eq!(c.classes[&class].requires, requirements);
             let a = s.list(format!("class-unlock-{class}")).await.unwrap();

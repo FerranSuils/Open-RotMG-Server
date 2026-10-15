@@ -1,14 +1,21 @@
 use anyhow::{Context, Result, bail, ensure};
 use roxmltree::Node;
+mod abilities;
+pub use abilities::Ability;
 use serde::Serialize;
 use std::{collections::BTreeMap, io::Read, path::Path};
 
 pub const WIZARD: u16 = 0x030e;
 pub const PRIEST: u16 = 0x0310;
+#[cfg(test)]
 pub const ARCHER: u16 = 0x0307;
+#[cfg(test)]
 pub const ROGUE: u16 = 0x0300;
+#[cfg(test)]
 pub const WARRIOR: u16 = 0x031d;
+#[cfg(test)]
 pub const KNIGHT: u16 = 0x031e;
+#[cfg(test)]
 pub const PALADIN: u16 = 0x031f;
 pub const SLOWED: i32 = 1 << 3;
 pub const STUNNED: i32 = 1 << 6;
@@ -116,9 +123,10 @@ pub struct Object {
     pub unlock_portal: Option<(String, String)>,
     pub heal_range: f32,
     pub activations: usize,
-    pub condition_activations: Vec<(u8, u64, Option<f32>)>,
+    pub abilities: Vec<Ability>,
     pub cooldown_ms: u64,
     pub enemy: bool,
+    pub stasis_immune: bool,
     pub terrain: u8,
     pub quest: bool,
     pub quest_level: Option<i32>,
@@ -181,45 +189,6 @@ fn kind(s: &str) -> Result<u16> {
     } else {
         Ok(s.parse()?)
     }
-}
-fn condition_activations(n: Node<'_, '_>) -> Result<Vec<(u8, u64, Option<f32>)>> {
-    if child(n, "Tier").is_none() || !matches!(text(n, "SlotType").as_str(), "12" | "13" | "16") {
-        return Ok(Vec::new());
-    }
-    n.children()
-        .filter(|a| a.has_tag_name("Activate"))
-        .map(|a| {
-            let effect = match a.attribute("effect").context("ability effect missing")? {
-                "Invisible" => crate::condition::INVISIBLE,
-                "Speedy" => 15,
-                "Berserk" => crate::condition::BERSERK,
-                "Healing" => crate::condition::HEALING,
-                "Damaging" => crate::condition::DAMAGING,
-                effect => bail!("unsupported tiered ability condition {effect}"),
-            };
-            let duration = std::time::Duration::try_from_secs_f32(
-                a.attribute("duration")
-                    .context("ability duration missing")?
-                    .parse()?,
-            )?
-            .as_millis()
-            .try_into()?;
-            ensure!(duration > 0, "ability duration is zero");
-            let range = match a.text() {
-                Some("ConditionEffectSelf") => None,
-                Some("ConditionEffectAura") => {
-                    let range: f32 = a
-                        .attribute("range")
-                        .context("ability range missing")?
-                        .parse()?;
-                    ensure!(range.is_finite() && range > 0., "invalid ability range");
-                    Some(range)
-                }
-                _ => bail!("unsupported tiered condition activation"),
-            };
-            Ok((effect, duration, range))
-        })
-        .collect()
 }
 impl Content {
     pub fn load(dir: &Path) -> Result<Self> {
@@ -359,11 +328,12 @@ impl Content {
                     .transpose()?
                     .unwrap_or(0.),
                 activations: n.children().filter(|p| p.has_tag_name("Activate")).count(),
-                condition_activations: condition_activations(n)?,
+                abilities: abilities::parse(n).with_context(|| format!("ability {id:#x}"))?,
                 cooldown_ms: std::time::Duration::try_from_secs_f32(number(n, "Cooldown", 0.5)?)?
                     .as_millis()
                     .try_into()?,
                 enemy: child(n, "Enemy").is_some(),
+                stasis_immune: child(n, "StasisImmune").is_some(),
                 terrain: match text(n, "Terrain").as_str() {
                     "" => 0,
                     "Mountains" => 1,
