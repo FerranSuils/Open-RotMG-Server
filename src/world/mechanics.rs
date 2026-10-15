@@ -21,6 +21,20 @@ impl World {
         match anchor {
             encounter::Anchor::Player => Ok(player),
             encounter::Anchor::Home => Ok(e.home),
+            encounter::Anchor::ElfLeader => {
+                let camp = self
+                    .elf_camps
+                    .get(e.elf_camp.context("Elf has no camp")?)
+                    .context("Elf camp missing")?;
+                let leader = self.population[camp.start]
+                    .entity
+                    .context("Elf leader slot is empty")?;
+                Ok(self
+                    .entities
+                    .get(&leader)
+                    .context("Elf leader is no longer alive")?
+                    .pos)
+            }
             encounter::Anchor::Parent => Ok(self
                 .entities
                 .get(&e.parent.context("entity has no explicit parent")?)
