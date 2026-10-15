@@ -4,7 +4,7 @@ pub(super) struct Role {
     pub kind: u16,
     pub maximum: usize,
     pub initial: usize,
-    pub interval: u64,
+    pub interval: Option<u64>,
 }
 pub(super) struct Family {
     pub leader: u16,
@@ -21,7 +21,7 @@ impl Family {
 }
 macro_rules! family {
     ($leader:expr,$terrain:expr; $( $kind:expr,$maximum:expr,$initial:expr,$interval:expr );+ $(;)?) => {
-        Family { leader:$leader, terrain:$terrain, roles:&[$(Role {kind:$kind,maximum:$maximum,initial:$initial,interval:$interval}),+] }
+        Family { leader:$leader, terrain:$terrain, roles:&[$(Role {kind:$kind,maximum:$maximum,initial:$initial,interval:Some($interval)}),+] }
     };
 }
 pub(super) const FAMILIES: &[Family] = &[
@@ -33,12 +33,31 @@ pub(super) const FAMILIES: &[Family] = &[
     family!(0x61a,9; 0x619,4,2,12000; 0x618,3,2,6000),
     family!(0x609,10; 0x605,2,2,15000; 0x606,4,4,7000; 0x607,1,1,8000),
     family!(0x614,10; 0x612,7,3,12000; 0x613,7,3,12000),
+    family!(0x652,1; 0x653,5,3,10000),
+    Family {
+        leader: 0x905,
+        terrain: 1,
+        roles: &[
+            Role {
+                kind: 0x906,
+                maximum: 1,
+                initial: 1,
+                interval: None,
+            },
+            Role {
+                kind: 0x907,
+                maximum: 1,
+                initial: 1,
+                interval: None,
+            },
+        ],
+    },
 ];
 pub(super) struct Camp {
     pub start: usize,
     pub family: &'static Family,
     pub(super) ready: u64,
-    next: Vec<u64>,
+    next: Vec<Option<u64>>,
 }
 
 fn region(terrain: u8) -> u8 {
@@ -130,7 +149,7 @@ impl World {
             family
                 .roles
                 .iter()
-                .all(|r| r.initial <= r.maximum && r.interval > 0),
+                .all(|r| r.initial <= r.maximum && r.interval.is_none_or(|interval| interval > 0)),
             "invalid family role bounds"
         );
         ensure!(
@@ -143,7 +162,11 @@ impl World {
             start,
             family,
             ready: 0,
-            next: family.roles.iter().map(|r| self.now + r.interval).collect(),
+            next: family
+                .roles
+                .iter()
+                .map(|r| r.interval.map(|interval| self.now + interval))
+                .collect(),
         });
         let members: Vec<_> = std::iter::once((family.leader, true))
             .chain(
@@ -324,8 +347,11 @@ impl World {
                     }
                 }
                 self.camps[camp].ready = 0;
-                self.camps[camp].next =
-                    family.roles.iter().map(|r| self.now + r.interval).collect();
+                self.camps[camp].next = family
+                    .roles
+                    .iter()
+                    .map(|r| r.interval.map(|interval| self.now + interval))
+                    .collect();
                 continue;
             }
             let leader = self.population[start]
@@ -348,8 +374,14 @@ impl World {
             let mut from = start + 1;
             for (role, r) in family.roles.iter().enumerate() {
                 let to = from + r.maximum;
-                if self.now >= self.camps[camp].next[role] {
-                    self.camps[camp].next[role] = self.now + r.interval;
+                let Some(interval) = r.interval else {
+                    from = to;
+                    continue;
+                };
+                let deadline =
+                    self.camps[camp].next[role].context("reinforcing role lacks its clock")?;
+                if self.now >= deadline {
+                    self.camps[camp].next[role] = Some(self.now + interval);
                     if let Some(slot) = (from..to).find(|i| self.population[*i].entity.is_none()) {
                         if !self.family_space(family.terrain, 1)? {
                             tracing::debug!(camp, role, "reinforcement refused: regional budget");
@@ -380,7 +412,7 @@ impl World {
                                 leader,
                                 role,
                                 kind = r.kind,
-                                interval = r.interval,
+                                interval,
                                 "family role reinforced"
                             );
                         } else {

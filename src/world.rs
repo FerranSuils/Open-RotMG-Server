@@ -21,6 +21,9 @@ mod endgame;
 mod endgame_ai;
 mod enemy_shots;
 mod families;
+mod gods;
+#[cfg(test)]
+mod gods_tests;
 mod population;
 #[cfg(test)]
 mod population_tests;
@@ -122,6 +125,12 @@ pub enum Controller {
 enum AttackSuppression {
     EffectiveCooldown,
 }
+struct ObservedMotion {
+    position: Pos,
+    time: i32,
+    velocity: Pos,
+    at: u64,
+}
 pub struct Player {
     pub character: Character,
     pub pos: Pos,
@@ -162,6 +171,7 @@ pub struct Player {
     attack_suppressed: Option<AttackSuppression>,
     last_move: i32,
     last_move_at: u64,
+    motion: ObservedMotion,
     goto_acks: VecDeque<(bool, Instant)>,
     discarded_attack: Option<(i32, i32)>,
     tick: i32,
@@ -169,6 +179,29 @@ pub struct Player {
     ability_shot: Option<(u16, i32, bool, i32)>,
 }
 impl Player {
+    fn record_motion(&mut self, position: Pos, time: i32, at: u64, maximum_speed: f32) {
+        let elapsed = i64::from(time) - i64::from(self.motion.time);
+        if elapsed == 0 {
+            return;
+        }
+        let mut velocity = Pos { x: 0., y: 0. };
+        if (1..=1000).contains(&elapsed) {
+            velocity = Pos {
+                x: (position.x - self.motion.position.x) * 1000. / elapsed as f32,
+                y: (position.y - self.motion.position.y) * 1000. / elapsed as f32,
+            };
+            // Teleports and discontinuities are observations, not physical velocities to extrapolate.
+            if velocity.x.hypot(velocity.y) > maximum_speed * 1.2 {
+                velocity = Pos { x: 0., y: 0. };
+            }
+        }
+        self.motion = ObservedMotion {
+            position,
+            time,
+            velocity,
+            at,
+        };
+    }
     pub(crate) fn native_time(&self) -> i32 {
         self.last_move
     }
@@ -1171,12 +1204,16 @@ impl World {
                 goal: None,
                 phase: 0.,
                 hp: definition.hp,
-                size: if definition.enemy && (8..=12).contains(&definition.terrain) {
+                size: if definition.enemy && matches!(definition.terrain, 1 | 8..=12) {
                     definition.size
                 } else {
                     100
                 },
-                condition: 0,
+                condition: if kind == 0x91a {
+                    crate::condition::bit(crate::condition::INVULNERABLE)
+                } else {
+                    0
+                },
                 statuses: BTreeMap::new(),
                 items,
                 drop_slots: BTreeSet::new(),
@@ -1290,12 +1327,13 @@ impl World {
         );
         let id = allocate_id(&self.ids)?;
         let (x, y) = self.map.spawns[self.players.len() % self.map.spawns.len()];
+        let pos = position.unwrap_or(Pos { x, y });
         let char_id = ch.id;
         self.players.insert(
             id,
             Player {
                 character: ch,
-                pos: position.unwrap_or(Pos { x, y }),
+                pos,
                 departing: false,
                 account_lists: AccountLists::default(),
                 paused: false,
@@ -1337,6 +1375,12 @@ impl World {
                 attack_suppressed: None,
                 last_move: 0,
                 last_move_at: self.now,
+                motion: ObservedMotion {
+                    position: pos,
+                    time: 0,
+                    velocity: Pos { x: 0., y: 0. },
+                    at: self.now,
+                },
                 goto_acks: VecDeque::new(),
                 discarded_attack: None,
                 tick: 0,
@@ -1745,6 +1789,8 @@ impl World {
         let p = self.players.get_mut(&id).context("native player missing")?;
         ensure!(time >= p.last_move, "native movement clock regressed");
         ensure!(received >= p.last_move_at, "native ingress clock regressed");
+        let speed = p.speed(&self.content, self.now)? * 1000.;
+        p.record_motion(if sentinel { p.pos } else { pos }, time, self.now, speed);
         if !sentinel {
             p.pos = pos;
         }
@@ -1773,6 +1819,8 @@ impl World {
         if !stationary {
             p.movement_credit = remaining_credit;
         }
+        let speed = p.speed(&self.content, self.now)? * 1000.;
+        p.record_motion(pos, time, self.now, speed);
         p.pos = pos;
         p.last_move = time;
         p.last_move_at = received;
@@ -2865,6 +2913,48 @@ impl World {
         }
         Ok(())
     }
+    fn defeat_entity(&mut self, id: i32) -> Result<()> {
+        let e = self.remove_entity(id);
+        let definition = &self.content.objects[&e.kind];
+        let reward = (definition.hp as f32 * definition.xp_multiplier / 10.).ceil() as i32;
+        for (id, p) in &mut self.players {
+            if p.character.alive && !p.death_pending && !p.departing && p.pos.distance(e.pos) < 25.
+            {
+                let cap = (crate::store::experience_goal(p.character.level)
+                    .expect("validated player level") as f32
+                    * if definition.quest { 0.5 } else { 0.1 }) as i32;
+                let amount = reward.min(cap);
+                p.experience_queued = p
+                    .experience_queued
+                    .checked_add(amount)
+                    .expect("experience queue overflow");
+                if amount > 0 {
+                    tracing::debug!(player = id, enemy = e.kind, amount, "experience queued");
+                }
+            }
+        }
+        if self.name == "Realm"
+            && let Some((portal, chance)) = crate::dungeon::portal_drop(e.kind)
+            && self.rng.gen_bool(chance)
+        {
+            self.portal_requests.push((portal, e.pos));
+            tracing::info!(
+                enemy = e.kind,
+                entity = id,
+                portal,
+                "defeat earned a dungeon portal"
+            );
+        }
+        if let Err(error) = self.encounter_death(&e) {
+            tracing::error!(enemy=e.kind, %error, "defeat mechanic failed");
+        }
+        if self.encounter
+            && let Err(error) = self.drop_loot(&e)
+        {
+            tracing::error!(enemy=e.kind,%error,"earned encounter loot creation failed");
+        }
+        Ok(())
+    }
     fn drop_loot(&mut self, defeated: &Entity) -> Result<()> {
         if crate::endgame::HEROES.contains(&defeated.kind) {
             self.critical_deaths.push(defeated.id);
@@ -3026,6 +3116,10 @@ impl World {
             let kind = entity.kind;
             let pos = entity.pos;
             let profile = profile(kind).expect("validated encounter profile");
+            // Self-destruction is a deadline, not target acquisition or a weapon cooldown.
+            let burst = kind == 0x91a
+                && entity.expires == Some(self.now + 50)
+                && self.now >= entity.next_shot;
             let nearest = self
                 .players
                 .values()
@@ -3034,27 +3128,34 @@ impl World {
                         && !p.death_pending
                         && !p.departing
                         && !p.paused
-                        && p.conditions(self.now)
-                            & crate::condition::bit(crate::condition::INVISIBLE)
-                            == 0
+                        && (kind == 0x6d8
+                            || p.conditions(self.now)
+                                & crate::condition::bit(crate::condition::INVISIBLE)
+                                == 0)
                 })
                 .min_by(|a, b| pos.distance(a.pos).total_cmp(&pos.distance(b.pos)))
                 .map(|p| p.pos);
             let wake = match kind {
                 0x609 | 0xd06 => 11.,
-                0x617 | 0x61a => 12.,
+                0x617 | 0x61a | 0x6d8 => 12.,
+                0x91a => 7.,
                 0xd90 => 8.,
                 _ => 20.,
             };
-            let Some(target) = nearest.filter(|p| {
-                pos.distance(*p)
-                    < if entity.activated.is_some() {
-                        20.
-                    } else {
-                        wake
-                    }
-            }) else {
-                continue;
+            let target = if burst {
+                pos
+            } else {
+                let Some(target) = nearest.filter(|p| {
+                    pos.distance(*p)
+                        < if entity.activated.is_some() {
+                            20.
+                        } else {
+                            wake
+                        }
+                }) else {
+                    continue;
+                };
+                target
             };
             let activated = *self
                 .entities
@@ -3068,7 +3169,18 @@ impl World {
                 continue;
             }
             let flags = self.entities[&id].conditions(self.now);
-            let (motion, mut speed) = if self.entities[&id].camp.is_some() {
+            let (motion, mut speed) = if gods::GODS.contains(&kind)
+                || gods::CONSTRUCTS.contains(&kind)
+                || (kind == 0x653 && self.entities[&id].camp.is_some())
+            {
+                match self.god_movement(id, target, elapsed) {
+                    Ok(movement) => movement,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"Godlands movement refused");
+                        continue;
+                    }
+                }
+            } else if self.entities[&id].camp.is_some() {
                 match self.family_movement(id, target, elapsed) {
                     Ok(movement) => movement,
                     Err(error) => {
@@ -3209,9 +3321,10 @@ impl World {
             let e = &self.entities[&id];
             if profile.interval == 0
                 || e.activated.is_none()
-                || self.now < e.next_shot
-                || e.pos.distance(target) > profile.range
-                || flags & crate::condition::bit(crate::condition::STUNNED) != 0
+                || (!burst
+                    && (self.now < e.next_shot
+                        || e.pos.distance(target) > profile.range
+                        || flags & crate::condition::bit(crate::condition::STUNNED) != 0))
             {
                 continue;
             }
@@ -3221,6 +3334,14 @@ impl World {
                     Ok(shots) => shots,
                     Err(error) => {
                         tracing::error!(entity=id,%error,"endgame projectiles refused");
+                        continue;
+                    }
+                }
+            } else if gods::GODS.contains(&kind) || gods::CONSTRUCTS.contains(&kind) {
+                match self.god_shots(id, target, heading, elapsed) {
+                    Ok(shots) => shots,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"Godlands projectiles refused");
                         continue;
                     }
                 }
@@ -3588,56 +3709,7 @@ impl World {
                         }
                         b.hit.insert(*target);
                         if kill {
-                            let e = self.remove_entity(*target);
-                            let definition = &self.content.objects[&e.kind];
-                            let reward = (definition.hp as f32 * definition.xp_multiplier / 10.)
-                                .ceil() as i32;
-                            for (id, p) in &mut self.players {
-                                if p.character.alive
-                                    && !p.death_pending
-                                    && !p.departing
-                                    && p.pos.distance(e.pos) < 25.
-                                {
-                                    let cap = (crate::store::experience_goal(p.character.level)
-                                        .expect("validated player level")
-                                        as f32
-                                        * if definition.quest { 0.5 } else { 0.1 })
-                                        as i32;
-                                    let amount = reward.min(cap);
-                                    p.experience_queued = p
-                                        .experience_queued
-                                        .checked_add(amount)
-                                        .expect("experience queue overflow");
-                                    if amount > 0 {
-                                        tracing::debug!(
-                                            player = id,
-                                            enemy = e.kind,
-                                            amount,
-                                            "experience queued"
-                                        );
-                                    }
-                                }
-                            }
-                            if self.name == "Realm"
-                                && let Some((portal, chance)) = crate::dungeon::portal_drop(e.kind)
-                                && self.rng.gen_bool(chance)
-                            {
-                                self.portal_requests.push((portal, e.pos));
-                                tracing::info!(
-                                    enemy = e.kind,
-                                    entity = target,
-                                    portal,
-                                    "defeat earned a dungeon portal"
-                                );
-                            }
-                            if let Err(error) = self.encounter_death(&e) {
-                                tracing::error!(enemy=e.kind, %error, "defeat mechanic failed");
-                            }
-                            if self.encounter
-                                && let Err(error) = self.drop_loot(&e)
-                            {
-                                tracing::error!(enemy=e.kind,%error,"earned encounter loot creation failed");
-                            }
+                            self.defeat_entity(*target).expect("validated enemy defeat");
                             tracing::info!(entity = target, owner = b.owner, "enemy defeated");
                         }
                     }

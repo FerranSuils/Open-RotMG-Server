@@ -102,7 +102,7 @@ fn table(kind: u16) -> &'static [(f64, Pick)] {
             (0.05, Tier(1, RINGS)),
             (0.05, Tier(1, ABILITIES)),
         ],
-        0x640 | 0x645 | 0x646 | 0x64f | 0x650 => &[
+        0x640 | 0x645 | 0x646 | 0x64f | 0x650 | 0x905 => &[
             (0.16, Tier(5, WEAPONS)),
             (0.08, Tier(6, WEAPONS)),
             (0.16, Tier(4, ARMOR)),
@@ -111,7 +111,12 @@ fn table(kind: u16) -> &'static [(f64, Pick)] {
             (0.05, Tier(3, RINGS)),
             (0.03, Tier(3, ABILITIES)),
         ],
-        0x651..=0x659 | 0xd05 => &[
+        0x906 | 0x907 => &[
+            (0.04, Item(0xa22)),
+            (0.01, Item(0xa23)),
+            (0.01, Tier(6, WEAPONS)),
+        ],
+        0x651..=0x659 | 0xd05 | 0x91a | 0x6d8 => &[
             (0.02, Tier(6, WEAPONS)),
             (0.01, Tier(7, WEAPONS)),
             (0.005, Tier(8, WEAPONS)),
@@ -188,7 +193,21 @@ pub fn collectibles(content: &Content) -> std::collections::BTreeSet<u16> {
         })
         .collect()
 }
+fn god_potion(kind: u16) -> Option<u16> {
+    match kind {
+        0x651 | 0x652 | 0x657 | 0x905..=0x907 => Some(0xa1f),
+        0x654 | 0x659 | 0x91a => Some(0xa21),
+        0x655 | 0x656 | 0x658 | 0x6d8 => Some(0xa20),
+        _ => None,
+    }
+}
 pub fn validate(content: &Content, kind: u16) -> Result<()> {
+    if let Some(potion) = god_potion(kind) {
+        ensure!(
+            content.get(potion)?.stat_increase.is_some(),
+            "Godlands potion is not a selected stat increase"
+        );
+    }
     for (_, pick) in table(kind) {
         let items = candidates(content, *pick);
         ensure!(
@@ -218,7 +237,7 @@ pub fn roll(content: &Content, kind: u16, rng: &mut impl Rng) -> Option<u16> {
     None
 }
 pub fn rewards(content: &Content, kind: u16, rng: &mut impl Rng) -> Vec<u16> {
-    if matches!(
+    let mut items = if matches!(
         kind,
         0x917 | 0xd06 | 0xd90 | 0xd78 | 0xd79 | crate::endgame::ORYX | crate::endgame::ORYX2
     ) {
@@ -235,10 +254,16 @@ pub fn rewards(content: &Content, kind: u16, rng: &mut impl Rng) -> Vec<u16> {
         items
     } else {
         roll(content, kind, rng).into_iter().collect()
+    };
+    if let Some(potion) = god_potion(kind)
+        && rng.gen_bool(0.015)
+    {
+        items.push(potion);
     }
+    items
 }
 pub fn private(kind: u16) -> bool {
-    matches!(kind, 0x683..=0x686 | 0x927 | 0x640 | 0x645 | 0x646 | 0x64f | 0x650..=0x659
+    matches!(kind, 0x91a | 0x6d8 | 0x905..=0x907 | 0x683..=0x686 | 0x927 | 0x640 | 0x645 | 0x646 | 0x64f | 0x650..=0x659
         | 0xd05 | 0x917 | 0xd06 | 0xd90 | 0xd95 | 0xd98..=0xd9a
         | 0x668 | 0x67d | 0xd78 | 0xd79 | 0xd7f | crate::endgame::ORYX | crate::endgame::ORYX2)
 }

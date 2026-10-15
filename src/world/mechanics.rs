@@ -110,6 +110,10 @@ impl World {
         if crate::endgame::ROSTER.contains(&self.entities[&id].kind) {
             return self.finale_mechanics(id, target, elapsed);
         }
+        let kind = self.entities[&id].kind;
+        if kind == 0x91a || super::gods::CONSTRUCTS.contains(&kind) {
+            return self.god_mechanics(id, elapsed);
+        }
         let e = &self.entities[&id];
         let (kind, hp, pos, home) = (e.kind, e.hp, e.pos, e.home);
         let stage = encounter::stage(kind, hp, elapsed);
@@ -199,7 +203,7 @@ impl World {
         }
         self.entities.get_mut(&id).unwrap().next_aux = self.now
             + match kind {
-                0x173 | 0x652 | 0xdae => 5000,
+                0x173 | 0xdae => 5000,
                 0x953 => 2500,
                 0x654 => 3000,
                 0x917 => 500,
@@ -211,7 +215,6 @@ impl World {
                 self.spawn_children(id, 0x223, 2, 1.5)?;
                 self.spawn_children(id, 0x224, 2, 2.)?;
             }
-            0x652 => self.spawn_children(id, 0x653, 5, 1.5)?,
             0x654 if pos.distance(target) < 8. => self.throw_grenade(id, target, 4., 150)?,
             0x917 if stage == 2 => self.throw_grenade(id, target, 5., 100)?,
             0xd06 if stage % 5 == 4 => {
@@ -362,7 +365,17 @@ impl World {
             .map(|e| e.id)
             .collect();
         for id in expired {
-            self.remove_entity(id);
+            if self.entities[&id].kind == 0x91a
+                && self.entities[&id]
+                    .expires
+                    .is_some_and(|deadline| deadline <= self.now)
+            {
+                if let Err(error) = self.finish_djinn(id) {
+                    tracing::error!(entity=id,%error,"Djinn defeat failed");
+                }
+            } else {
+                self.remove_entity(id);
+            }
         }
     }
 
