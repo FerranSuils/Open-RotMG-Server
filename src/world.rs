@@ -17,12 +17,13 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 mod abilities;
 mod chat;
-mod elves;
-#[cfg(test)]
-mod elves_tests;
 mod endgame;
 mod endgame_ai;
 mod enemy_shots;
+mod families;
+mod population;
+#[cfg(test)]
+mod population_tests;
 pub(crate) use chat::{chat_error, chat_info, chat_private, validate as validate_chat};
 pub use endgame::ForcedTransfer;
 #[cfg(test)]
@@ -92,7 +93,7 @@ pub struct Entity {
     activated: Option<u64>,
     stage: Option<u64>,
     parent: Option<i32>,
-    elf_camp: Option<usize>,
+    camp: Option<usize>,
     expires: Option<u64>,
     next_aux: u64,
     bullet: u8,
@@ -267,6 +268,7 @@ struct Spawn {
     pos: Pos,
     entity: Option<i32>,
     ready: u64,
+    camp: Option<usize>,
 }
 pub struct World {
     pub content: Arc<Content>,
@@ -290,7 +292,7 @@ pub struct World {
     pub max_players: usize,
     encounter: bool,
     population: Vec<Spawn>,
-    elf_camps: Vec<elves::Camp>,
+    camps: Vec<population::Camp>,
     portal_requests: Vec<(u16, Pos)>,
     critical_deaths: Vec<i32>,
     admission_open: bool,
@@ -1011,7 +1013,7 @@ impl World {
                         activated: None,
                         stage: None,
                         parent: None,
-                        elf_camp: None,
+                        camp: None,
                         expires: None,
                         next_aux: 0,
                         bullet: 0,
@@ -1070,7 +1072,7 @@ impl World {
             max_players: 85,
             encounter: false,
             population: vec![],
-            elf_camps: vec![],
+            camps: vec![],
             portal_requests: vec![],
             critical_deaths: vec![],
             admission_open: true,
@@ -1169,7 +1171,11 @@ impl World {
                 goal: None,
                 phase: 0.,
                 hp: definition.hp,
-                size: 100,
+                size: if definition.enemy && (8..=12).contains(&definition.terrain) {
+                    definition.size
+                } else {
+                    100
+                },
                 condition: 0,
                 statuses: BTreeMap::new(),
                 items,
@@ -1182,7 +1188,7 @@ impl World {
                 activated: None,
                 stage: None,
                 parent: None,
-                elf_camp: None,
+                camp: None,
                 expires: None,
                 next_aux: 0,
                 bullet: 0,
@@ -1221,12 +1227,12 @@ impl World {
         let entity = self.entities.remove(&id).expect("indexed entity missing");
         assert!(!entity.reserved, "cannot remove a reserved container");
         self.bag_expiry.remove(&id);
-        if let Some(camp) = entity.elf_camp {
+        if let Some(camp) = entity.camp {
             tracing::debug!(
                 camp,
                 entity = id,
                 kind = entity.kind,
-                "Elf camp member removed"
+                "family member removed"
             );
         }
         let cell = entity.pos.y as usize * self.map.width as usize + entity.pos.x as usize;
@@ -2945,60 +2951,21 @@ impl World {
         Ok(())
     }
     fn populate_shore(&mut self) -> Result<()> {
-        let &(x, y) = self.map.spawns.first().context("shore has no spawn")?;
-        let spawn = Pos { x, y };
-        let mut candidates: Vec<_> = self
-            .map
-            .cells
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| {
-                let pos = Pos {
-                    x: (i % self.map.width as usize) as f32 + 0.5,
-                    y: (i / self.map.width as usize) as f32 + 0.5,
-                };
-                (matches!(c.terrain, 11 | 12) && self.walkable(pos) && pos.distance(spawn) >= 12.)
-                    .then_some(pos)
-            })
-            .collect();
-        candidates.shuffle(&mut self.rng);
-        // Keep the bounded starter population playable on a Realm-sized coastline.
-        candidates.sort_by(|a, b| a.distance(spawn).total_cmp(&b.distance(spawn)));
-        for pos in candidates {
-            if self.population.iter().any(|s| s.pos.distance(pos) < 6.) {
-                continue;
-            }
-            let kind = [0x600, 0x60e, 0x60f, 0x610][self.population.len() % 4];
-            let entity = self.spawn_entity(kind, pos, vec![])?;
-            self.population.push(Spawn {
-                kind,
-                pos,
-                entity: Some(entity),
-                ready: 0,
-            });
-            if self.population.len() == 24 {
-                break;
-            }
-        }
-        ensure!(
-            self.population.len() == 24,
-            "sourced shore cannot support its bounded population"
-        );
-        Ok(())
+        self.populate_shore_population()
     }
     fn repopulate(&mut self) -> Result<()> {
+        for s in &mut self.population {
+            if s.entity.is_some_and(|id| !self.entities.contains_key(&id)) {
+                s.entity = None;
+                s.ready = self.now + 60_000;
+            }
+        }
         for i in 0..self.population.len() {
             let s = &self.population[i];
-            if s.entity.is_some_and(|id| !self.entities.contains_key(&id)) {
-                self.population[i].entity = None;
-                self.population[i].ready = self.now + 60_000;
-            }
-            let s = &self.population[i];
-            if elves::KINDS.contains(&s.kind) {
-                continue;
-            }
-            if s.entity.is_none()
+            if s.camp.is_none()
+                && s.entity.is_none()
                 && self.now >= s.ready
+                && self.population_space(self.content.objects[&s.kind].terrain, 1)?
                 && self.players.values().all(|p| p.pos.distance(s.pos) >= 12.)
             {
                 let id = self.spawn_entity(s.kind, s.pos, vec![])?;
@@ -3006,11 +2973,11 @@ impl World {
                 tracing::debug!(
                     entity = id,
                     kind = self.population[i].kind,
-                    "shore enemy respawned"
+                    "ordinary population member replenished"
                 );
             }
         }
-        self.repopulate_elves()
+        self.repopulate_families()
     }
     fn move_entity(&mut self, id: i32, goal: Pos, distance: f32) -> Result<()> {
         let old = self.entities[&id].pos;
@@ -3075,6 +3042,7 @@ impl World {
                 .map(|p| p.pos);
             let wake = match kind {
                 0x609 | 0xd06 => 11.,
+                0x617 | 0x61a => 12.,
                 0xd90 => 8.,
                 _ => 20.,
             };
@@ -3100,11 +3068,11 @@ impl World {
                 continue;
             }
             let flags = self.entities[&id].conditions(self.now);
-            let (motion, mut speed) = if self.entities[&id].elf_camp.is_some() {
-                match self.elf_movement(id, target, elapsed) {
+            let (motion, mut speed) = if self.entities[&id].camp.is_some() {
+                match self.family_movement(id, target, elapsed) {
                     Ok(movement) => movement,
                     Err(error) => {
-                        tracing::error!(entity=id,%error,"Elf movement refused");
+                        tracing::error!(entity=id,%error,"family movement refused");
                         continue;
                     }
                 }
@@ -4163,8 +4131,12 @@ mod tests {
                 .contains(&(distant.x as i16, distant.y as i16))
         );
         assert!(w.entities.values().any(|e| origin.distance(e.pos) > 20.));
+        let quest = w.quest_target(observer).unwrap();
+        assert!(origin.distance(w.entities[&quest].pos) > 20.);
         assert!(w.entities.values().all(|e| {
-            origin.distance(e.pos) < 20. || !w.players[&observer].known.contains(&e.id)
+            origin.distance(e.pos) < 20.
+                || e.id == quest
+                || !w.players[&observer].known.contains(&e.id)
         }));
         let private = w.loot_bag(origin, Some(2), vec![0xa4f]).unwrap();
         w.updates(observer, false).unwrap();
@@ -4187,6 +4159,21 @@ mod tests {
         for (actor, hidden) in [(observer, peer), (peer, observer)] {
             let view = d.player_view(actor).unwrap();
             assert!(!view.objects.iter().any(|o| o.id == hidden));
+            if actor == observer {
+                assert!(view.objects.iter().any(|o| o.id == quest));
+                let target = view
+                    .objects
+                    .iter()
+                    .find(|o| o.id == quest)
+                    .unwrap()
+                    .position;
+                assert!(
+                    !view
+                        .tiles
+                        .iter()
+                        .any(|t| t.x == target.x as i16 && t.y == target.y as i16)
+                );
+            }
         }
         let (newcomer, _) = receive(&mut d, -3, 3, WIZARD);
         assert!(d.worlds[&-3].players[&newcomer].known.contains(&peer));
@@ -5138,59 +5125,49 @@ mod tests {
     fn shore_population_is_bounded_sourced_and_cannot_respawn_on_players() {
         let mut d = Directory::load(Path::new("data"), world().content, 16).unwrap();
         let w = d.worlds.get_mut(&-3).unwrap();
-        assert_eq!(
-            w.population
-                .iter()
-                .filter(|s| matches!(s.kind, 0x600 | 0x60e | 0x60f | 0x610))
-                .count(),
-            24
-        );
-        let (x, y) = w.map.spawns[0];
-        let arrival = Pos { x, y };
+        assert_eq!(w.population_count(11), 24);
         for spawn in w
             .population
             .iter()
-            .filter(|s| matches!(s.kind, 0x600 | 0x60e | 0x60f | 0x610))
+            .filter(|s| w.content.objects[&s.kind].terrain >= 11)
         {
-            assert!((12.0..60.0).contains(&spawn.pos.distance(arrival)));
-            let cell =
-                &w.map.cells[spawn.pos.y as usize * w.map.width as usize + spawn.pos.x as usize];
-            assert!(matches!(cell.terrain, 11 | 12));
+            assert_eq!(
+                w.map.cell(spawn.pos.x, spawn.pos.y).unwrap().terrain,
+                w.content.objects[&spawn.kind].terrain
+            );
             assert!(w.walkable(spawn.pos));
-            assert!(matches!(spawn.kind, 0x600 | 0x60e | 0x60f | 0x610));
         }
-        let pos = w.population[0].pos;
-        let old = w.population[0].entity.unwrap();
+        let slot = w.population.iter().position(|s| s.kind == 0x602).unwrap();
+        let pos = w.population[slot].pos;
+        let old = w.population[slot].entity.unwrap();
         w.remove_entity(old);
         w.repopulate().unwrap();
-        assert!(w.population[0].entity.is_none());
         let player = w.enter(ch(w), None).unwrap();
         w.players.get_mut(&player).unwrap().pos = pos;
         w.now = 60_000;
         w.repopulate().unwrap();
-        assert!(w.population[0].entity.is_none());
-        w.players.get_mut(&player).unwrap().pos = Pos { x: -30., y: -30. };
+        assert!(w.population[slot].entity.is_none());
+        w.players.get_mut(&player).unwrap().pos = Pos { x: 0.5, y: 0.5 };
         w.repopulate().unwrap();
-        let new = w.population[0].entity.unwrap();
-        assert_ne!(old, new);
-        assert_eq!(
-            w.entities_at(pos)
-                .filter(|e| e.kind == w.population[0].kind)
-                .count(),
-            1
-        );
+        assert_ne!(w.population[slot].entity.unwrap(), old);
+        assert_eq!(w.entities_at(pos).filter(|e| e.kind == 0x602).count(), 1);
         assert_eq!(
             w.entities
                 .values()
                 .filter(|e| w.content.objects[&e.kind].enemy)
                 .count(),
-            w.population.len() + w.hero_identities().len()
+            w.population
+                .iter()
+                .filter(|s| s.entity.is_some_and(|id| w.entities.contains_key(&id)))
+                .count()
+                + w.hero_identities().len()
         );
+        assert!(w.population_count(11) <= 24);
         assert_eq!(w.hero_identities().len(), 6);
         assert!(
             w.population
                 .iter()
-                .all(|spawn| !crate::endgame::HEROES.contains(&spawn.kind))
+                .all(|s| !crate::endgame::HEROES.contains(&s.kind))
         );
     }
     #[test]

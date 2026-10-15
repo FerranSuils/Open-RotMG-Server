@@ -129,7 +129,12 @@ fn multihit_hits_distinct_targets_once_and_native_projectile_modes_match_client_
 fn inland_population_respects_xml_biomes_caps_and_validated_attack_contracts() {
     let d = Directory::load(Path::new("data"), tests::world().content, 16).unwrap();
     let w = &d.worlds[&-3];
-    assert!(w.population.len() > 250 && w.population.len() <= 344);
+    let alive = w
+        .population
+        .iter()
+        .filter(|s| s.entity.is_some_and(|id| w.entities.contains_key(&id)))
+        .count();
+    assert!(alive > 250 && alive <= 344);
     for (terrain, roster) in progression::REALM_ROSTER {
         for kind in *roster {
             crate::encounter::validate(&w.content, *kind).unwrap();

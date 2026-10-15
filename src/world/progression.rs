@@ -2,8 +2,8 @@ use super::*;
 
 pub const REALM_ROSTER: &[(u8, &[u16])] = &[
     (8, &[0x60d, 0x60a, 0x60c]),
-    (9, &[0x617, 0x615, 0x616]),
-    (10, &[0x609, 0x605, 0x606, 0x607]),
+    (9, &[0x617, 0x615, 0x616, 0x61a, 0x618, 0x619]),
+    (10, &[0x609, 0x605, 0x606, 0x607, 0x614, 0x612, 0x613]),
     (5, &[0x632, 0x633]),
     (6, &[0x624, 0x625, 0x626]),
     (7, &[0x61f, 0x61c, 0x61d, 0x61e]),
@@ -50,8 +50,14 @@ impl World {
                     .ground
                     != 0xd0
             });
-            if *terrain == 10 {
-                self.populate_elves(candidates)?;
+            let families: &[u16] = match terrain {
+                8 => &[0x60d, 0x60d, 0x60d, 0x60d, 0x60d],
+                9 => &[0x617, 0x61a, 0x617, 0x61a],
+                10 => &[0x614, 0x609, 0x609],
+                _ => &[],
+            };
+            if !families.is_empty() {
+                self.populate_families(*terrain, &candidates, families)?;
                 continue;
             }
             let mut count = 0;
@@ -66,6 +72,7 @@ impl World {
                     pos,
                     entity: Some(entity),
                     ready: 0,
+                    camp: None,
                 });
                 count += 1;
                 if count == 32 {
