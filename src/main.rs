@@ -1,3 +1,4 @@
+mod backup;
 mod bots;
 mod clock;
 mod condition;
@@ -21,6 +22,10 @@ use rand::RngCore;
 use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if backup::run(&args).await? {
+        return Ok(());
+    }
     let started = std::time::Instant::now();
     let filter = match std::env::var("RUST_LOG") {
         Ok(v) => tracing_subscriber::EnvFilter::try_new(v)?,
@@ -31,7 +36,6 @@ async fn main() -> Result<()> {
         .with_env_filter(filter)
         .json()
         .init();
-    let args: Vec<_> = std::env::args().skip(1).collect();
     let (config, dev_control) = config::Config::load(&args)?;
     let client = config.client;
     let state = config.state;

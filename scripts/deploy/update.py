@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import ctypes
+import datetime
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -22,6 +24,7 @@ LIVE = Path('/opt/openrotmg/server')
 ROOT = Path('/var/lib/openrotmg-deploy')
 BACKUPS = Path('/opt/openrotmg-backup')
 CONFIG = Path('/etc/openrotmg/config.json')
+LAST_BACKUP = Path('/var/lib/openrotmg-backup/last-success.json')
 sys.dont_write_bytecode = True
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
@@ -106,10 +109,19 @@ def ready(port, process=None):
 
 
 def backup_module(stage):
+    os.environ['OPENROTMG_BACKUP_BINARY'] = str(stage / 'openrotmg')
     spec = importlib.util.spec_from_file_location('release_backup', stage / 'scripts/backups/backup.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def verify_backup(started):
+    proof = json.loads(LAST_BACKUP.read_text())
+    uploaded = datetime.datetime.fromisoformat(proof['uploaded_at']).timestamp()
+    require(proof.get('restored') is True and uploaded >= started
+            and proof['revisions']['server'] == (LIVE / 'REVISION').read_text().strip(),
+            'Fresh uploaded backup and exact restore were not verified')
 
 
 def start_backup():
@@ -117,24 +129,46 @@ def start_backup():
             'Previous backup failed; resolve it or await its scheduled retry')
     # Successful deployment backups must not consume the scheduled job's failure-retry budget.
     run('systemctl', 'reset-failed', 'openrotmg-backup.service')
+    started = time.time()
     run('systemctl', 'start', 'openrotmg-backup.service')
     require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Independent GitHub backup failed')
+    verify_backup(started)
 
 
 def install_backups(stage):
-    require(subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'ActiveState', '--value'], text=True).strip() == 'inactive', 'Backup already active; retry after it finishes')
+    state = subprocess.check_output(['systemctl', 'show', 'openrotmg-backup', '-p', 'ActiveState', '--value'], text=True).strip()
+    require(state == 'inactive', f'Backup service is {state}; inspect its journal before retrying')
     run('runuser', '-u', 'openrotmg', '--', sys.executable, '-B', '-W', 'error::ResourceWarning',
         '-m', 'unittest', 'discover', '-s', str(stage / 'scripts/backups'), '-p', 'test_*.py')
-    for name in ['backup.py', 'test_backup.py', 'test_backup_credential.py']:
-        target = BACKUPS / name
-        temporary = target.with_name(name + '.new')
-        temporary.write_bytes((stage / 'scripts/backups' / name).read_bytes())
-        temporary.chmod(target.stat().st_mode & 0o777)
-        temporary.replace(target)
+    revision = (stage / 'REVISION').read_text().strip()
+    releases = BACKUPS / 'releases'
+    releases.mkdir(exist_ok=True)
+    bundle = releases / revision
+    sources = {'backup.py': stage / 'scripts/backups/backup.py', 'openrotmg': stage / 'openrotmg',
+               'REVISION': stage / 'REVISION', 'openrotmg-backup.sh': stage / 'scripts/backups/openrotmg-backup.sh'}
+    if not bundle.exists():
+        temporary = releases / (revision + '.new')
+        temporary.mkdir()
+        for name, source in sources.items():
+            target = temporary / name
+            target.write_bytes(source.read_bytes())
+            target.chmod(0o755 if name in {'openrotmg', 'openrotmg-backup.sh'} else 0o644)
+        temporary.rename(bundle)
+    require(files(bundle) == {name: digest(path) for name, path in sources.items()}, 'Backup tool bundle differs from release')
+    pointer = BACKUPS / 'current.new'
+    pointer.symlink_to(bundle)
+    pointer.replace(BACKUPS / 'current')
+    wrapper = BACKUPS / 'run.sh.new'
+    wrapper.write_text('#!/bin/sh\nset -eu\nexec /opt/openrotmg-backup/current/openrotmg-backup.sh\n')
+    wrapper.chmod(0o755)
+    wrapper.replace(BACKUPS / 'run.sh')
     start_backup()
 
 
 def rehearse(stage, work, config):
+    run(sys.executable, '-B', str(stage / 'scripts/backups/release_contract.py'),
+        str(stage / 'openrotmg'), str(stage / 'data'), str(work / 'writer-contract'),
+        (stage / 'REVISION').read_text().strip())
     shadow = work / 'shadow'
     shadow.mkdir(mode=0o700)
     copy_db(Path(config['state']) / 'game.db', shadow / 'game.db')
@@ -161,7 +195,7 @@ def rehearse(stage, work, config):
     module = backup_module(stage)
     archive = work / 'shadow-export.json.gz'
     bundle = module.export(shadow / 'game.db', '/var/lib/openrotmg-discord-bot/levels.sqlite', archive,
-                           stage / 'REVISION', '/opt/openrotmg-discord-bot/REVISION')
+                           stage / 'REVISION', '/opt/openrotmg-discord-bot/REVISION', stage / 'REVISION')
     restored = work / 'restored'
     module.restore(archive, restored)
     require(module.snapshot(restored / 'game.db', module.GAME_SCHEMAS[bundle['schema']]) == bundle['game']
@@ -170,28 +204,30 @@ def rehearse(stage, work, config):
 
 def deploy(stage, work, metadata, config):
     run('runuser', '-u', 'openrotmg', '--', 'test', '-x', str(stage / 'openrotmg'))
-    install_backups(stage)
     rehearse(stage, work, config)
+    install_backups(stage)
     require(files(stage) == metadata['manifest'], 'Rehearsal changed release files')
     require(main_revision() == metadata['revision'], 'Main advanced during rehearsal; no cutover performed')
-    run('systemctl', 'stop', 'openrotmg.service')
-    require(subprocess.check_output(['systemctl', 'show', 'openrotmg', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Shutdown save failed; no source exchange performed')
-    frozen = work / 'cutover'
-    frozen.mkdir(mode=0o700)
-    copy_db(Path(config['state']) / 'game.db', frozen / 'game.db')
-    shutil.copyfile(Path(config['state']) / 'server.pem', frozen / 'server.pem')
-    (frozen / 'server.pem').chmod(0o600)
-    libc = ctypes.CDLL(None, use_errno=True)
-    require(libc.renameat2(-100, os.fsencode(LIVE), -100, os.fsencode(stage), 2) == 0,
-            'Atomic source exchange failed; frozen recovery state retained')
-    (work / 'previous-server-path').write_text(str(stage) + '\n')
-    run('runuser', '-u', 'openrotmg', '--', 'test', '-x', str(LIVE / 'openrotmg'))
-    run('systemctl', 'start', 'openrotmg.service')
-    ready(int(config['bind'].rsplit(':', 1)[1]))
-    require((LIVE / 'REVISION').read_text().strip() == metadata['revision'], 'Activated revision mismatch')
-    require(digest(LIVE / 'openrotmg') == metadata['binary_sha256'], 'Activated binary mismatch')
-    pid = int(subprocess.check_output(['systemctl', 'show', 'openrotmg', '-p', 'MainPID', '--value'], text=True))
-    require(pid > 0 and digest(f'/proc/{pid}/exe') == metadata['binary_sha256'], 'Running process binary mismatch')
+    with LAST_BACKUP.with_name('backup.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        run('systemctl', 'stop', 'openrotmg.service')
+        require(subprocess.check_output(['systemctl', 'show', 'openrotmg', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Shutdown save failed; no source exchange performed')
+        frozen = work / 'cutover'
+        frozen.mkdir(mode=0o700)
+        copy_db(Path(config['state']) / 'game.db', frozen / 'game.db')
+        shutil.copyfile(Path(config['state']) / 'server.pem', frozen / 'server.pem')
+        (frozen / 'server.pem').chmod(0o600)
+        libc = ctypes.CDLL(None, use_errno=True)
+        require(libc.renameat2(-100, os.fsencode(LIVE), -100, os.fsencode(stage), 2) == 0,
+                'Atomic source exchange failed; frozen recovery state retained')
+        (work / 'previous-server-path').write_text(str(stage) + '\n')
+        run('runuser', '-u', 'openrotmg', '--', 'test', '-x', str(LIVE / 'openrotmg'))
+        run('systemctl', 'start', 'openrotmg.service')
+        ready(int(config['bind'].rsplit(':', 1)[1]))
+        require((LIVE / 'REVISION').read_text().strip() == metadata['revision'], 'Activated revision mismatch')
+        require(digest(LIVE / 'openrotmg') == metadata['binary_sha256'], 'Activated binary mismatch')
+        pid = int(subprocess.check_output(['systemctl', 'show', 'openrotmg', '-p', 'MainPID', '--value'], text=True))
+        require(pid > 0 and digest(f'/proc/{pid}/exe') == metadata['binary_sha256'], 'Running process binary mismatch')
     start_backup()
 
 
@@ -201,14 +237,20 @@ def main_revision():
     return revision
 
 
-def main():
+def main(retry=False):
     os.umask(0o077)
     ROOT.mkdir(mode=0o700, exist_ok=True)
     desired = main_revision()
+    previous = ROOT / 'status.json'
+    if previous.exists() and not retry:
+        last = json.loads(previous.read_text())
+        if last['desired'] == desired and last['state'] == 'blocked':
+            print(json.dumps(last), flush=True)
+            return
     if (LIVE / 'REVISION').read_text().strip() == desired:
         ready(int(json.loads(CONFIG.read_text())['bind'].rsplit(':', 1)[1]))
         previous = ROOT / 'status.json'
-        if previous.exists() and json.loads(previous.read_text())['state'] == 'failed':
+        if previous.exists() and json.loads(previous.read_text())['state'] in {'failed', 'blocked', 'activated_unverified'}:
             start_backup()
         status('up_to_date', desired)
         return
@@ -235,11 +277,14 @@ def main():
         status('rehearsing', desired)
         config = json.loads(CONFIG.read_text())
         deploy(stage, work, metadata, config)
-        status('deployed', desired, recovery_directory=str(work))
-    except Exception:
-        status('failed', desired, recovery_directory=str(work))
+        status('deployed', desired, recovery_directory=str(work), backup=json.loads(LAST_BACKUP.read_text()))
+    except Exception as error:
+        activated = (LIVE / 'REVISION').read_text().strip() == desired
+        state = 'activated_unverified' if activated else ('failed' if isinstance(error, OSError) else 'blocked')
+        status(state, desired, recovery_directory=str(work), error=str(error))
         raise
 
 
 if __name__ == '__main__':
-    main()
+    require(sys.argv[1:] in ([], ['--retry']), 'Only --retry is accepted')
+    main(retry=bool(sys.argv[1:]))

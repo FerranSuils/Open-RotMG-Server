@@ -18,8 +18,9 @@ class Backups(unittest.TestCase):
         self.output = self.root / 'state.json.gz'
         self.revision = self.root / 'revision'
         self.revision.write_text('a' * 40)
-        self.stats = {key: 0 for key in backup.CHARACTER}
-        self.stats.update(id=1, account=1, name='Guest1', alive=False, items=[2711, 2606] + [-1] * 10)
+        legacy = 'id account name level exp fame hp mp items revision alive created_at shots hits kills quests tiles'
+        self.stats = {key: 0 for key in legacy.split()}
+        self.stats.update(id=1, account=1, name='Guest1', level=1, alive=False, items=[2711, 2606] + [-1] * 10)
         with closing(sqlite3.connect(self.game)) as db, db:
             db.executescript('''PRAGMA foreign_keys=ON;
 CREATE TABLE accounts(id INTEGER PRIMARY KEY,guid TEXT NOT NULL UNIQUE,name TEXT NOT NULL);
@@ -220,7 +221,7 @@ INSERT INTO account_lists VALUES(1,0,2),(1,1,2),(2,0,1),(1,0,3);''')
         self.temp.cleanup()
 
     def export(self):
-        return backup.export(self.game, self.discord, self.output, self.revision, self.revision)
+        return backup.export(self.game, self.discord, self.output, self.revision, self.revision, self.revision)
 
     def test_export_has_no_credentials_and_preserves_death_equipment(self):
         bundle = self.export()
