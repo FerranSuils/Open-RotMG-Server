@@ -498,11 +498,14 @@ async fn committed_native_death_is_not_reconnect_and_halts_the_owned_cohort() {
         .await
         .unwrap();
     app.world.clock.set_paused(false);
-    app.world
+    let detached_output = app
+        .world
         .for_player(player)
         .call(move |w| {
-            w.players.get_mut(&player).unwrap().departing = true;
-            Ok(())
+            let output = w.players[&player].tx.clone().unwrap();
+            assert!(w.begin_departure(player)?.is_some());
+            assert!(w.players[&player].tx.is_none());
+            Ok(output)
         })
         .await
         .unwrap();
@@ -516,7 +519,10 @@ async fn committed_native_death_is_not_reconnect_and_halts_the_owned_cohort() {
     app.world
         .for_player(player)
         .call(move |w| {
-            w.players.get_mut(&player).unwrap().departing = false;
+            let p = w.players.get_mut(&player).unwrap();
+            p.departing = false;
+            p.pending = false;
+            p.tx = Some(detached_output);
             Ok(())
         })
         .await

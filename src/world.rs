@@ -157,6 +157,9 @@ impl Player {
     pub(crate) fn native_time(&self) -> i32 {
         self.last_move
     }
+    pub(crate) fn native_transferring(&self) -> bool {
+        self.departing && self.persistence_failure.is_none()
+    }
     pub(crate) fn native_ready(&self, clock_paused: bool) -> bool {
         self.native_update_acked && (clock_paused || self.last_move > 0)
     }
