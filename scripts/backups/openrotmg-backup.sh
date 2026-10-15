@@ -28,6 +28,7 @@ test "$commit" = "$(git rev-parse FETCH_HEAD)"
 git show FETCH_HEAD:state.json.gz > "$verified/state.json.gz"
 cmp state.json.gz "$verified/state.json.gz"
 /usr/bin/python3 "$tools/backup.py" restore --archive "$verified/state.json.gz" --directory "$verified/restored"
+"$tools/openrotmg" --backup-load "$verified/restored/game.db" "$tools/data"
 /usr/bin/python3 - "$commit" <<'PY'
 import datetime,gzip,hashlib,json,pathlib,sys
 archive=pathlib.Path('state.json.gz').read_bytes()
