@@ -1,5 +1,5 @@
 use super::*;
-use crate::content::{Object, PRIEST};
+use crate::content::Object;
 use std::time::Duration;
 
 #[derive(Debug, Serialize)]
@@ -177,51 +177,21 @@ impl World {
         Ok(())
     }
 
-    pub(super) fn heal_nova(&mut self, id: i32, slot: Slot, item: &Object) -> Result<()> {
+    pub(super) fn heal_ability(
+        &mut self,
+        id: i32,
+        item: &Object,
+        amount: i32,
+        range: f32,
+    ) -> Result<()> {
         let p = self.players.get(&id).context("healer missing")?;
-        ensure!(
-            ready(p),
-            "Busy, dead, departing or quarantined players cannot heal."
-        );
-        ensure!(
-            p.character.class == PRIEST
-                && slot.object == id
-                && slot.slot == 1
-                && p.character.items[1] == slot.kind
-                && slot.kind == item.kind as i32
-                && item.slot_type == 4,
-            "Healing requires an equipped Priest tome."
-        );
-        ensure!(
-            item.tier.is_some_and(|tier| tier <= 6) && item.activations == 1,
-            "Only single-activation tiered healing tomes are implemented."
-        );
-        ensure!(
-            item.heal > 0
-                && item.heal_range.is_finite()
-                && item.heal_range > 0.
-                && item.heal_range <= 20.
-                && item.mana_cost > 0
-                && item.cooldown_ms > 0,
-            "Invalid healing tome definition."
-        );
-        ensure!(
-            p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET) == 0,
-            "Cannot heal while Quiet."
-        );
-        ensure!(p.character.mp >= item.mana_cost, "Not enough mana to heal.");
-        ensure!(
-            p.last_ability
-                .is_none_or(|last| self.now >= last + item.cooldown_ms),
-            "Healing ability cooldown."
-        );
         let position = p.pos;
         let healing = self
             .players
             .iter()
             .filter(|(_, q)| {
                 ready(q)
-                    && q.pos.distance(position) < item.heal_range
+                    && q.pos.distance(position) < range
                     && q.conditions(self.now) & crate::condition::bit(crate::condition::SICK) == 0
             })
             .map(|(id, q)| {
@@ -229,7 +199,7 @@ impl World {
                     *id,
                     (q.character.effective(&self.content)?[0] - q.character.hp)
                         .max(0)
-                        .min(item.heal),
+                        .min(amount),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -242,9 +212,6 @@ impl World {
                         && self.players[target].pos.distance(enemy.pos) <= 15.
                 })
         });
-        let p = self.players.get_mut(&id).unwrap();
-        p.character.mp -= item.mana_cost;
-        p.last_ability = Some(self.now);
         for (target, amount) in &healing {
             self.players.get_mut(target).unwrap().character.hp += amount;
             if *amount > 0 {
@@ -265,18 +232,7 @@ impl World {
             .values()
             .filter(|p| ready(p) && p.known.contains(&id))
         {
-            send(
-                p,
-                wire::SHOW_EFFECT,
-                effect(
-                    5,
-                    id,
-                    Pos {
-                        x: item.heal_range,
-                        y: 0.,
-                    },
-                ),
-            );
+            send(p, wire::SHOW_EFFECT, effect(5, id, Pos { x: range, y: 0. }));
         }
         tracing::info!(
             player = id,
@@ -286,9 +242,9 @@ impl World {
             combat,
             item = item.kind,
             mana = item.mana_cost,
-            range = item.heal_range,
+            range,
             ?healing,
-            "Priest healing applied"
+            "area ability healing applied"
         );
         Ok(())
     }

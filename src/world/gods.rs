@@ -241,14 +241,22 @@ impl World {
         if matches!(e.kind, 0x652 | 0x656 | 0x658) && e.pos.distance(target) > 10. {
             shots.retain(|(index, _)| *index != 1);
         }
-        let p = self
+        let velocity = if let Some(p) = self
             .players
             .values()
             .find(|p| p.pos.x == target.x && p.pos.y == target.y)
-            .context("Godlands target is not a current player")?;
-        let velocity = if self.now.saturating_sub(p.motion.at) <= 200 {
-            p.motion.velocity
+        {
+            if self.now.saturating_sub(p.motion.at) <= 200 {
+                p.motion.velocity
+            } else {
+                Pos { x: 0., y: 0. }
+            }
         } else {
+            ensure!(
+                self.decoy_positions()
+                    .any(|p| p.x == target.x && p.y == target.y),
+                "Godlands target is neither a current player nor a live decoy"
+            );
             Pos { x: 0., y: 0. }
         };
         for (index, angle) in &mut shots {

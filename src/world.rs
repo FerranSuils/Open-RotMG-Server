@@ -19,6 +19,7 @@ mod abilities;
 mod chat;
 mod endgame;
 mod endgame_ai;
+mod enemy_damage;
 mod enemy_shots;
 mod families;
 mod gods;
@@ -33,6 +34,8 @@ pub use endgame::ForcedTransfer;
 mod bot_tests;
 #[cfg(test)]
 mod class_tests;
+#[cfg(test)]
+mod complete_abilities_tests;
 mod cooperative;
 #[cfg(test)]
 mod cooperative_tests;
@@ -175,6 +178,7 @@ pub struct Player {
     goto_acks: VecDeque<(bool, Instant)>,
     discarded_attack: Option<(i32, i32)>,
     tick: i32,
+    last_motion: Option<(f32, u64)>,
     last_ability: Option<u64>,
     ability_shot: Option<(u16, i32, bool, i32)>,
 }
@@ -310,6 +314,7 @@ pub struct World {
     pub players: BTreeMap<i32, Player>,
     pub bullets: Vec<Bullet>,
     grenades: Vec<mechanics::Grenade>,
+    ability_state: abilities::State,
     finale: endgame_ai::Actors,
     cells: Vec<BTreeSet<i32>>,
     rng: rand::rngs::StdRng,
@@ -1030,7 +1035,11 @@ impl World {
                         phase: 0.,
                         hp: o.hp,
                         size: 100,
-                        condition: 0,
+                        condition: if o.stasis_immune {
+                            crate::condition::bit(crate::condition::STASIS_IMMUNE)
+                        } else {
+                            0
+                        },
                         statuses: BTreeMap::new(),
                         items: o.equipment.clone(),
                         drop_slots: BTreeSet::new(),
@@ -1057,7 +1066,7 @@ impl World {
                             "name" => e.name = v.into(),
                             "size" => e.size = v.parse()?,
                             "eff" => {
-                                e.condition = i32::from_str_radix(v.trim_start_matches("0x"), 16)?
+                                e.condition |= i32::from_str_radix(v.trim_start_matches("0x"), 16)?
                             }
                             "conn" | "mtype" | "mcount" | "mtime" | "nstar" => {
                                 let value = if let Some(hex) = v.strip_prefix("0x") {
@@ -1090,6 +1099,7 @@ impl World {
             players: BTreeMap::new(),
             bullets: Vec::new(),
             grenades: Vec::new(),
+            ability_state: abilities::State::default(),
             finale: endgame_ai::Actors::default(),
             cells,
             rng: rand::rngs::StdRng::from_entropy(),
@@ -1209,11 +1219,15 @@ impl World {
                 } else {
                     100
                 },
-                condition: if kind == 0x91a {
+                condition: (if kind == 0x91a {
                     crate::condition::bit(crate::condition::INVULNERABLE)
                 } else {
                     0
-                },
+                }) | (if definition.stasis_immune {
+                    crate::condition::bit(crate::condition::STASIS_IMMUNE)
+                } else {
+                    0
+                }),
                 statuses: BTreeMap::new(),
                 items,
                 drop_slots: BTreeSet::new(),
@@ -1261,6 +1275,7 @@ impl World {
         self.spawn_entity(kind, pos, vec![])
     }
     fn remove_entity(&mut self, id: i32) -> Entity {
+        self.ability_state.objects.remove(&id);
         let entity = self.entities.remove(&id).expect("indexed entity missing");
         assert!(!entity.reserved, "cannot remove a reserved container");
         self.bag_expiry.remove(&id);
@@ -1384,6 +1399,7 @@ impl World {
                 goto_acks: VecDeque::new(),
                 discarded_attack: None,
                 tick: 0,
+                last_motion: None,
                 last_ability: None,
                 ability_shot: None,
             },
@@ -1409,6 +1425,7 @@ impl World {
         Ok(id)
     }
     pub fn leave(&mut self, id: i32) -> Result<Character> {
+        self.clear_abilities(id);
         self.cancel_trade(id, "Trade cancelled by departure.");
         let p = self.players.get(&id).context("player not found")?;
         ensure!(
@@ -1522,6 +1539,15 @@ impl World {
                 .entities
                 .get_mut(&id)
                 .context("condition target missing")?;
+            if index == crate::condition::STASIS {
+                if e.conditions(self.now) & crate::condition::bit(crate::condition::STASIS_IMMUNE)
+                    != 0
+                {
+                    return Ok(());
+                }
+                e.statuses
+                    .insert(crate::condition::STASIS_IMMUNE, (deadline, deadline + 3000));
+            }
             if index == crate::condition::STUNNED
                 && e.conditions(self.now) & crate::condition::bit(12) != 0
             {
@@ -1792,6 +1818,9 @@ impl World {
         let speed = p.speed(&self.content, self.now)? * 1000.;
         p.record_motion(if sentinel { p.pos } else { pos }, time, self.now, speed);
         if !sentinel {
+            if p.pos.distance(pos) > 0.001 {
+                p.last_motion = Some(((pos.y - p.pos.y).atan2(pos.x - p.pos.x), self.now));
+            }
             p.pos = pos;
         }
         p.last_move = time;
@@ -1821,6 +1850,9 @@ impl World {
         }
         let speed = p.speed(&self.content, self.now)? * 1000.;
         p.record_motion(pos, time, self.now, speed);
+        if p.pos.distance(pos) > 0.001 {
+            p.last_motion = Some(((pos.y - p.pos.y).atan2(pos.x - p.pos.x), self.now));
+        }
         p.pos = pos;
         p.last_move = time;
         p.last_move_at = received;
@@ -2151,6 +2183,10 @@ impl World {
         );
         ensure!(slot.kind >= 0, "empty item slot");
         let item = self.content.get(slot.kind as u16)?.clone();
+        if !item.abilities.is_empty() {
+            self.activate_ability(id, slot, &item, pos)?;
+            return Ok(None);
+        }
         match item.activate.as_str() {
             "Heal" | "Magic" => {
                 ensure!(
@@ -2209,77 +2245,6 @@ impl World {
                 plan.healing_nova = Some((item.heal, item.heal_range));
                 self.players.get_mut(&id).unwrap().pending = true;
                 Ok(Some(plan))
-            }
-            "HealNova" => {
-                self.heal_nova(id, slot, &item)?;
-                Ok(None)
-            }
-            "ConditionEffectSelf" | "ConditionEffectAura" => {
-                self.condition_ability(id, slot, &item, pos)?;
-                Ok(None)
-            }
-            "Shoot" if matches!(item.slot_type, 5 | 15) && item.tier.is_some() => {
-                ensure!(
-                    p.controller == Controller::Human,
-                    "projectile abilities require native reports"
-                );
-                ensure!(
-                    (1..=5).contains(&item.shots) && item.activations == 1,
-                    "unsupported ability projectile layout"
-                );
-                self.spend_ability(id, slot, &item, pos)?;
-                Ok(None)
-            }
-            "BulletNova" => {
-                let spec = item
-                    .projectiles
-                    .get(&0)
-                    .cloned()
-                    .context("ability has no projectile zero")?;
-                self.spend_ability(id, slot, &item, pos)?;
-                let p = self.players.get_mut(&id).unwrap();
-                p.character.shots += 20;
-                let mut messages = Vec::new();
-                for i in 0..20 {
-                    let bullet = p.server_bullet;
-                    p.server_bullet = 128 + (bullet.wrapping_add(1) % 128);
-                    let angle = i as f32 * std::f32::consts::TAU / 20.;
-                    // Server-created abilities must not consume the client's mirrored weapon stream.
-                    let damage = self.rng.gen_range(spec.min..=spec.max);
-                    self.bullets.push(Bullet {
-                        owner: id,
-                        source_kind: p.character.class,
-                        id: bullet,
-                        friendly: true,
-                        start: pos,
-                        pos,
-                        angle,
-                        born: self.now,
-                        damage,
-                        spec: spec.clone(),
-                        hit: BTreeSet::new(),
-                    });
-                    let mut o = Writer::new();
-                    o.u8(bullet)
-                        .i32(id)
-                        .i16(slot.kind as i16)
-                        .f32(pos.x)
-                        .f32(pos.y)
-                        .f32(angle)
-                        .i16(damage as i16);
-                    messages.push(o.0);
-                }
-                for body in messages {
-                    for (peer, p) in &mut self.players {
-                        if p.known.contains(&id)
-                            && (*peer != id || native_hits::expect_shoot_ack(p, vec![]))
-                        {
-                            send(p, 13, body.clone());
-                        }
-                    }
-                }
-                tracing::info!(player = id, "spell cast");
-                Ok(None)
             }
             _ => bail!("item activation not implemented: {}", item.activate),
         }
@@ -2791,6 +2756,7 @@ impl World {
             .utf(&p.killer);
         send(p, 41, out.0);
         tracing::info!(player=id,character=p.character.id,killed_by=%p.killer,"permanent death committed");
+        self.clear_abilities(id);
         Ok(())
     }
     pub fn begin_departure(&mut self, id: i32) -> Result<Option<Character>> {
@@ -3120,6 +3086,22 @@ impl World {
             let burst = kind == 0x91a
                 && entity.expires == Some(self.now + 50)
                 && self.now >= entity.next_shot;
+            if !burst
+                && entity.conditions(self.now) & crate::condition::bit(crate::condition::STASIS)
+                    != 0
+            {
+                let e = self.entities.get_mut(&id).unwrap();
+                if let Some(activated) = &mut e.activated {
+                    *activated += 50;
+                }
+                if e.next_shot >= self.now - 50 {
+                    e.next_shot += 50;
+                }
+                if e.next_aux >= self.now - 50 {
+                    e.next_aux += 50;
+                }
+                continue;
+            }
             let nearest = self
                 .players
                 .values()
@@ -3133,8 +3115,9 @@ impl World {
                                 & crate::condition::bit(crate::condition::INVISIBLE)
                                 == 0)
                 })
-                .min_by(|a, b| pos.distance(a.pos).total_cmp(&pos.distance(b.pos)))
-                .map(|p| p.pos);
+                .map(|p| p.pos)
+                .chain(self.decoy_positions())
+                .min_by(|a, b| pos.distance(*a).total_cmp(&pos.distance(*b)));
             let wake = match kind {
                 0x609 | 0xd06 => 11.,
                 0x617 | 0x61a | 0x6d8 => 12.,
@@ -3348,6 +3331,15 @@ impl World {
             } else {
                 phased_attacks(kind, e.hp, heading, elapsed)
             };
+            let shots =
+                if flags & crate::condition::bit(crate::condition::DAZED) != 0 && shots.len() > 1 {
+                    let count = (shots.len() / 2).max(1);
+                    (0..count)
+                        .map(|i| shots[(2 * i + 1) * shots.len() / (2 * count)])
+                        .collect()
+                } else {
+                    shots
+                };
             let interval = match kind {
                 0x633 if elapsed % 10000 >= 5000 => 500,
                 0x917 if !(1875..3750).contains(&e.hp) => 1000,
@@ -3553,6 +3545,7 @@ impl World {
             tracing::debug!(entity = id, "expired transient or empty container removed");
         }
         self.mechanic_expiry();
+        self.ability_step();
         let shots = self.npc_step();
         self.grenade_step();
         for id in &ids {
@@ -3635,11 +3628,21 @@ impl World {
                     b.hit.insert(-1);
                     break;
                 }
+                if !b.friendly
+                    && !b.spec.multi_hit
+                    && self.decoy_positions().any(|pos| inside_box(pos, b.pos))
+                {
+                    b.hit.insert(-1);
+                    break;
+                }
                 if b.friendly {
                     let targets: Vec<_> = self
                         .near_entities(old, b.pos)
                         .filter(|e| {
                             e.hp > 0
+                                && e.conditions(self.now)
+                                    & crate::condition::bit(crate::condition::STASIS)
+                                    == 0
                                 && self.content.objects[&e.kind].destructible
                                 && !b.hit.contains(&e.id)
                                 && inside_box(e.pos, b.pos)
@@ -3656,62 +3659,16 @@ impl World {
                             b.hit.insert(*target);
                             break;
                         }
-                        let e = &self.entities[target];
-                        let damage = crate::condition::damage(
+                        self.damage_enemy(
+                            b.owner,
+                            *target,
                             b.damage,
-                            self.content.objects[&e.kind].defense,
-                            e.conditions(self.now),
                             b.spec.armor_piercing,
-                        );
-                        if damage > 0 {
-                            for (index, duration) in &b.spec.effects {
-                                self.apply_condition(*target, *index, *duration)
-                                    .expect("validated projectile condition");
-                            }
-                        }
-                        let e = self.entities.get_mut(target).unwrap();
-                        if let Some(p) = self.players.get(&b.owner) {
-                            *e.damage.entry(p.character.id).or_default() += damage.min(e.hp).max(0);
-                        }
-                        e.hp -= damage;
-                        let kill = e.hp <= 0;
-                        let quest = e.kind == 0x6b1 || self.content.objects[&e.kind].quest;
-                        if let Some(p) = self.players.get_mut(&b.owner) {
-                            if damage > 0 {
-                                p.character.hits += 1;
-                            }
-                            if kill {
-                                p.character.kills += 1;
-                                if quest {
-                                    p.character.quests += 1;
-                                }
-                            }
-                        }
-                        let mut o = Writer::new();
-                        o.i32(*target).u8(if damage > 0 {
-                            b.spec.effects.len() as u8
-                        } else {
-                            0
-                        });
-                        if damage > 0 {
-                            for (index, _) in &b.spec.effects {
-                                o.u8(*index);
-                            }
-                        }
-                        o.i16(damage as i16)
-                            .u8(u8::from(kill))
-                            .u8(b.id)
-                            .i32(b.owner);
-                        for p in self.players.values() {
-                            if p.known.contains(target) {
-                                send(p, 47, o.0.clone());
-                            }
-                        }
+                            &b.spec.effects,
+                            Some(b.id),
+                        )
+                        .expect("validated enemy damage");
                         b.hit.insert(*target);
-                        if kill {
-                            self.defeat_entity(*target).expect("validated enemy defeat");
-                            tracing::info!(entity = target, owner = b.owner, "enemy defeated");
-                        }
                     }
                 } else if !self.safe {
                     for id in &ids {

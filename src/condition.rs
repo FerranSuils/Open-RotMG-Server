@@ -13,6 +13,8 @@ pub const BLEEDING: u8 = 16;
 pub const HEALING: u8 = 18;
 pub const DAMAGING: u8 = 19;
 pub const BERSERK: u8 = 20;
+pub const STASIS: u8 = 22;
+pub const STASIS_IMMUNE: u8 = 23;
 pub const INVINCIBLE: u8 = 24;
 pub const INVULNERABLE: u8 = 25;
 pub const ARMORED: u8 = 26;
@@ -23,7 +25,7 @@ pub const fn bit(index: u8) -> i32 {
 pub fn mask(timers: &BTreeMap<u8, (u64, u64)>, now: u64) -> i32 {
     timers
         .iter()
-        .filter(|(_, (_, deadline))| *deadline > now)
+        .filter(|(_, (since, deadline))| *since <= now && *deadline > now)
         .fold(0, |mask, (index, _)| mask | bit(*index))
 }
 pub fn projectile_effect(name: &str) -> Result<u8> {
@@ -45,7 +47,7 @@ pub fn projectile_effect(name: &str) -> Result<u8> {
     })
 }
 pub fn damage(raw: i32, defense: i32, flags: i32, piercing: bool) -> i32 {
-    if flags & (bit(INVINCIBLE) | bit(INVULNERABLE)) != 0 {
+    if flags & (bit(INVINCIBLE) | bit(INVULNERABLE) | bit(STASIS)) != 0 {
         return 0;
     }
     let defense = if piercing || flags & bit(ARMOR_BROKEN) != 0 {
