@@ -104,7 +104,10 @@ fn complete_pack_is_seeded_sourced_distributed_and_regionally_bounded() {
 
 #[test]
 fn every_family_reinforces_on_its_role_clock_without_duplicate_ids() {
-    for family in population::FAMILIES {
+    for family in population::FAMILIES
+        .iter()
+        .filter(|family| family.roles[0].interval.is_some())
+    {
         let mut d = directory(12351);
         let w = d.worlds.get_mut(&-3).unwrap();
         let c = camp(w, family.leader);
@@ -125,7 +128,7 @@ fn every_family_reinforces_on_its_role_clock_without_duplicate_ids() {
         let old = w.population[slot].entity.unwrap();
         w.remove_entity(old);
         w.repopulate().unwrap();
-        let deadline = family.roles[0].interval;
+        let deadline = family.roles[0].interval.unwrap();
         w.now = deadline - 1;
         w.repopulate().unwrap();
         assert!(w.population[slot].entity.is_none());

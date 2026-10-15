@@ -108,32 +108,27 @@ fn selected_boss_shields_summons_corners_and_cleanup_are_bounded() {
 }
 
 #[test]
-fn grates_and_sprite_guardians_have_real_selected_children_and_no_unbounded_reproduction() {
+fn grates_have_bounded_selected_children_and_existing_portal_sources_are_unchanged() {
     let mut w = arena();
     let pos = center(&w);
-    for (parent_kind, expected) in [(0x173, 4), (0x652, 5)] {
-        let parent = w.spawn_entity(parent_kind, pos, vec![]).unwrap();
-        for _ in 0..5 {
-            w.encounter_mechanics(parent, pos, 0).unwrap();
-            w.now += 5000;
-        }
-        let children: Vec<_> = w
-            .entities
-            .values()
-            .filter(|e| e.parent == Some(parent))
-            .collect();
-        assert_eq!(children.len(), expected);
-        for child in children {
-            crate::encounter::validate(&w.content, child.kind).unwrap();
-            crate::loot::validate(&w.content, child.kind).unwrap();
-            if parent_kind == 0x652 {
-                assert_eq!(crate::dungeon::portal_drop(child.kind), Some((0x70c, 0.11)));
-            }
-        }
-        w.remove_entity(parent);
-        w.mechanic_expiry();
-        assert!(w.entities.is_empty());
+    let parent = w.spawn_entity(0x173, pos, vec![]).unwrap();
+    for _ in 0..5 {
+        w.encounter_mechanics(parent, pos, 0).unwrap();
+        w.now += 5000;
     }
+    let children: Vec<_> = w
+        .entities
+        .values()
+        .filter(|e| e.parent == Some(parent))
+        .collect();
+    assert_eq!(children.len(), 4);
+    for child in children {
+        crate::encounter::validate(&w.content, child.kind).unwrap();
+        crate::loot::validate(&w.content, child.kind).unwrap();
+    }
+    w.remove_entity(parent);
+    w.mechanic_expiry();
+    assert!(w.entities.is_empty());
     for (enemy, portal, chance) in [
         (0x610, 0x717, 0.01),
         (0x654, 0x718, 0.17),

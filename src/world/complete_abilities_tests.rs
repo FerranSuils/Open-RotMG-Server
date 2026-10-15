@@ -159,6 +159,25 @@ fn trickster_leaves_decoy_before_teleport_and_decoy_draws_enemy_targeting() {
     assert!(!w.entities.contains_key(&decoy));
 }
 #[test]
+fn godlands_predictive_shooters_accept_live_decoys_without_inventing_player_motion() {
+    let (mut w, id) = fixture(0x324, 0xae3);
+    let god = w
+        .spawn_entity(0x651, Pos { x: 10., y: 12. }, vec![])
+        .unwrap();
+    w.players.get_mut(&id).unwrap().last_motion = Some((std::f32::consts::PI, w.now));
+    cast(&mut w, id, Pos { x: 20., y: 12. }).unwrap();
+    for _ in 0..30 {
+        w.step();
+    }
+    assert!(
+        w.bullets
+            .iter()
+            .any(|b| b.owner == god && b.angle.cos() < 0.)
+    );
+    assert!(w.god_shots(god, Pos { x: 90., y: 90. }, 0., 0).is_err());
+}
+
+#[test]
 fn scepter_chain_is_bounded_unique_and_special_variant_slows() {
     for item in [0xae5, 0xc30] {
         let (mut w, id) = fixture(0x325, item);

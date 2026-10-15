@@ -164,10 +164,14 @@ pub fn profile(kind: u16) -> Option<Profile> {
             0.,
         ),
         0x655 => (chase(4.), 10., 1250, 12.),
-        0x656 => (chase(4.), 4., 750, 12.),
+        0x656 => (chase(4.), 10., 250, 12.),
         0x657 => (chase(4.), 6., 500, 12.),
-        0x658 => (chase(4.), 10., 650, 12.),
+        0x658 => (chase(4.), 10., 50, 12.),
         0x659 => (chase(4.), 4., 900, 12.),
+        0x91a => (chase(0.), 6., 50, 10.),
+        0x6d8 => (chase(5.), 8., 300, 15.),
+        0x905 => (Wander, 2., 1000, 15.),
+        0x906 | 0x907 => (Wander, 4., 800, 15.),
         0x223 | 0x224 => (Wander, 8., 1000, 10.),
         0x225 | 0x227 => (chase(1.), 10., 1000, 10.),
         0x226 => (Wander, 5., 1000, 10.),
@@ -229,6 +233,10 @@ pub fn stage(kind: u16, hp: i32, elapsed: u64) -> u64 {
         0x609 => elapsed / 2000,
         0x614 => u64::from(hp <= 182),
         0x953 => u64::from(hp <= 80),
+        0x91a if hp < 400 => 2,
+        0x91a => u64::from(elapsed % 3750 >= 2500),
+        0x6d8 => (elapsed / 1500) % 3 + 3 * ((elapsed / 2000) % 3),
+        0x906 | 0x907 => u64::from(hp < 400),
         0x917 => {
             if hp >= 5625 {
                 0
@@ -414,18 +422,63 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
         }
         0x654 | 0x655 => spread(0, 5, 10., heading),
         0x656 => {
-            let mut shots = ring(0, 12, heading);
-            shots.push((1, heading));
+            let mut shots = if elapsed % 750 < 250 {
+                ring(0, 5, heading)
+            } else {
+                vec![]
+            };
+            if elapsed % 1000 < 250 {
+                shots.push((1, heading));
+            }
             shots
         }
-        0x657 => ring(0, 5, heading),
+        0x657 => ring(0, 5, 0.),
         0x658 => {
-            if (elapsed / 650).is_multiple_of(2) {
+            let mut shots = if elapsed % 1000 < 50 {
                 spread(0, 5, 10., heading)
             } else {
-                vec![(1, heading)]
+                vec![]
+            };
+            if elapsed % 650 < 50 {
+                shots.push((1, heading));
+            }
+            shots
+        }
+        0x91a if hp < 400 || elapsed % 3750 < 2700 => vec![],
+        0x91a => {
+            let t = elapsed % 3750 - 2500;
+            if t > 1000 || t % 200 >= 50 {
+                vec![]
+            } else {
+                let step = (t - 200) / 200;
+                let mut shots = ring(0, 4, (step * 10) as f32 * std::f32::consts::PI / 180.);
+                shots.extend(ring(
+                    0,
+                    4,
+                    (90 - step * 10) as f32 * std::f32::consts::PI / 180.,
+                ));
+                shots
             }
         }
+        0x6d8 => match elapsed % 4500 {
+            0..1500 => (0..3)
+                .flat_map(|i| spread(0, 3, 10., (i * 120) as f32 * std::f32::consts::PI / 180.))
+                .collect(),
+            1500..3000 => (0..3)
+                .flat_map(|i| {
+                    spread(
+                        0,
+                        4,
+                        10.,
+                        (60 + i * 120) as f32 * std::f32::consts::PI / 180.,
+                    )
+                })
+                .collect(),
+            _ => spread(1, 2, 15., heading),
+        },
+        0x905 => vec![(0, heading)],
+        0x906 | 0x907 if hp < 400 => ring(0, 8, 0.),
+        0x906 | 0x907 => spread(0, 3, 20., heading),
         0x659 => spread(0, 7, 25., heading),
         0x228 | 0xd95 | 0xd98 | 0xd9e | 0xd9f => spread(0, 3, 6., heading),
         0x225 => spread(0, 3, 6., heading),
