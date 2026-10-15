@@ -17,6 +17,9 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 mod abilities;
 mod chat;
+mod elves;
+#[cfg(test)]
+mod elves_tests;
 mod endgame;
 mod endgame_ai;
 mod enemy_shots;
@@ -89,6 +92,7 @@ pub struct Entity {
     activated: Option<u64>,
     stage: Option<u64>,
     parent: Option<i32>,
+    elf_camp: Option<usize>,
     expires: Option<u64>,
     next_aux: u64,
     bullet: u8,
@@ -286,6 +290,7 @@ pub struct World {
     pub max_players: usize,
     encounter: bool,
     population: Vec<Spawn>,
+    elf_camps: Vec<elves::Camp>,
     portal_requests: Vec<(u16, Pos)>,
     critical_deaths: Vec<i32>,
     admission_open: bool,
@@ -1006,6 +1011,7 @@ impl World {
                         activated: None,
                         stage: None,
                         parent: None,
+                        elf_camp: None,
                         expires: None,
                         next_aux: 0,
                         bullet: 0,
@@ -1064,6 +1070,7 @@ impl World {
             max_players: 85,
             encounter: false,
             population: vec![],
+            elf_camps: vec![],
             portal_requests: vec![],
             critical_deaths: vec![],
             admission_open: true,
@@ -1175,6 +1182,7 @@ impl World {
                 activated: None,
                 stage: None,
                 parent: None,
+                elf_camp: None,
                 expires: None,
                 next_aux: 0,
                 bullet: 0,
@@ -1213,6 +1221,14 @@ impl World {
         let entity = self.entities.remove(&id).expect("indexed entity missing");
         assert!(!entity.reserved, "cannot remove a reserved container");
         self.bag_expiry.remove(&id);
+        if let Some(camp) = entity.elf_camp {
+            tracing::debug!(
+                camp,
+                entity = id,
+                kind = entity.kind,
+                "Elf camp member removed"
+            );
+        }
         let cell = entity.pos.y as usize * self.map.width as usize + entity.pos.x as usize;
         assert!(
             self.cells[cell].remove(&id),
@@ -2978,6 +2994,9 @@ impl World {
                 self.population[i].ready = self.now + 60_000;
             }
             let s = &self.population[i];
+            if elves::KINDS.contains(&s.kind) {
+                continue;
+            }
             if s.entity.is_none()
                 && self.now >= s.ready
                 && self.players.values().all(|p| p.pos.distance(s.pos) >= 12.)
@@ -2991,7 +3010,7 @@ impl World {
                 );
             }
         }
-        Ok(())
+        self.repopulate_elves()
     }
     fn move_entity(&mut self, id: i32, goal: Pos, distance: f32) -> Result<()> {
         let old = self.entities[&id].pos;
@@ -3055,7 +3074,7 @@ impl World {
                 .min_by(|a, b| pos.distance(a.pos).total_cmp(&pos.distance(b.pos)))
                 .map(|p| p.pos);
             let wake = match kind {
-                0xd06 => 11.,
+                0x609 | 0xd06 => 11.,
                 0xd90 => 8.,
                 _ => 20.,
             };
@@ -3081,7 +3100,15 @@ impl World {
                 continue;
             }
             let flags = self.entities[&id].conditions(self.now);
-            let (motion, mut speed) = if crate::endgame::ROSTER.contains(&kind) {
+            let (motion, mut speed) = if self.entities[&id].elf_camp.is_some() {
+                match self.elf_movement(id, target, elapsed) {
+                    Ok(movement) => movement,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"Elf movement refused");
+                        continue;
+                    }
+                }
+            } else if crate::endgame::ROSTER.contains(&kind) {
                 match self.finale_movement(id, elapsed) {
                     Ok(movement) => movement,
                     Err(error) => {
@@ -3096,6 +3123,21 @@ impl World {
                 Motion::Stationary => {
                     speed = 0.;
                     Some(pos)
+                }
+                Motion::Wiggle => Some(Pos {
+                    x: self.entities[&id].home.x
+                        + (elapsed as f32 / 1000. * std::f32::consts::TAU).sin(),
+                    y: self.entities[&id].home.y,
+                }),
+                Motion::Retreat { distance } => {
+                    if pos.distance(target) >= distance {
+                        speed = 0.;
+                    }
+                    let angle = (pos.y - target.y).atan2(pos.x - target.x);
+                    Some(Pos {
+                        x: target.x + distance * angle.cos(),
+                        y: target.y + distance * angle.sin(),
+                    })
                 }
                 Motion::Protect { anchor, distance } => {
                     let leader = match self.orbit_anchor(id, anchor, target) {
@@ -3198,6 +3240,7 @@ impl World {
             }
             let e = &self.entities[&id];
             if profile.interval == 0
+                || e.activated.is_none()
                 || self.now < e.next_shot
                 || e.pos.distance(target) > profile.range
                 || flags & crate::condition::bit(crate::condition::STUNNED) != 0
@@ -3402,7 +3445,7 @@ impl World {
             }
         }
         if let Err(error) = self.repopulate() {
-            tracing::error!(%error,"bounded shore respawn failed");
+            tracing::error!(%error,"Realm population replenishment failed");
         }
         let expired: Vec<_> = self
             .bag_expiry

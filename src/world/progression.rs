@@ -50,6 +50,10 @@ impl World {
                     .ground
                     != 0xd0
             });
+            if *terrain == 10 {
+                self.populate_elves(candidates)?;
+                continue;
+            }
             let mut count = 0;
             for pos in candidates {
                 if self.population.iter().any(|s| s.pos.distance(pos) < 8.) {

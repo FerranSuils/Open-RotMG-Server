@@ -7,6 +7,7 @@ pub enum Anchor {
     Parent,
     Kind(u16),
     Home,
+    ElfLeader,
 }
 #[derive(Clone, Copy)]
 pub enum Motion {
@@ -14,6 +15,8 @@ pub enum Motion {
     Wander,
     Chase { sight: f32, stop: f32 },
     Circle,
+    Wiggle,
+    Retreat { distance: f32 },
     Orbit { anchor: Anchor, radius: f32 },
     Protect { anchor: Anchor, distance: f32 },
 }
@@ -148,6 +151,7 @@ pub fn profile(kind: u16) -> Option<Profile> {
 }
 pub fn stage(kind: u16, hp: i32, elapsed: u64) -> u64 {
     match kind {
+        0x609 => elapsed / 2000,
         0x917 => {
             if hp >= 5625 {
                 0
@@ -258,16 +262,8 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
         | 0xd9b..=0xd9d
         | 0xda4
         | 0xdaa..=0xdb2 => vec![(0, heading)],
-        0x609 => spread(
-            0,
-            3,
-            if (elapsed / 1000).is_multiple_of(2) {
-                14.
-            } else {
-                10.
-            },
-            heading,
-        ),
+        0x609 if elapsed % 6000 >= 4000 => vec![],
+        0x609 => spread(0, 3, if elapsed % 6000 < 2000 { 14. } else { 10. }, heading),
         0x617 => {
             let phase = (elapsed / 400) % 3;
             ring(phase as u8, 15, phase as f32 * 8f32.to_radians())
