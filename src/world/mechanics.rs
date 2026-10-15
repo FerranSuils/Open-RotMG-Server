@@ -107,6 +107,9 @@ impl World {
     }
 
     pub(super) fn encounter_mechanics(&mut self, id: i32, target: Pos, elapsed: u64) -> Result<()> {
+        if crate::dungeon::abyss::ROSTER.contains(&self.entities[&id].kind) {
+            return self.abyss_mechanics(id, target, elapsed);
+        }
         if crate::endgame::ROSTER.contains(&self.entities[&id].kind) {
             return self.finale_mechanics(id, target, elapsed);
         }
@@ -380,6 +383,9 @@ impl World {
     }
 
     pub(super) fn encounter_death(&mut self, defeated: &Entity) -> Result<()> {
+        if defeated.kind == crate::dungeon::abyss::IDOL {
+            self.idol_bridge(defeated.home, true)?;
+        }
         if crate::endgame::ROSTER.contains(&defeated.kind) {
             return self.finale_death(defeated);
         }

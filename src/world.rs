@@ -30,6 +30,9 @@ mod population;
 mod population_tests;
 pub(crate) use chat::{chat_error, chat_info, chat_private, validate as validate_chat};
 pub use endgame::ForcedTransfer;
+mod abyss;
+#[cfg(test)]
+mod abyss_tests;
 #[cfg(test)]
 mod bot_tests;
 #[cfg(test)]
@@ -151,6 +154,7 @@ pub struct Player {
     shoot_acks: VecDeque<(Instant, Vec<Bullet>)>,
     visible_projectiles: BTreeMap<(i32, u8), native_hits::VisibleProjectile>,
     tiles: BTreeSet<(i16, i16)>,
+    ground_hits: BTreeMap<usize, i32>,
     pub death_started: bool,
     killer: String,
     movement_credit: f32,
@@ -158,7 +162,7 @@ pub struct Player {
     mp_fraction: f32,
     pub pending: bool,
     pub experience_queued: i32,
-    clears_queued: [u64; 4],
+    clears_queued: [u64; 5],
     pub(crate) progress_started: bool,
     pub death_pending: bool,
     persistence_failure: Option<String>,
@@ -216,11 +220,14 @@ impl Player {
         self.native_update_acked && (clock_paused || self.last_move > 0)
     }
     fn roll_damage(&mut self, spec: &Projectile) -> i32 {
-        if spec.min == spec.max {
-            spec.min
+        self.roll_between(spec.min, spec.max)
+    }
+    fn roll_between(&mut self, min: i32, max: i32) -> i32 {
+        if min == max {
+            min
         } else {
             self.seed = ((self.seed as u64 * 16807) % 2147483647) as u32;
-            spec.min + (self.seed % (spec.max - spec.min) as u32) as i32
+            min + (self.seed % (max - min) as u32) as i32
         }
     }
     fn speed(&self, content: &Content, now: u64) -> Result<f32> {
@@ -314,6 +321,7 @@ pub struct World {
     pub players: BTreeMap<i32, Player>,
     pub bullets: Vec<Bullet>,
     grenades: Vec<mechanics::Grenade>,
+    lava_patches: BTreeMap<usize, (u64, u8)>,
     ability_state: abilities::State,
     finale: endgame_ai::Actors,
     cells: Vec<BTreeSet<i32>>,
@@ -517,7 +525,13 @@ impl Directory {
     fn make(&self, template: &str, name: &str, safe: bool, owner: Option<i32>) -> Result<World> {
         let mut world = World::with_ids(
             self.content.clone(),
-            if template == "snake-pit" {
+            if template == "abyss-of-demons" {
+                let seed = match self.prepared_seed {
+                    Some(seed) => seed ^ self.next_world as u64,
+                    None => rand::random(),
+                };
+                Arc::new(crate::dungeon::abyss::generate(&self.content, seed)?)
+            } else if template == "snake-pit" {
                 Arc::new(crate::dungeon::snake_pit(&self.content, rand::random())?)
             } else {
                 self.templates
@@ -1034,12 +1048,17 @@ impl World {
                         goal: None,
                         phase: 0.,
                         hp: o.hp,
-                        size: 100,
-                        condition: if o.stasis_immune {
-                            crate::condition::bit(crate::condition::STASIS_IMMUNE)
+                        size: if crate::dungeon::abyss::ROSTER.contains(&kind) {
+                            o.size
                         } else {
-                            0
+                            100
                         },
+                        condition: crate::dungeon::abyss::initial_condition(kind)
+                            | if o.stasis_immune {
+                                crate::condition::bit(crate::condition::STASIS_IMMUNE)
+                            } else {
+                                0
+                            },
                         statuses: BTreeMap::new(),
                         items: o.equipment.clone(),
                         drop_slots: BTreeSet::new(),
@@ -1099,6 +1118,7 @@ impl World {
             players: BTreeMap::new(),
             bullets: Vec::new(),
             grenades: Vec::new(),
+            lava_patches: BTreeMap::new(),
             ability_state: abilities::State::default(),
             finale: endgame_ai::Actors::default(),
             cells,
@@ -1214,20 +1234,25 @@ impl World {
                 goal: None,
                 phase: 0.,
                 hp: definition.hp,
-                size: if definition.enemy && matches!(definition.terrain, 1 | 8..=12) {
+                size: if definition.enemy
+                    && (matches!(definition.terrain, 1 | 8..=12)
+                        || crate::dungeon::abyss::ROSTER.contains(&kind))
+                {
                     definition.size
                 } else {
                     100
                 },
-                condition: (if kind == 0x91a {
-                    crate::condition::bit(crate::condition::INVULNERABLE)
-                } else {
-                    0
-                }) | (if definition.stasis_immune {
-                    crate::condition::bit(crate::condition::STASIS_IMMUNE)
-                } else {
-                    0
-                }),
+                condition: crate::dungeon::abyss::initial_condition(kind)
+                    | (if kind == 0x91a {
+                        crate::condition::bit(crate::condition::INVULNERABLE)
+                    } else {
+                        0
+                    })
+                    | (if definition.stasis_immune {
+                        crate::condition::bit(crate::condition::STASIS_IMMUNE)
+                    } else {
+                        0
+                    }),
                 statuses: BTreeMap::new(),
                 items,
                 drop_slots: BTreeSet::new(),
@@ -1367,6 +1392,7 @@ impl World {
                 shoot_acks: VecDeque::new(),
                 visible_projectiles: BTreeMap::new(),
                 tiles: BTreeSet::new(),
+                ground_hits: BTreeMap::new(),
                 death_started: false,
                 killer: String::new(),
                 movement_credit: 0.78,
@@ -1374,7 +1400,7 @@ impl World {
                 mp_fraction: 0.,
                 pending: false,
                 experience_queued: 0,
-                clears_queued: [0; 4],
+                clears_queued: [0; 5],
                 progress_started: false,
                 death_pending: false,
                 persistence_failure: None,
@@ -2642,7 +2668,7 @@ impl World {
     pub fn pending_progress(&mut self) -> Result<Vec<(i32, Character)>> {
         let mut plans = Vec::new();
         for (id, p) in &mut self.players {
-            if (p.experience_queued == 0 && p.clears_queued == [0; 4])
+            if (p.experience_queued == 0 && p.clears_queued == [0; 5])
                 || p.pending
                 || p.death_started
             {
@@ -2654,14 +2680,18 @@ impl World {
                 .pirate_caves
                 .checked_add(p.clears_queued[0])
                 .context("dungeon clear counter overflow")?;
-            for (count, queued) in snapshot.dungeons.iter_mut().zip(&p.clears_queued[1..]) {
+            snapshot.abysses = snapshot
+                .abysses
+                .checked_add(p.clears_queued[4])
+                .context("Abyss clear counter overflow")?;
+            for (count, queued) in snapshot.dungeons.iter_mut().zip(&p.clears_queued[1..4]) {
                 *count = count
                     .checked_add(*queued)
                     .context("dungeon clear counter overflow")?;
             }
             snapshot.alive = true;
             p.experience_queued = 0;
-            p.clears_queued = [0; 4];
+            p.clears_queued = [0; 5];
             p.pending = true;
             p.progress_started = true;
             plans.push((*id, snapshot));
@@ -2681,7 +2711,8 @@ impl World {
             "progress reservation changed"
         );
         let cleared_dungeon = snapshot.pirate_caves > p.character.pirate_caves
-            || snapshot.dungeons != p.character.dungeons;
+            || snapshot.dungeons != p.character.dungeons
+            || snapshot.abysses > p.character.abysses;
         let leveled = snapshot.level > p.character.level;
         p.character.exp = snapshot.exp;
         p.character.fame = snapshot.fame;
@@ -2689,6 +2720,7 @@ impl World {
         p.character.base = snapshot.base;
         p.character.pirate_caves = snapshot.pirate_caves;
         p.character.dungeons = snapshot.dungeons;
+        p.character.abysses = snapshot.abysses;
         if leveled && !p.death_pending {
             let values = p.character.effective(&self.content)?;
             p.character.hp = values[0];
@@ -2733,7 +2765,7 @@ impl World {
                 p.death_pending
                     && !p.pending
                     && p.experience_queued == 0
-                    && p.clears_queued == [0; 4]
+                    && p.clears_queued == [0; 5]
                     && !p.death_started
             })
             .map(|(id, p)| {
@@ -2774,7 +2806,7 @@ impl World {
         p.tx = None;
         p.bot_goal = None;
         p.bot_aim = None;
-        if p.pending || p.death_pending || p.experience_queued > 0 || p.clears_queued != [0; 4] {
+        if p.pending || p.death_pending || p.experience_queued > 0 || p.clears_queued != [0; 5] {
             return Ok(None);
         };
         p.pending = true;
@@ -2948,7 +2980,12 @@ impl World {
                 );
             }
             if self.clear_exit.is_none() {
-                let exit = self.spawn_exit(0x71d, defeated.pos)?;
+                let kind = if defeated.kind == crate::dungeon::abyss::MALPHAS {
+                    0x71c
+                } else {
+                    0x71d
+                };
+                let exit = self.spawn_exit(kind, defeated.pos)?;
                 self.entities.get_mut(&exit).unwrap().published = false;
                 self.clear_exit = Some(exit);
             }
@@ -3081,6 +3118,9 @@ impl World {
             };
             let kind = entity.kind;
             let pos = entity.pos;
+            if kind == crate::dungeon::abyss::IDOL && entity.hp == self.content.objects[&kind].hp {
+                continue;
+            }
             let profile = profile(kind).expect("validated encounter profile");
             // Self-destruction is a deadline, not target acquisition or a weapon cooldown.
             let burst = kind == 0x91a
@@ -3119,7 +3159,7 @@ impl World {
                 .chain(self.decoy_positions())
                 .min_by(|a, b| pos.distance(*a).total_cmp(&pos.distance(*b)));
             let wake = match kind {
-                0x609 | 0xd06 => 11.,
+                0x609 | 0xd06 | crate::dungeon::abyss::MALPHAS => 11.,
                 0x617 | 0x61a | 0x6d8 => 12.,
                 0x91a => 7.,
                 0xd90 => 8.,
@@ -3152,7 +3192,9 @@ impl World {
                 continue;
             }
             let flags = self.entities[&id].conditions(self.now);
-            let (motion, mut speed) = if gods::GODS.contains(&kind)
+            let (motion, mut speed) = if kind == 0x909 && self.entities[&id].stage == Some(1) {
+                (Motion::Stationary, 0.)
+            } else if gods::GODS.contains(&kind)
                 || gods::CONSTRUCTS.contains(&kind)
                 || (kind == 0x653 && self.entities[&id].camp.is_some())
             {
@@ -3329,6 +3371,11 @@ impl World {
                     }
                 }
             } else {
+                let elapsed = if kind == 0x909 && e.stage == Some(1) {
+                    5000
+                } else {
+                    elapsed
+                };
                 phased_attacks(kind, e.hp, heading, elapsed)
             };
             let shots =
@@ -3545,6 +3592,25 @@ impl World {
             tracing::debug!(entity = id, "expired transient or empty container removed");
         }
         self.mechanic_expiry();
+        self.abyss_step();
+        for id in &ids {
+            let p = &self.players[id];
+            if p.controller != Controller::Human
+                && p.character.alive
+                && !p.paused
+                && !p.departing
+                && !p.death_pending
+            {
+                let pos = p.pos;
+                let hazard = self
+                    .map
+                    .cell(pos.x, pos.y)
+                    .is_some_and(|c| self.content.hazards.contains_key(&c.ground));
+                if hazard && let Err(error) = self.ground_damage(*id, self.now as i32, pos) {
+                    tracing::error!(player=id,%error,"actor ground damage refused");
+                }
+            }
+        }
         self.ability_step();
         let shots = self.npc_step();
         self.grenade_step();
@@ -3863,6 +3929,7 @@ mod tests {
             tiles: 0,
             pirate_caves: 0,
             dungeons: [0; 3],
+            abysses: 0,
         }
     }
     pub(super) fn receive(

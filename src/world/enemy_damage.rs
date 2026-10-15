@@ -31,6 +31,10 @@ impl World {
             *e.damage.entry(p.character.id).or_default() += damage.min(e.hp).max(0);
         }
         e.hp -= damage;
+        // A damaged Malphas missile ends through its telegraphed explosion, not ordinary loot/death.
+        if e.kind == 0x909 {
+            e.hp = e.hp.max(1);
+        }
         let kill = e.hp <= 0;
         let quest = e.kind == 0x6b1 || self.content.objects[&e.kind].quest;
         if let Some(p) = self.players.get_mut(&owner) {
