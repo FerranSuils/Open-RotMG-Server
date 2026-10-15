@@ -13,12 +13,9 @@ pub struct TeleportReceipt {
 }
 
 fn ready(p: &Player) -> bool {
-    p.character.alive
+    p.active()
         && p.character.hp > 0
         && !p.pending
-        && !p.death_pending
-        && !p.departing
-        && p.persistence_failure.is_none()
         && p.tx
             .as_ref()
             .is_none_or(|tx| !*tx.lost.borrow() && !tx.packets.is_closed())

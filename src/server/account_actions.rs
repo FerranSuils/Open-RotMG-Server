@@ -1,4 +1,4 @@
-use super::hiscores::{authorize, json_result};
+use super::hiscores::{json_error, json_result, private_denial};
 use super::*;
 
 #[derive(Deserialize)]
@@ -17,31 +17,6 @@ pub(super) struct RecoverRequest {
 pub(super) struct ResetRequest {
     token: String,
     password: String,
-}
-fn private_denial(a: &App, peer: SocketAddr, headers: &HeaderMap) -> Option<Response> {
-    if authorize(a, peer, headers).is_err() {
-        return Some(
-            (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error":"account API authorization denied"})),
-            )
-                .into_response(),
-        );
-    }
-    if !rate_allow(
-        &mut a.requests.lock().expect("request registry poisoned"),
-        peer.ip(),
-        std::time::Instant::now(),
-    ) {
-        return Some(
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error":"account attempt limit; wait one minute"})),
-            )
-                .into_response(),
-        );
-    }
-    None
 }
 pub(super) async fn discord_kick(
     State(a): State<App>,
@@ -85,20 +60,15 @@ pub(super) async fn reset_password(
     Json(request): Json<ResetRequest>,
 ) -> Response {
     if headers.get("origin").and_then(|h| h.to_str().ok()) != Some(a.origin.as_str()) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error":"reset request origin denied"})),
-        )
-            .into_response();
+        return json_error(StatusCode::FORBIDDEN, "reset request origin denied");
     }
     match admit(&a, &headers, peer) {
         Ok(true) => {}
         Ok(false) => {
-            return (
+            return json_error(
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error":"Too many reset attempts; wait one minute"})),
-            )
-                .into_response();
+                "Too many reset attempts; wait one minute",
+            );
         }
         Err(e) => return json_result(Err(e)),
     }
