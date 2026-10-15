@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 
 LEGACY_GAME = {
     'accounts': ('id', 'guid', 'name'),
@@ -26,28 +27,18 @@ AUTH_HISCORES_GAME = {**HISCORES_GAME, 'credentials': AUTH_GAME['credentials'], 
 AUTH_ACTIONS_GAME = {**ACTIONS_GAME, 'credentials': AUTH_GAME['credentials'], **{t: AUTH_HISCORES_GAME['discord_codes'] for t in ['discord_codes', 'recovery_codes', 'password_resets']}}
 AUTH_SOCIAL_GAME = {**AUTH_ACTIONS_GAME, 'account_lists': SOCIAL_GAME['account_lists']}
 DISCORD = {'levels': ('guild_id', 'user_id', 'username', 'xp', 'last_xp_at', 'last_message_id')}
-CHARACTER = {'id', 'account', 'name', 'level', 'exp', 'fame', 'hp', 'mp', 'items', 'revision',
-             'alive', 'created_at', 'shots', 'hits', 'kills', 'quests', 'tiles'}
 
 
-def character(value):
-    if not isinstance(value, dict) or set(value) not in (CHARACTER, CHARACTER | {'schema', 'class', 'base', 'pirate_caves'}):
-        raise ValueError('Unsupported character payload; review the credential-free export schema')
-    if 'schema' in value:
-        if type(value['schema']) is not int or value['schema'] != 1 or type(value['class']) is not int or not 0 <= value['class'] <= 65535:
-            raise ValueError('Invalid character schema/class')
-        if not isinstance(value['base'], list) or len(value['base']) != 8 or any(type(i) is not int or i < 0 for i in value['base']):
-            raise ValueError('Invalid character base stats')
-        if type(value['pirate_caves']) is not int or value['pirate_caves'] < 0:
-            raise ValueError('Invalid character dungeon counter')
-    if not isinstance(value['name'], str) or type(value['alive']) is not bool:
-        raise ValueError('Invalid character name/alive types')
-    for key in CHARACTER - {'name', 'alive', 'items'}:
-        if type(value[key]) is not int:
-            raise ValueError('Invalid character integer: ' + key)
-    if not isinstance(value['items'], list) or len(value['items']) != 12 or any(type(i) is not int for i in value['items']):
-        raise ValueError('Invalid character equipment')
-    return value
+def characters(values):
+    binary = os.environ.get('OPENROTMG_BACKUP_BINARY')
+    if not binary:
+        raise RuntimeError('OPENROTMG_BACKUP_BINARY must name the matching release binary')
+    result = subprocess.run([binary, '--backup-validate'], input=json.dumps(values),
+                            text=True, capture_output=True, timeout=30)
+    if result.returncode:
+        raise ValueError('Release character validation failed: ' + result.stderr.strip())
+    if json.loads(result.stdout) != {'validated_characters': len(values)}:
+        raise ValueError('Release character validator returned an invalid receipt')
 
 
 def snapshot(path, schema):
@@ -79,7 +70,7 @@ def validate(bundle):
     if set(bundle) != {'schema', 'created_at', 'revisions', 'game', 'discord'} or type(bundle['schema']) is not int or bundle['schema'] not in GAME_SCHEMAS:
         raise ValueError('Unsupported backup envelope')
     datetime.datetime.strptime(bundle['created_at'], '%Y-%m-%dT%H:%M:%SZ')
-    if set(bundle['revisions']) != {'server', 'discord_bot'} or any(not re.fullmatch('[0-9a-f]{40}', v) for v in bundle['revisions'].values()):
+    if set(bundle['revisions']) not in ({'server', 'discord_bot'}, {'server', 'discord_bot', 'validator'}) or any(not re.fullmatch('[0-9a-f]{40}', v) for v in bundle['revisions'].values()):
         raise ValueError('Invalid source revisions')
     for name, schema in [('game', GAME_SCHEMAS[bundle['schema']]), ('discord', DISCORD)]:
         data = bundle[name]
@@ -89,13 +80,12 @@ def validate(bundle):
             allowed = set(columns) - {'guid'}
             if not isinstance(data[table], list) or any(not isinstance(r, dict) or set(r) != allowed for r in data[table]):
                 raise ValueError('Unsupported backup fields: ' + table)
+    characters([json.loads(row['stats']) for row in bundle['game']['characters']]
+               + [json.loads(row['snapshot']) for row in bundle['game']['deaths']])
     for row in bundle['game']['characters']:
-        character(json.loads(row['stats']))
         items = json.loads(row['items'])
         if not isinstance(items, list) or len(items) != 12 or any(type(i) is not int for i in items):
             raise ValueError('Invalid inventory')
-    for row in bundle['game']['deaths']:
-        character(json.loads(row['snapshot']))
     for row in bundle['game'].get('vaults', []):
         items = json.loads(row['items'])
         if type(row['account']) is not int or row['account'] <= 0 or type(row['revision']) is not int or row['revision'] < 0:
@@ -140,12 +130,13 @@ def validate(bundle):
     return bundle
 
 
-def export(game, discord, output, server_revision, bot_revision):
+def export(game, discord, output, server_revision, bot_revision, validator_revision):
     game_data = snapshot(game, [*GAME_SCHEMAS.values(), AUTH_GAME, AUTH_SHORE_GAME, AUTH_HISCORES_GAME, AUTH_ACTIONS_GAME, AUTH_SOCIAL_GAME])
     version = next(version for version, schema in GAME_SCHEMAS.items() if set(schema) == set(game_data))
     bundle = validate({
         'schema': version, 'created_at': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-        'revisions': {'server': Path(server_revision).read_text().strip(), 'discord_bot': Path(bot_revision).read_text().strip()},
+        'revisions': {'server': Path(server_revision).read_text().strip(), 'discord_bot': Path(bot_revision).read_text().strip(),
+                      'validator': Path(validator_revision).read_text().strip()},
         'game': game_data, 'discord': snapshot(discord, DISCORD),
     })
     data = gzip.compress(json.dumps(bundle, sort_keys=True, separators=(',', ':')).encode(), mtime=0)
@@ -202,6 +193,10 @@ CREATE TABLE discord_recovery(account INTEGER PRIMARY KEY REFERENCES discord_lin
                 pass
             with closing(sqlite3.connect(path)) as target:
                 db.backup(target)
+    for name, filename in [('game', 'game.db'), ('discord', 'levels.sqlite')]:
+        schema = GAME_SCHEMAS[bundle['schema']] if name == 'game' else DISCORD
+        if snapshot(directory / filename, schema) != bundle[name]:
+            raise ValueError('Restored fields differ from uploaded archive: ' + name)
     return bundle
 
 
@@ -210,7 +205,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Credential-free persisted-state export and offline restore')
     commands = parser.add_subparsers(dest='command', required=True)
     exp = commands.add_parser('export')
-    for option in ['game', 'discord', 'output', 'server-revision', 'bot-revision']:
+    for option in ['game', 'discord', 'output', 'server-revision', 'bot-revision', 'validator-revision']:
         exp.add_argument('--' + option, required=True)
     res = commands.add_parser('restore')
     res.add_argument('--archive', required=True)

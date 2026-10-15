@@ -8,6 +8,7 @@ import sys
 import tarfile
 import tempfile
 
+sys.dont_write_bytecode = True
 revision, binary, output = sys.argv[1:]
 assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == revision
 output = Path(output)
@@ -22,6 +23,9 @@ with tempfile.TemporaryDirectory() as temporary:
     shutil.copyfile(binary, stage / 'openrotmg')
     (stage / 'openrotmg').chmod(0o755)
     (stage / 'REVISION').write_text(revision + '\n')
+    sys.path.insert(0, str(stage / 'scripts/backups'))
+    from release_contract import check
+    check(stage / 'openrotmg', stage / 'data', root / 'contract', revision)
     digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     manifest = {str(p.relative_to(stage)): digest(p) for p in sorted(stage.rglob('*')) if p.is_file()}
     with tarfile.open(output / 'server.tar.gz', 'w:gz') as archive:
