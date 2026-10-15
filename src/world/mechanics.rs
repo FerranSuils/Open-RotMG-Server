@@ -21,18 +21,18 @@ impl World {
         match anchor {
             encounter::Anchor::Player => Ok(player),
             encounter::Anchor::Home => Ok(e.home),
-            encounter::Anchor::ElfLeader => {
+            encounter::Anchor::CampLeader => {
                 let camp = self
-                    .elf_camps
-                    .get(e.elf_camp.context("Elf has no camp")?)
-                    .context("Elf camp missing")?;
+                    .camps
+                    .get(e.camp.context("entity has no family camp")?)
+                    .context("family camp missing")?;
                 let leader = self.population[camp.start]
                     .entity
-                    .context("Elf leader slot is empty")?;
+                    .context("family leader slot is empty")?;
                 Ok(self
                     .entities
                     .get(&leader)
-                    .context("Elf leader is no longer alive")?
+                    .context("family leader is no longer alive")?
                     .pos)
             }
             encounter::Anchor::Parent => Ok(self
@@ -141,6 +141,24 @@ impl World {
             e.stage = Some(stage);
             tracing::debug!(entity = id, kind, stage, "encounter phase entered");
             match kind {
+                0x614 if stage == 1 => {
+                    let mut out = Writer::new();
+                    out.u8(15)
+                        .i32(id)
+                        .f32(0.6)
+                        .f32(5.)
+                        .f32(0.)
+                        .f32(0.)
+                        .u32(0xff666666);
+                    for p in self
+                        .players
+                        .values()
+                        .filter(|p| p.known.contains(&id) && p.pos.distance(pos) < 20.)
+                    {
+                        send(p, wire::SHOW_EFFECT, out.0.clone());
+                    }
+                    tracing::debug!(entity = id, "Goblin horde commanded by wounded mage");
+                }
                 0x917 if stage == 1 => self.spawn_children(id, 0x919, 8, 3.)?,
                 0xd06 if stage % 5 == 3 => {
                     for radius in [9.5, 14.] {
@@ -182,11 +200,13 @@ impl World {
         self.entities.get_mut(&id).unwrap().next_aux = self.now
             + match kind {
                 0x173 | 0x652 | 0xdae => 5000,
+                0x953 => 2500,
                 0x654 => 3000,
                 0x917 => 500,
                 _ => 1000,
             };
         match kind {
+            0x953 => self.throw_grenade(id, target, 2., 12)?,
             0x173 => {
                 self.spawn_children(id, 0x223, 2, 1.5)?;
                 self.spawn_children(id, 0x224, 2, 2.)?;

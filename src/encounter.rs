@@ -7,7 +7,7 @@ pub enum Anchor {
     Parent,
     Kind(u16),
     Home,
-    ElfLeader,
+    CampLeader,
 }
 #[derive(Clone, Copy)]
 pub enum Motion {
@@ -41,6 +41,81 @@ pub fn profile(kind: u16) -> Option<Profile> {
             2500,
             3.,
         ),
+        0x601 => (
+            Chase {
+                sight: 6.,
+                stop: 1.,
+            },
+            11.,
+            2500,
+            3.,
+        ),
+        0x602 => (Wander, 6., 2000, 10.),
+        0x603 => (Wander, 4., 2000, 8.),
+        0x604 => (Wander, 2., 0, 0.),
+        0x953 => (
+            Chase {
+                sight: 6.,
+                stop: 1.,
+            },
+            4.,
+            1000,
+            8.,
+        ),
+        0x954 => (
+            Chase {
+                sight: 6.,
+                stop: 0.,
+            },
+            8.,
+            2000,
+            8.,
+        ),
+        0x612 | 0x613 => (
+            Chase {
+                sight: 8.,
+                stop: 2.,
+            },
+            8.,
+            1000,
+            3.,
+        ),
+        0x614 => (
+            Chase {
+                sight: 10.5,
+                stop: 4.,
+            },
+            5.,
+            100,
+            10.,
+        ),
+        0x618 => (
+            Chase {
+                sight: 8.,
+                stop: 1.,
+            },
+            8.5,
+            1000,
+            3.,
+        ),
+        0x619 => (
+            Chase {
+                sight: 8.,
+                stop: 4.,
+            },
+            8.,
+            1000,
+            10.,
+        ),
+        0x61a => (
+            Chase {
+                sight: 10.5,
+                stop: 6.,
+            },
+            7.5,
+            200,
+            12.,
+        ),
         0x60e => (Wander, 4., 1000, 5.),
         0x60f => (Wander, 4., 600, 5.),
         0x610 => (Wander, 4., 1800, 5.),
@@ -59,10 +134,10 @@ pub fn profile(kind: u16) -> Option<Profile> {
         0x605 | 0x60a | 0x616 => (chase(4.), 8., 1000, 10.),
         0x606 | 0x615 => (chase(1.), 8., 1000, 3.),
         0x607 => (chase(6.), 6., 300, 10.),
-        0x60c => (chase(4.), 6., 1000, 10.),
+        0x60c => (chase(4.), 6., 200, 10.),
         0x60d => (chase(4.), 6., 10000, 10.),
         0x609 => (chase(2.), 6., 1000, 10.),
-        0x617 => (chase(4.), 7.5, 400, 15.),
+        0x617 => (chase(6.), 7.5, 400, 12.),
         0x61c | 0x61e | 0x61f | 0x63a | 0x63b | 0x63e => (chase(1.), 10., 1000, 3.),
         0x61d | 0x63c => (chase(7.), 10., 1000, 10.),
         0x63f => (Wander, 4., 1000, 10.),
@@ -152,6 +227,8 @@ pub fn profile(kind: u16) -> Option<Profile> {
 pub fn stage(kind: u16, hp: i32, elapsed: u64) -> u64 {
     match kind {
         0x609 => elapsed / 2000,
+        0x614 => u64::from(hp <= 182),
+        0x953 => u64::from(hp <= 80),
         0x917 => {
             if hp >= 5625 {
                 0
@@ -231,6 +308,41 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
     match kind {
         0x927 if hp < 640 => vec![(0, heading), (1, heading)],
         0x172 | 0x173 | 0x175..=0x179 | 0x927 | 0x68a..=0x68f | 0x653 => vec![],
+        0x604 => vec![],
+        0x601 | 0x602 | 0x603 | 0x612 | 0x613 | 0x618 | 0x619 | 0x953 => vec![(0, heading)],
+        0x954 => vec![(((elapsed / 2000) % 2) as u8, heading)],
+        0x60c => {
+            let mut shots = vec![];
+            if elapsed % 5000 < 200 {
+                shots.push((0, heading));
+            }
+            if elapsed % 400 < 200 {
+                shots.push((1, heading));
+            }
+            shots
+        }
+        0x614 => {
+            let mut shots = vec![];
+            if elapsed % 1000 < 100 {
+                shots.push((0, heading));
+            }
+            if elapsed % if hp <= 182 { 1000 } else { 1300 } < 100 {
+                shots.push((1, heading));
+            }
+            shots
+        }
+        0x61a => {
+            let mut shots = if elapsed % 400 < 200 {
+                let phase = (elapsed / 400) % 3;
+                ring(phase as u8, 15, phase as f32 * 8f32.to_radians())
+            } else {
+                vec![]
+            };
+            if elapsed % 1000 < 200 {
+                shots.push((3, heading));
+            }
+            shots
+        }
         0x60e => spread(0, 2, 10., heading),
         0x610 => ring(0, 5, 0.),
         0x600
@@ -238,7 +350,6 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
         | 0x683..=0x689
         | 0x605..=0x607
         | 0x60a
-        | 0x60c
         | 0x60d
         | 0x615
         | 0x616
@@ -400,7 +511,7 @@ mod tests {
         assert_eq!(attacks(0x610, 70, 0.).len(), 5);
         let red = attacks(0x60e, 70, 0.);
         assert!((red[1].1 - red[0].1 - 10f32.to_radians()).abs() < 0.00001);
-        assert!(profile(0x601).is_none());
+        assert!(profile(0xffff).is_none());
         assert!(attacks(0x68a, 5, 0.).is_empty());
     }
 }
