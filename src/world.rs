@@ -1,5 +1,5 @@
 use crate::{
-    content::{Content, DAZED, Map, PARALYZED, Projectile, SLOWED, SPEEDY, STUNNED},
+    content::{Content, Map, PARALYZED, Projectile, SLOWED, SPEEDY, STUNNED},
     store::{AccountLists, Character, Vault},
     wire::{self, Packet, Writer},
 };
@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use rand::{Rng, SeedableRng, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicI32, Ordering},
@@ -16,12 +16,26 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 mod chat;
+mod endgame;
+mod endgame_ai;
+mod enemy_shots;
 pub(crate) use chat::{chat_error, chat_info, chat_private, validate as validate_chat};
+pub use endgame::ForcedTransfer;
 #[cfg(test)]
 mod bot_tests;
 mod cooperative;
 #[cfg(test)]
 mod cooperative_tests;
+mod mechanics;
+#[cfg(test)]
+mod mechanics_tests;
+mod reconciliation;
+#[cfg(test)]
+mod reconciliation_tests;
+pub use reconciliation::{NativeInput, RejectedNativeShot};
+mod progression;
+#[cfg(test)]
+mod progression_tests;
 mod trade;
 pub(crate) mod view;
 #[cfg(test)]
@@ -52,6 +66,7 @@ pub struct Entity {
     pub hp: i32,
     pub size: i32,
     pub condition: i32,
+    statuses: BTreeMap<u8, (u64, u64)>,
     pub items: Vec<i32>,
     #[serde(skip)]
     drop_slots: BTreeSet<usize>,
@@ -63,9 +78,17 @@ pub struct Entity {
     goal: Option<Pos>,
     phase: f32,
     next_shot: u64,
+    activated: Option<u64>,
+    stage: Option<u64>,
+    parent: Option<i32>,
+    expires: Option<u64>,
+    next_aux: u64,
     bullet: u8,
 }
 impl Entity {
+    fn conditions(&self, now: u64) -> i32 {
+        self.condition | crate::condition::mask(&self.statuses, now)
+    }
     fn accessible(&self, account: i32) -> bool {
         if !self.published {
             return false;
@@ -82,6 +105,11 @@ pub enum Controller {
     Qa,
     Autonomous,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttackSuppression {
+    ReceiveBudget,
+    EffectiveCooldown,
+}
 pub struct Player {
     pub character: Character,
     pub pos: Pos,
@@ -89,9 +117,11 @@ pub struct Player {
     pub departing: bool,
     account_lists: AccountLists,
     paused: bool,
-    conditions: BTreeMap<i32, (u64, u64)>,
     controller: Controller,
     pub known: BTreeSet<i32>,
+    quest: Option<i32>,
+    statuses: BTreeMap<u8, (u64, u64)>,
+    native_motion_condition: i32,
     known_since: BTreeMap<i32, u64>,
     tiles: BTreeSet<(i16, i16)>,
     pub death_started: bool,
@@ -101,7 +131,7 @@ pub struct Player {
     mp_fraction: f32,
     pub pending: bool,
     pub experience_queued: i32,
-    caves_queued: u64,
+    clears_queued: [u64; 4],
     progress_started: bool,
     pub death_pending: bool,
     persistence_failure: Option<String>,
@@ -114,21 +144,25 @@ pub struct Player {
     last_attack_at: u64,
     attack_credit: f32,
     attack_count: i32,
-    attack_suppressed: bool,
+    attack_suppressed: Option<AttackSuppression>,
     last_move: i32,
     last_move_at: u64,
+    goto_acks: VecDeque<(bool, Instant)>,
+    discarded_attack: Option<(i32, i32)>,
     tick: i32,
     last_ability: u64,
 }
 impl Player {
-    fn condition(&self, now: u64) -> i32 {
-        self.conditions
-            .iter()
-            .filter(|(_, (_, until))| *until > now)
-            .fold(0, |mask, (effect, _)| mask | effect)
+    fn roll_damage(&mut self, spec: &Projectile) -> i32 {
+        if spec.min == spec.max {
+            spec.min
+        } else {
+            self.seed = ((self.seed as u64 * 16807) % 2147483647) as u32;
+            spec.min + (self.seed % (spec.max - spec.min) as u32) as i32
+        }
     }
     fn speed(&self, content: &Content, now: u64) -> Result<f32> {
-        let condition = self.condition(now);
+        let condition = self.conditions(now);
         Ok(if condition & PARALYZED != 0 {
             0.
         } else if condition & SLOWED != 0 {
@@ -153,21 +187,19 @@ pub struct Bullet {
     pub spec: Projectile,
     pub hit: BTreeSet<i32>,
 }
+impl Player {
+    pub(crate) fn conditions(&self, now: u64) -> i32 {
+        crate::condition::mask(&self.statuses, now)
+    }
+}
 impl Bullet {
     pub fn position(&self, now: u64) -> Pos {
-        let age = (now - self.born) as f32;
-        let d = age * self.spec.speed / 10000.;
-        let phase = if self.id.is_multiple_of(2) {
-            0.
-        } else {
-            std::f32::consts::PI
-        };
-        let wave = self.spec.amplitude
-            * (phase + age / self.spec.lifetime * self.spec.frequency * std::f32::consts::TAU)
-                .sin();
+        let (x, y) = self
+            .spec
+            .offset(self.id, self.angle, (now - self.born) as f32);
         Pos {
-            x: self.start.x + d * self.angle.cos() - wave * self.angle.sin(),
-            y: self.start.y + d * self.angle.sin() + wave * self.angle.cos(),
+            x: self.start.x + x,
+            y: self.start.y + y,
         }
     }
 }
@@ -186,9 +218,12 @@ pub struct InventoryPlan {
     pub character: i32,
     pub bag: Option<(i32, Vec<i32>)>,
     pub healing: i32,
+    pub healing_nova: Option<(i32, f32)>,
     pub mana: i32,
+    pub stat_growth: Option<(Character, Slot, usize, i32)>,
     pub vault: Option<Vault>,
     pub dropped: Option<i32>,
+    pub unlock: Option<(i32, i32)>,
     pub collected: Option<u16>,
     loot_slot: Option<(i32, usize)>,
 }
@@ -215,6 +250,8 @@ pub struct World {
     pub entities: BTreeMap<i32, Entity>,
     pub players: BTreeMap<i32, Player>,
     pub bullets: Vec<Bullet>,
+    grenades: Vec<mechanics::Grenade>,
+    finale: endgame_ai::Actors,
     cells: Vec<BTreeSet<i32>>,
     rng: rand::rngs::StdRng,
     pub now: u64,
@@ -227,7 +264,9 @@ pub struct World {
     pub max_players: usize,
     encounter: bool,
     population: Vec<Spawn>,
-    portal_requests: Vec<Pos>,
+    portal_requests: Vec<(u16, Pos)>,
+    critical_deaths: Vec<i32>,
+    admission_open: bool,
     bag_expiry: BTreeMap<i32, u64>,
     cleared: bool,
     clear_exit: Option<i32>,
@@ -272,6 +311,7 @@ pub struct Directory {
     grants: BTreeMap<Vec<u8>, Grant>,
     portals: BTreeMap<i32, Portal>,
     chat_budgets: BTreeMap<i32, chat::ChatBudget>,
+    endgame: endgame::RealmDirectory,
     teleports: BTreeMap<i32, Instant>,
     idle: BTreeMap<i32, u64>,
     next_world: i32,
@@ -320,8 +360,20 @@ impl Directory {
         max_players: usize,
         seed: u64,
     ) -> Result<Self> {
+        crate::endgame::validate(&content)?;
         let mut templates = BTreeMap::new();
-        for name in ["tutorial", "nexus", "nexus-limbo", "vault", "pirate-cave"] {
+        for name in [
+            "tutorial",
+            "nexus",
+            "nexus-limbo",
+            "vault",
+            "pirate-cave",
+            crate::endgame::CASTLE,
+            crate::endgame::CHAMBER,
+            crate::endgame::CELLAR,
+            "sprite-world",
+            "undead-lair",
+        ] {
             templates.insert(
                 name.to_string(),
                 Arc::new(Map::load(&path.join(format!("{name}.wmap")), &content)?),
@@ -339,6 +391,7 @@ impl Directory {
             grants: BTreeMap::new(),
             portals: BTreeMap::new(),
             chat_budgets: BTreeMap::new(),
+            endgame: endgame::RealmDirectory::default(),
             teleports: BTreeMap::new(),
             idle: BTreeMap::new(),
             next_world: 1,
@@ -355,6 +408,7 @@ impl Directory {
             let world = d.make(template, name, safe, None)?;
             d.worlds.insert(id, world);
         }
+        d.bind_realm_heroes(-3, d.worlds[&-3].hero_identities())?;
         let nexus = d.worlds.get_mut(&-2).expect("constructed Nexus");
         let pos = nexus
             .map
@@ -375,33 +429,64 @@ impl Directory {
     fn make(&self, template: &str, name: &str, safe: bool, owner: Option<i32>) -> Result<World> {
         let mut world = World::with_ids(
             self.content.clone(),
-            self.templates
-                .get(template)
-                .context("world template missing")?
-                .clone(),
+            if template == "snake-pit" {
+                Arc::new(crate::dungeon::snake_pit(&self.content, rand::random())?)
+            } else {
+                self.templates
+                    .get(template)
+                    .context("world template missing")?
+                    .clone()
+            },
             self.ids.clone(),
         )?;
         world.name = name.into();
         world.safe = safe;
         world.owner = owner;
         world.max_players = self.max_players;
-        world.encounter = matches!(template, "realm-shore" | "pirate-cave");
+        world.encounter = template == "realm-shore"
+            || template == crate::endgame::CASTLE
+            || crate::dungeon::DUNGEONS
+                .iter()
+                .chain(crate::endgame::DUNGEONS)
+                .any(|(_, name, _, _)| *name == template);
         if template == "realm-shore" {
             world.populate_shore()?;
+            world.populate_inland()?;
+            world.populate_realm_heroes()?;
+        }
+        world.prepare_endgame()?;
+        if template == "sprite-world" {
+            let exits: Vec<_> = world
+                .entities
+                .values()
+                .filter(|e| e.kind == 0x70e)
+                .map(|e| e.id)
+                .collect();
+            ensure!(
+                exits.len() == 1,
+                "Sprite World requires one authored completion exit"
+            );
+            world.entities.get_mut(&exits[0]).unwrap().published = false;
+            world.clear_exit = Some(exits[0]);
         }
         if world.encounter {
-            for e in world
+            let kinds: BTreeSet<_> = world
                 .entities
                 .values()
                 .filter(|e| world.content.objects[&e.kind].enemy)
-            {
-                ensure!(
-                    crate::encounter::profile(e.kind).is_some(),
-                    "missing encounter profile for {:#x}",
-                    e.kind
-                );
-                crate::loot::validate(&world.content, e.kind)?;
+                .map(|e| e.kind)
+                .collect();
+            for kind in kinds {
+                crate::encounter::validate(&world.content, kind)?;
+                crate::loot::validate(&world.content, kind)?;
             }
+        }
+        for kind in [
+            0x173, 0x653, 0x918, 0x919, 0xd07, 0xd08, 0xd09, 0xd0a, 0xdaa, 0xdab, 0xdac, 0xdad,
+            0xdae, 0xdaf, 0xdb0, 0xdb1, 0xdb2,
+        ] {
+            crate::encounter::validate(&world.content, kind)?;
+            crate::loot::validate(&world.content, kind)?;
         }
         Ok(world)
     }
@@ -426,7 +511,7 @@ impl Directory {
         let destination = match game {
             0 | -2 => -2,
             -1 => -1,
-            -3 => -3,
+            -3 => self.endgame.active,
             -4 => -4,
             _ => bail!("world entry {game} requires a transfer grant"),
         };
@@ -434,14 +519,17 @@ impl Directory {
             self.worlds.contains_key(&destination),
             "entry world missing"
         );
+        ensure!(self.worlds[&destination].admission_open, "Realm is closed");
         Ok(destination)
     }
     pub fn instance(&mut self, template: &str, account: Option<i32>) -> Result<i32> {
         ensure!(
-            matches!(
-                (template, account),
-                ("vault", Some(_)) | ("pirate-cave", None)
-            ),
+            matches!((template, account), ("vault", Some(_)))
+                || (account.is_none()
+                    && crate::dungeon::DUNGEONS
+                        .iter()
+                        .chain(crate::endgame::DUNGEONS)
+                        .any(|(_, name, _, _)| *name == template)),
             "invalid private/dungeon instance policy"
         );
         if let Some(account) = account
@@ -455,7 +543,12 @@ impl Directory {
             if template == "vault" {
                 "Vault"
             } else {
-                "Pirate Cave"
+                crate::dungeon::DUNGEONS
+                    .iter()
+                    .chain(crate::endgame::DUNGEONS)
+                    .find(|(_, name, _, _)| *name == template)
+                    .context("dungeon registration missing")?
+                    .2
             },
             template == "vault",
             account,
@@ -488,9 +581,13 @@ impl Directory {
         };
         let destination = match kind {
             0x703 | 0x70d | 0x712 | 0x71d => -2,
-            0x704 | 0x70e | 0x71c => -3,
+            0x704 | 0x70e | 0x71c => self.initial(-3)?,
             0x720 => self.instance("vault", Some(account))?,
-            0x717 => {
+            kind if crate::dungeon::DUNGEONS
+                .iter()
+                .chain(crate::endgame::DUNGEONS)
+                .any(|(portal, _, _, _)| *portal == kind) =>
+            {
                 let binding = self
                     .portals
                     .get(&portal.context("dungeon portal identity missing")?)
@@ -521,6 +618,7 @@ impl Directory {
             world.owner.is_none_or(|owner| owner == account),
             "private destination belongs to another account"
         );
+        ensure!(world.admission_open, "Realm is closed");
         let name = world.name.clone();
         let mut key = vec![0; 16];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
@@ -570,6 +668,7 @@ impl Directory {
             self.worlds.contains_key(&destination),
             "transfer destination expired"
         );
+        ensure!(self.worlds[&destination].admission_open, "Realm is closed");
         let character = grant.character;
         self.grants.remove(&key);
         if destination > 0 {
@@ -578,30 +677,39 @@ impl Directory {
         tracing::info!(account, character, destination, "transfer grant consumed");
         Ok(character)
     }
+    #[cfg(test)]
     fn drop_portal(&mut self, origin: i32, pos: Pos) -> Result<i32> {
+        self.drop_dungeon_portal(origin, 0x717, pos)
+    }
+    fn drop_dungeon_portal(&mut self, origin: i32, kind: u16, pos: Pos) -> Result<i32> {
+        let definition = crate::dungeon::DUNGEONS
+            .iter()
+            .find(|(portal, _, _, _)| *portal == kind)
+            .context("unregistered earned dungeon portal")?;
         ensure!(
-            origin == -3 && self.worlds[&origin].walkable(pos),
-            "dungeon portal must be earned on the walkable Realm shore"
+            self.worlds[&origin].name == "Realm" && self.worlds[&origin].walkable(pos),
+            "dungeon portal must be earned on the walkable Realm"
         );
-        let destination = self.instance("pirate-cave", None)?;
+        let destination = self.instance(definition.1, None)?;
         let id = self
             .worlds
             .get_mut(&origin)
             .unwrap()
-            .spawn_entity(0x717, pos, vec![])?;
+            .spawn_entity(kind, pos, vec![])?;
         self.portals.insert(
             id,
             Portal {
                 origin,
                 destination,
-                expires: self.tick + 600,
+                expires: self.tick + if kind == 0x70c { 300 } else { 600 },
             },
         );
         tracing::info!(
             portal = id,
+            kind,
             origin,
             destination,
-            "earned Pirate Cave portal dropped"
+            "earned dungeon portal dropped"
         );
         Ok(id)
     }
@@ -610,7 +718,7 @@ impl Directory {
         self.grants.retain(|_, grant| grant.expires > self.tick);
         for (id, world) in &mut self.worlds {
             world.step();
-            if *id > 0 {
+            if *id > 0 && *id != self.endgame.active {
                 if world.players.is_empty() {
                     self.idle.entry(*id).or_insert(self.tick);
                 } else {
@@ -618,6 +726,7 @@ impl Directory {
                 }
             }
         }
+        self.endgame_step();
         let requests: Vec<_> = self
             .worlds
             .iter_mut()
@@ -627,15 +736,22 @@ impl Directory {
                     .map(|pos| (*id, pos))
             })
             .collect();
-        for (origin, pos) in requests {
-            if let Err(error) = self.drop_portal(origin, pos) {
+        for (origin, (kind, pos)) in requests {
+            if let Err(error) = self.drop_dungeon_portal(origin, kind, pos) {
                 tracing::error!(origin,%error,"earned dungeon portal creation failed");
             }
         }
         let expired_portals: Vec<_> = self
             .portals
             .iter()
-            .filter(|(_, binding)| binding.expires <= self.tick)
+            .filter(|(id, binding)| {
+                binding.expires <= self.tick
+                    && self
+                        .worlds
+                        .get(&binding.origin)
+                        .and_then(|w| w.entities.get(id))
+                        .is_none_or(|e| !e.reserved)
+            })
             .map(|(id, binding)| (*id, binding.origin))
             .collect();
         for (id, origin) in expired_portals {
@@ -794,6 +910,7 @@ impl World {
                         hp: o.hp,
                         size: 100,
                         condition: 0,
+                        statuses: BTreeMap::new(),
                         items: o.equipment.clone(),
                         drop_slots: BTreeSet::new(),
                         extra_stats: if o.class == "Portal" {
@@ -805,6 +922,11 @@ impl World {
                         published: true,
                         damage: BTreeMap::new(),
                         next_shot: 0,
+                        activated: None,
+                        stage: None,
+                        parent: None,
+                        expires: None,
+                        next_aux: 0,
                         bullet: 0,
                     };
                     for setting in c.config.split(';').filter(|s| !s.is_empty()) {
@@ -845,6 +967,8 @@ impl World {
             entities,
             players: BTreeMap::new(),
             bullets: Vec::new(),
+            grenades: Vec::new(),
+            finale: endgame_ai::Actors::default(),
             cells,
             rng: rand::rngs::StdRng::from_entropy(),
             now: 0,
@@ -858,6 +982,8 @@ impl World {
             encounter: false,
             population: vec![],
             portal_requests: vec![],
+            critical_deaths: vec![],
+            admission_open: true,
             bag_expiry: BTreeMap::new(),
             cleared: false,
             clear_exit: None,
@@ -934,6 +1060,7 @@ impl World {
                 hp: definition.hp,
                 size: 100,
                 condition: 0,
+                statuses: BTreeMap::new(),
                 items,
                 drop_slots: BTreeSet::new(),
                 extra_stats,
@@ -941,6 +1068,11 @@ impl World {
                 published: true,
                 damage: BTreeMap::new(),
                 next_shot: 0,
+                activated: None,
+                stage: None,
+                parent: None,
+                expires: None,
+                next_aux: 0,
                 bullet: 0,
             },
         );
@@ -972,6 +1104,7 @@ impl World {
         o.0
     }
     pub fn enter(&mut self, ch: Character, tx: Option<Output>) -> Result<i32> {
+        ensure!(self.admission_open, "Realm is closed");
         ensure!(ch.alive && ch.hp > 0, "dead character");
         ch.effective(&self.content)?;
         ensure!(
@@ -1000,7 +1133,6 @@ impl World {
                 departing: false,
                 account_lists: AccountLists::default(),
                 paused: false,
-                conditions: BTreeMap::new(),
                 controller: if tx.is_none() {
                     Controller::Qa
                 } else {
@@ -1008,6 +1140,9 @@ impl World {
                 },
                 tx,
                 known: BTreeSet::new(),
+                quest: None,
+                statuses: BTreeMap::new(),
+                native_motion_condition: 0,
                 known_since: BTreeMap::new(),
                 tiles: BTreeSet::new(),
                 death_started: false,
@@ -1017,7 +1152,7 @@ impl World {
                 mp_fraction: 0.,
                 pending: false,
                 experience_queued: 0,
-                caves_queued: 0,
+                clears_queued: [0; 4],
                 progress_started: false,
                 death_pending: false,
                 persistence_failure: None,
@@ -1030,9 +1165,11 @@ impl World {
                 last_attack_at: 0,
                 attack_credit: 1000.,
                 attack_count: 0,
-                attack_suppressed: false,
+                attack_suppressed: None,
                 last_move: 0,
                 last_move_at: self.now,
+                goto_acks: VecDeque::new(),
+                discarded_attack: None,
                 tick: 0,
                 last_ability: 0,
             },
@@ -1101,7 +1238,7 @@ impl World {
                 (28, values[5]),
                 (
                     29,
-                    p.condition(self.now) | if p.paused { 1 << 20 } else { 0 },
+                    p.conditions(self.now) | if p.paused { 1 << 20 } else { 0 },
                 ),
                 (30, 0),
             ] {
@@ -1138,7 +1275,7 @@ impl World {
             stat(&mut o, 0, self.content.get(e.kind)?.hp);
             stat(&mut o, 1, e.hp);
             stat(&mut o, 2, e.size);
-            stat(&mut o, 29, e.condition);
+            stat(&mut o, 29, e.conditions(self.now));
             if !e.name.is_empty() {
                 text_stat(&mut o, 31, &e.name);
             }
@@ -1151,9 +1288,81 @@ impl World {
         }
         Ok(o.0)
     }
+    pub(crate) fn apply_condition(&mut self, id: i32, index: u8, duration_ms: u64) -> Result<()> {
+        ensure!(
+            (1..=28).contains(&index) && duration_ms > 0,
+            "invalid condition application"
+        );
+        let deadline = self
+            .now
+            .checked_add(duration_ms)
+            .context("condition deadline overflow")?;
+        let timers = if let Some(p) = self.players.get_mut(&id) {
+            if index == crate::condition::QUIET {
+                p.character.mp = 0;
+                p.mp_fraction = 0.;
+            }
+            &mut p.statuses
+        } else {
+            let e = self
+                .entities
+                .get_mut(&id)
+                .context("condition target missing")?;
+            if index == crate::condition::STUNNED
+                && e.conditions(self.now) & crate::condition::bit(12) != 0
+            {
+                tracing::debug!(entity = id, index, "condition blocked by Stun Immunity");
+                return Ok(());
+            }
+            &mut e.statuses
+        };
+        timers
+            .entry(index)
+            .and_modify(|old| *old = (self.now, old.1.max(deadline)))
+            .or_insert((self.now, deadline));
+        tracing::debug!(
+            entity = id,
+            condition = index,
+            deadline,
+            "timed condition applied"
+        );
+        Ok(())
+    }
     fn defense(&self, id: i32) -> Result<i32> {
         let p = &self.players[&id];
         Ok(p.character.effective(&self.content)?[3])
+    }
+    fn quest_target(&self, id: i32) -> Option<i32> {
+        if self.safe {
+            return None;
+        }
+        let player = &self.players[&id];
+        self.entities
+            .values()
+            .filter_map(|e| {
+                let definition = &self.content.objects[&e.kind];
+                if !definition.quest || e.hp <= 0 || !e.accessible(player.character.account) {
+                    return None;
+                }
+                let (min, max) = match e.kind {
+                    0x617 => (3, 8),
+                    0x609 | 0x60d => (4, 9),
+                    0x61f => (5, 10),
+                    _ => (definition.quest_level?, 20),
+                };
+                (min <= player.character.level && player.character.level <= max).then_some((e, min))
+            })
+            .min_by(|(a, a_level), (b, b_level)| {
+                b_level
+                    .cmp(a_level)
+                    .then_with(|| {
+                        a.pos
+                            .distance(player.pos)
+                            .total_cmp(&b.pos.distance(player.pos))
+                    })
+                    .then_with(|| a.id.cmp(&b.id))
+            })
+            .map(|(e, _)| e.id)
     }
     fn visible(&self, id: i32) -> BTreeSet<i32> {
         let pos = self.players[&id].pos;
@@ -1163,6 +1372,7 @@ impl World {
                 e.pos.distance(pos) < 20. && e.accessible(self.players[&id].character.account)
             })
             .map(|e| e.id)
+            .chain(self.quest_target(id))
             .chain(
                 self.players
                     .iter()
@@ -1224,9 +1434,22 @@ impl World {
             p.known_since.entry(*entity).or_insert(self.now);
         }
         p.known = visible;
+        let quest = self.quest_target(id);
+        let p = self.players.get_mut(&id).unwrap();
+        if initial || p.quest != quest {
+            p.quest = quest;
+            let mut out = Writer::new();
+            out.i32(quest.unwrap_or(-1));
+            send(p, 34, out.0);
+            tracing::debug!(player = id, quest, "native quest target updated");
+        }
         Ok(())
     }
+    #[cfg(test)]
     fn validate_move(&self, id: i32, pos: Pos, time: i32) -> Result<f32> {
+        self.validate_move_at(id, pos, time, self.now)
+    }
+    fn validate_move_at(&self, id: i32, pos: Pos, time: i32, received: u64) -> Result<f32> {
         ensure!(
             pos.x.is_finite() && pos.y.is_finite(),
             "non-finite movement"
@@ -1255,13 +1478,20 @@ impl World {
             .cell(p.pos.x, p.pos.y)
             .context("player outside map")?;
         let speed = p.speed(&self.content, self.now)? * self.content.grounds[&cell.ground];
+        let push = self.content.pushes[&cell.ground];
         let distance = p.pos.distance(pos);
+        let input_distance = |delta| {
+            p.pos.distance(Pos {
+                x: pos.x - push.0 * delta,
+                y: pos.y - push.1 * delta,
+            })
+        };
         ensure!(
-            p.condition(self.now) & PARALYZED == 0 || distance <= 0.001,
+            p.conditions(self.now) & PARALYZED == 0 || distance <= 0.001,
             "paralyzed movement"
         );
         ensure!(
-            distance <= speed * elapsed + 0.3,
+            input_distance(elapsed) <= speed * elapsed + 0.3,
             "movement exceeds speed: from=({}, {}) to=({}, {}) distance={distance} allowed={} speed={speed} client_elapsed_ms={elapsed}",
             p.pos.x,
             p.pos.y,
@@ -1269,13 +1499,30 @@ impl World {
             pos.y,
             speed * elapsed + 0.3
         );
-        let server_elapsed = self
-            .now
+        let server_elapsed = received
             .checked_sub(p.last_move_at)
             .context("movement server clock regressed")?;
         let credit = (p.movement_credit + speed * server_elapsed as f32).min(speed * 350. + 0.3);
+        let charged = input_distance((server_elapsed as f32).min(350.));
+        tracing::debug!(
+            player = id,
+            client_time = time,
+            received,
+            ground = cell.ground,
+            speed,
+            client_elapsed_ms = elapsed,
+            server_elapsed_ms = server_elapsed,
+            previous_credit = p.movement_credit,
+            credit,
+            charged,
+            from_x = p.pos.x,
+            from_y = p.pos.y,
+            to_x = pos.x,
+            to_y = pos.y,
+            "native motion budget"
+        );
         ensure!(
-            distance <= credit + 0.001,
+            charged <= credit + 0.001,
             "movement exceeds server time budget: distance={distance} credit={credit} server_elapsed_ms={server_elapsed} client_elapsed_ms={elapsed} previous_credit={}",
             p.movement_credit
         );
@@ -1290,9 +1537,44 @@ impl World {
             }),
             "movement across a blocked tile"
         );
-        Ok(credit - distance)
+        Ok(credit - charged)
+    }
+    #[cfg(test)]
+    pub fn native_move_to(&mut self, id: i32, pos: Pos, time: i32) -> Result<()> {
+        // Skipped simulation ticks must not reduce real movement funding or desynchronize SHOOT prediction.
+        self.native_move_received(id, pos, (time, Instant::now()))
+            .map(|_| ())
+    }
+    pub fn native_move_received(
+        &mut self,
+        id: i32,
+        pos: Pos,
+        (time, received): (i32, Instant),
+    ) -> Result<NativeInput> {
+        let queued_ms = received.elapsed().as_millis();
+        let received = received
+            .checked_duration_since(self.attack_epoch)
+            .context("native MOVE predates world epoch")?
+            .as_millis() as u64;
+        tracing::debug!(
+            player = id,
+            client_time = time,
+            received,
+            queued_ms,
+            x = pos.x,
+            y = pos.y,
+            "native MOVE ingress"
+        );
+        if self.discard_correcting_move(id, pos, time)? {
+            return Ok(NativeInput::DiscardedUntilGotoAck);
+        }
+        self.move_timed(id, pos, time, received)?;
+        Ok(NativeInput::Applied)
     }
     pub fn move_to(&mut self, id: i32, pos: Pos, time: i32) -> Result<()> {
+        self.move_timed(id, pos, time, self.now)
+    }
+    fn move_timed(&mut self, id: i32, pos: Pos, time: i32, received: u64) -> Result<()> {
         let p = self.players.get(&id).context("player missing")?;
         ensure!(
             p.last_move == 0 || i64::from(time) - i64::from(p.last_move) <= 1000,
@@ -1300,19 +1582,19 @@ impl World {
         );
         // MOVE precedes condition updates; accept either form across a toggle.
         let sentinel = pos.x == -1. && pos.y == -1.;
-        let immobile = p.paused || p.condition(self.now) & PARALYZED != 0;
+        let immobile = p.paused || p.conditions(self.now) & PARALYZED != 0;
         let correct = immobile && !sentinel && p.pos.distance(pos) > 0.001;
         let stationary = immobile || sentinel;
         ensure!(pos.x.is_finite() && pos.y.is_finite(), "invalid position");
         let pos = if stationary { p.pos } else { pos };
-        let remaining_credit = self.validate_move(id, pos, time)?;
+        let remaining_credit = self.validate_move_at(id, pos, time, received)?;
         let p = self.players.get_mut(&id).unwrap();
         if !stationary {
             p.movement_credit = remaining_credit;
         }
         p.pos = pos;
         p.last_move = time;
-        p.last_move_at = self.now;
+        p.last_move_at = received;
         if correct {
             self.correct_position(id, time, "immobilized movement")?;
         }
@@ -1348,6 +1630,7 @@ impl World {
             })
         })
     }
+    #[cfg(test)]
     pub fn native_shoot(
         &mut self,
         id: i32,
@@ -1358,8 +1641,40 @@ impl World {
         angle: f32,
     ) -> Result<()> {
         // Skipped actor ticks must not charge real client attacks against a slower simulation clock.
-        let received = self.attack_epoch.elapsed().as_millis() as u64;
-        self.shoot_timed(id, (time, received, true), bullet, kind, start, angle)
+        self.native_shoot_received(id, (time, Instant::now()), bullet, kind, start, angle)
+            .map(|_| ())
+    }
+    pub fn native_shoot_received(
+        &mut self,
+        id: i32,
+        (time, received): (i32, Instant),
+        bullet: u8,
+        kind: u16,
+        start: Pos,
+        angle: f32,
+    ) -> Result<NativeInput> {
+        let queued_ms = received.elapsed().as_millis();
+        let received = received
+            .checked_duration_since(self.attack_epoch)
+            .context("native SHOOT predates world epoch")?
+            .as_millis() as u64;
+        tracing::debug!(
+            player = id,
+            client_time = time,
+            received,
+            queued_ms,
+            bullet,
+            x = start.x,
+            y = start.y,
+            angle,
+            "native SHOOT ingress"
+        );
+        if self.discard_correcting_shot(id, time, bullet, kind, start, angle)? {
+            return Ok(NativeInput::DiscardedUntilGotoAck);
+        }
+        let outcome = self.shoot_timed(id, (time, received, true), bullet, kind, start, angle)?;
+        self.players.get_mut(&id).unwrap().discarded_attack = None;
+        Ok(outcome)
     }
     // Fixture tests drive fixed ticks without sleeping, so script shots use simulation time.
     pub fn shoot(
@@ -1372,6 +1687,7 @@ impl World {
         angle: f32,
     ) -> Result<()> {
         self.shoot_timed(id, (time, self.now, false), bullet, kind, start, angle)
+            .map(|_| ())
     }
     fn shoot_timed(
         &mut self,
@@ -1381,7 +1697,7 @@ impl World {
         kind: u16,
         start: Pos,
         angle: f32,
-    ) -> Result<()> {
+    ) -> Result<NativeInput> {
         ensure!(angle.is_finite(), "invalid shot angle");
         ensure!(
             start.x.is_finite() && start.y.is_finite(),
@@ -1395,33 +1711,43 @@ impl World {
                 && p.persistence_failure.is_none(),
             "dead, departing or quarantined player cannot shoot"
         );
+
         ensure!(
             p.character.items[0] == kind as i32,
             "weapon does not match equipped item"
         );
-        // SHOOT can precede MOVE, and stationary clients need not send MOVE; prediction cannot advance movement credit.
-        let center = Pos {
-            x: start.x - 0.3 * angle.cos(),
-            y: start.y - 0.3 * angle.sin(),
+        let item = self.content.get(kind)?;
+        ensure!(item.shots > 0, "weapon projectile count is zero");
+        let shot_index = if time == p.last_attack {
+            p.attack_count
+        } else {
+            0
         };
-        let condition = p.condition(self.now);
+        // The client displaces every muzzle along central aim, not each projectile's spread angle.
+        let aim =
+            angle + item.arc.to_radians() * ((item.shots - 1) as f32 / 2. - shot_index as f32);
+        // Prediction cannot advance movement credit or authoritative position.
+        let center = Pos {
+            x: start.x - 0.3 * aim.cos(),
+            y: start.y - 0.3 * aim.sin(),
+        };
+        let condition = p.conditions(self.now);
         let origin = if !p.paused && p.pos.distance(center) > 0.001 {
-            self.validate_move(id, center, time)
+            self.validate_move_at(id, center, time, received)
         } else {
             Ok(0.)
         };
         // Drop stale predicted shots for one MOVE time-jump window around movement changes.
         let displaced = origin.is_err()
             && (condition & PARALYZED != 0
-                || p.conditions.iter().any(|(effect, (since, until))| {
-                    effect & (SLOWED | SPEEDY | PARALYZED) != 0
+                || p.statuses.iter().any(|(effect, (since, until))| {
+                    crate::condition::bit(*effect) & (SLOWED | SPEEDY | PARALYZED) != 0
                         && (self.now - since < 1000
                             || self.now >= *until && self.now - until < 1000)
                 }));
         if !displaced {
-            origin.with_context(|| format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at))?;
+            origin.with_context(|| RejectedNativeShot(format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at)))?;
         }
-        let item = self.content.get(kind)?;
         let spec = item
             .projectiles
             .get(&0)
@@ -1431,14 +1757,12 @@ impl World {
         let frequency =
             0.0015 + (0.008 - 0.0015) * p.character.effective(&self.content)?[5] as f64 / 75.;
         let normal_cooldown = (1. / frequency / f64::from(item.rate)).floor() as f32;
-        let cooldown = if condition & DAZED != 0 {
-            (1. / 0.0015 / f64::from(item.rate)).floor() as f32
-        } else {
-            normal_cooldown
-        };
+        let cooldown = reconciliation::attack_cooldown(p, &self.content, self.now, item.rate)?;
         let admission = if native { normal_cooldown } else { cooldown };
         let p = self.players.get_mut(&id).unwrap();
         ensure!(time >= 0, "negative shot time");
+        ensure!(shot_index < item.shots, "too many projectiles in attack");
+        ensure!(bullet == p.next_bullet, "unexpected player bullet counter");
         if time != p.last_attack {
             let attack_elapsed = i64::from(time) - i64::from(p.last_attack);
             ensure!(attack_elapsed >= admission as i64 - 2, "attack too fast");
@@ -1446,53 +1770,71 @@ impl World {
                 .checked_sub(p.last_attack_at)
                 .context("attack receive clock regressed")?;
             let credit = (p.attack_credit + elapsed as f32).min(cooldown * 2.);
+            let unfunded = credit < admission - 50.;
             ensure!(
-                credit >= admission - 50.,
-                "attack exceeds server time budget: credit={credit} cooldown={cooldown} received_time={received} simulation_time={} last_received_time={} shot_time={time} last_shot_time={}",
-                self.now,
-                p.last_attack_at,
-                p.last_attack
+                native || !unfunded,
+                RejectedNativeShot(format!(
+                    "attack exceeds server time budget: credit={credit} cooldown={cooldown} received_time={received} simulation_time={} last_received_time={} shot_time={time} last_shot_time={}",
+                    self.now, p.last_attack_at, p.last_attack
+                ))
             );
-            // Reconcile pre-Dazed packets without firing or desynchronizing the native counter/RNG.
-            p.attack_suppressed = attack_elapsed < cooldown as i64 - 2 || credit < cooldown - 50.;
+            p.attack_suppressed = if unfunded {
+                tracing::warn!(
+                    player = id,
+                    credit,
+                    admission,
+                    cooldown,
+                    received_time = received,
+                    simulation_time = self.now,
+                    last_received_time = p.last_attack_at,
+                    shot_time = time,
+                    last_shot_time = p.last_attack,
+                    "native volley denied: attack exceeds server time budget"
+                );
+                Some(AttackSuppression::ReceiveBudget)
+            } else if attack_elapsed < cooldown as i64 - 2 || credit < cooldown - 50. {
+                Some(AttackSuppression::EffectiveCooldown)
+            } else {
+                None
+            };
+            // Denial accrues actual elapsed once but cannot debit or authorize an unfunded attack.
             p.attack_credit = credit
-                - if p.attack_suppressed {
-                    normal_cooldown
-                } else {
-                    cooldown
+                - match p.attack_suppressed {
+                    Some(AttackSuppression::ReceiveBudget) => 0.,
+                    Some(AttackSuppression::EffectiveCooldown) => normal_cooldown,
+                    None => cooldown,
                 };
             p.last_attack_at = received;
             p.last_attack = time;
             p.attack_count = 0;
         }
-        ensure!(
-            p.attack_count < item.shots,
-            "too many projectiles in attack"
-        );
-        ensure!(bullet == p.next_bullet, "unexpected player bullet counter");
         p.next_bullet = (bullet + 1) % 128;
         p.attack_count += 1;
-        let draw = if spec.min == spec.max {
-            spec.min
-        } else {
-            p.seed = ((p.seed as u64 * 16807) % 2147483647) as u32;
-            spec.min + (p.seed % (spec.max - spec.min) as u32) as i32
-        };
+        let draw = p.roll_damage(&spec);
         // In-flight native SHOOT packets must still consume their counter/RNG draw.
-        if p.paused || condition & STUNNED != 0 || displaced || p.attack_suppressed {
+        if p.paused || condition & STUNNED != 0 || displaced || p.attack_suppressed.is_some() {
             tracing::debug!(
                 player = id,
                 condition,
                 displaced,
-                suppressed = p.attack_suppressed,
+                suppressed = ?p.attack_suppressed,
                 "condition suppressed shot"
             );
-            return Ok(());
+            return Ok(
+                if p.attack_suppressed == Some(AttackSuppression::ReceiveBudget) {
+                    NativeInput::DeniedAttackBudget
+                } else {
+                    NativeInput::Applied
+                },
+            );
         }
         p.character.shots += 1;
-        let damage = (draw as f32
-            * (0.5 + 1.5 * p.character.effective(&self.content)?[2] as f32 / 75.))
-            as i32;
+        let multiplier = if condition & crate::condition::bit(crate::condition::WEAK) != 0 {
+            0.5
+        } else {
+            0.5 + 1.5 * p.character.effective(&self.content)?[2] as f32 / 75.
+        };
+        let damage = (draw as f32 * multiplier) as i32;
         self.bullets.push(Bullet {
             owner: id,
             source_kind: p.character.class,
@@ -1514,7 +1856,7 @@ impl World {
             }
         }
         tracing::debug!(player = id, bullet, damage, "player shot");
-        Ok(())
+        Ok(NativeInput::Applied)
     }
     pub fn use_item(&mut self, id: i32, slot: Slot, pos: Pos) -> Result<Option<InventoryPlan>> {
         self.cancel_trade(id, "Trade cancelled by inventory mutation.");
@@ -1537,6 +1879,12 @@ impl World {
         let item = self.content.get(slot.kind as u16)?.clone();
         match item.activate.as_str() {
             "Heal" | "Magic" => {
+                ensure!(
+                    item.activate != "Magic"
+                        || p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET)
+                            == 0,
+                    "cannot restore mana while Quiet"
+                );
                 let mut items = p.character.items.clone();
                 items[slot.slot] = -1;
                 self.players.get_mut(&id).unwrap().pending = true;
@@ -1548,6 +1896,46 @@ impl World {
                 }
                 Ok(Some(plan))
             }
+            "IncrementStat" => {
+                ensure!(
+                    matches!(item.kind, 0xa1f | 0xa20 | 0xa21 | 0xa34 | 0xa35 | 0xa4c)
+                        && item.activations == 1,
+                    "unsupported permanent stat consumable"
+                );
+                let (stat, amount) = item
+                    .stat_increase
+                    .context("permanent potion activation missing")?;
+                let index = crate::content::STATS
+                    .iter()
+                    .position(|(id, _)| *id == stat)
+                    .context("unsupported permanent potion stat")?;
+                ensure!(
+                    amount > 0
+                        && p.character.base[index]
+                            < self.content.classes[&p.character.class].caps[index],
+                    "stat is already at its class cap"
+                );
+                let snapshot = p.character.clone();
+                let mut items = snapshot.items.clone();
+                items[slot.slot] = -1;
+                let mut plan = self.plan(id, items, None, 0);
+                plan.stat_growth = Some((snapshot, slot, index, amount));
+                self.players.get_mut(&id).unwrap().pending = true;
+                Ok(Some(plan))
+            }
+            "UnlockPortal" => self.begin_unlock(id, slot, &item).map(Some),
+            "HealNova" if item.kind == 0xa3f => {
+                ensure!(
+                    item.activations == 1 && item.heal == 100 && item.heal_range == 10.,
+                    "invalid selected Snake Oil activation"
+                );
+                let mut items = p.character.items.clone();
+                items[slot.slot] = -1;
+                let mut plan = self.plan(id, items, None, 0);
+                plan.healing_nova = Some((item.heal, item.heal_range));
+                self.players.get_mut(&id).unwrap().pending = true;
+                Ok(Some(plan))
+            }
             "HealNova" => {
                 self.heal_nova(id, slot, &item)?;
                 Ok(None)
@@ -1557,6 +1945,10 @@ impl World {
                     slot.slot == 1
                         && item.slot_type == self.content.get(p.character.class)?.slots[1],
                     "ability must be equipped by a compatible class"
+                );
+                ensure!(
+                    p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET) == 0,
+                    "cannot cast while Quiet"
                 );
                 ensure!(p.character.mp >= item.mana_cost, "not enough mana");
                 ensure!(
@@ -1578,7 +1970,8 @@ impl World {
                     let bullet = p.server_bullet;
                     p.server_bullet = 128 + (bullet.wrapping_add(1) % 128);
                     let angle = i as f32 * std::f32::consts::TAU / 20.;
-                    let damage = spec.min;
+                    // Server-created abilities must not consume the client's mirrored weapon stream.
+                    let damage = self.rng.gen_range(spec.min..=spec.max);
                     self.bullets.push(Bullet {
                         owner: id,
                         source_kind: p.character.class,
@@ -1631,9 +2024,12 @@ impl World {
             character: p.character.id,
             bag,
             healing,
+            healing_nova: None,
             mana: 0,
+            stat_growth: None,
             vault: None,
             dropped: None,
+            unlock: None,
             collected: None,
             loot_slot: None,
         }
@@ -1814,6 +2210,10 @@ impl World {
         Ok(())
     }
     pub fn finish_inventory(&mut self, plan: InventoryPlan, result: Result<i32>) -> Result<()> {
+        ensure!(
+            plan.unlock.is_none(),
+            "portal unlock requires its directory commit"
+        );
         if let Err(error) = result {
             self.poison(plan.player, error.to_string())?;
             return Err(error);
@@ -1841,13 +2241,38 @@ impl World {
             Ok(revision) => {
                 p.character.items = plan.items;
                 p.character.revision = revision;
+                if let Some((snapshot, _, index, amount)) = plan.stat_growth {
+                    ensure!(
+                        p.character.base == snapshot.base,
+                        "reserved potion base stats changed"
+                    );
+                    let cap = self.content.classes[&p.character.class].caps[index];
+                    ensure!(
+                        snapshot.base[index] + amount <= cap,
+                        "reserved potion exceeds current class cap"
+                    );
+                    p.character.base[index] = snapshot.base[index] + amount;
+                    tracing::info!(
+                        player = plan.player,
+                        stat = crate::content::STATS[index].0,
+                        base = p.character.base[index],
+                        revision,
+                        "permanent stat potion committed"
+                    );
+                }
                 let values = p.character.effective(&self.content)?;
                 p.character.hp = p.character.hp.min(values[0]);
                 p.character.mp = p.character.mp.min(values[1]);
-                if plan.healing > 0 && !p.death_pending {
+                if plan.healing > 0
+                    && !p.death_pending
+                    && p.conditions(self.now) & crate::condition::bit(crate::condition::SICK) == 0
+                {
                     p.character.hp = (p.character.hp + plan.healing).min(values[0]);
                 }
-                if plan.mana > 0 && !p.death_pending {
+                if plan.mana > 0
+                    && !p.death_pending
+                    && p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET) == 0
+                {
                     p.character.mp = (p.character.mp + plan.mana).min(values[1]);
                 }
                 if let Some((id, items)) = plan.bag {
@@ -1875,6 +2300,9 @@ impl World {
             }
         }
         send(p, 4, o.0);
+        if let Some((amount, range)) = plan.healing_nova {
+            self.consumable_heal_nova(plan.player, amount, range)?;
+        }
         Ok(())
     }
     pub fn action(&mut self, id: i32, a: Action) -> Result<Option<InventoryPlan>> {
@@ -1947,10 +2375,10 @@ impl World {
     pub fn correct_position(&mut self, id: i32, time: i32, reason: &str) -> Result<()> {
         let p = self.players.get_mut(&id).context("player missing")?;
         let previous_time = p.last_move;
-        p.last_move = time;
+        ensure!(!p.correcting()?, "position correction is already pending");
         let mut out = Writer::new();
         out.i32(id).f32(p.pos.x).f32(p.pos.y);
-        send(p, wire::GOTO, out.0);
+        reconciliation::goto(p, true, out.0);
         tracing::warn!(
             player = id,
             previous_time,
@@ -1963,18 +2391,26 @@ impl World {
     pub fn pending_progress(&mut self) -> Result<Vec<(i32, Character)>> {
         let mut plans = Vec::new();
         for (id, p) in &mut self.players {
-            if (p.experience_queued == 0 && p.caves_queued == 0) || p.pending || p.death_started {
+            if (p.experience_queued == 0 && p.clears_queued == [0; 4])
+                || p.pending
+                || p.death_started
+            {
                 continue;
             }
             let mut snapshot = p.character.clone();
             snapshot.gain_experience(&self.content, p.experience_queued, &mut self.rng)?;
             snapshot.pirate_caves = snapshot
                 .pirate_caves
-                .checked_add(p.caves_queued)
+                .checked_add(p.clears_queued[0])
                 .context("dungeon clear counter overflow")?;
+            for (count, queued) in snapshot.dungeons.iter_mut().zip(&p.clears_queued[1..]) {
+                *count = count
+                    .checked_add(*queued)
+                    .context("dungeon clear counter overflow")?;
+            }
             snapshot.alive = true;
             p.experience_queued = 0;
-            p.caves_queued = 0;
+            p.clears_queued = [0; 4];
             p.pending = true;
             p.progress_started = true;
             plans.push((*id, snapshot));
@@ -1993,13 +2429,15 @@ impl World {
                 && p.character.revision == snapshot.revision,
             "progress reservation changed"
         );
-        let cleared_cave = snapshot.pirate_caves > p.character.pirate_caves;
+        let cleared_dungeon = snapshot.pirate_caves > p.character.pirate_caves
+            || snapshot.dungeons != p.character.dungeons;
         let leveled = snapshot.level > p.character.level;
         p.character.exp = snapshot.exp;
         p.character.fame = snapshot.fame;
         p.character.level = snapshot.level;
         p.character.base = snapshot.base;
         p.character.pirate_caves = snapshot.pirate_caves;
+        p.character.dungeons = snapshot.dungeons;
         if leveled && !p.death_pending {
             let values = p.character.effective(&self.content)?;
             p.character.hp = values[0];
@@ -2015,12 +2453,16 @@ impl World {
             experience = p.character.exp,
             "progress committed"
         );
-        if cleared_cave && let Some(exit) = self.clear_exit.take() {
+        if cleared_dungeon && let Some(exit) = self.clear_exit.take() {
             self.entities
                 .get_mut(&exit)
                 .context("reserved clear exit missing")?
                 .published = true;
-            tracing::info!(entity = exit, "durable Cave clear published Nexus exit");
+            tracing::info!(
+                entity = exit,
+                dungeon = self.name,
+                "durable dungeon clear published exit"
+            );
         }
         Ok(())
     }
@@ -2040,7 +2482,7 @@ impl World {
                 p.death_pending
                     && !p.pending
                     && p.experience_queued == 0
-                    && p.caves_queued == 0
+                    && p.clears_queued == [0; 4]
                     && !p.death_started
             })
             .map(|(id, p)| {
@@ -2080,7 +2522,7 @@ impl World {
         p.tx = None;
         p.bot_goal = None;
         p.bot_aim = None;
-        if p.pending || p.death_pending || p.experience_queued > 0 || p.caves_queued > 0 {
+        if p.pending || p.death_pending || p.experience_queued > 0 || p.clears_queued != [0; 4] {
             return Ok(None);
         };
         p.pending = true;
@@ -2141,10 +2583,7 @@ impl World {
         )
     }
     fn loot_bag(&mut self, pos: Pos, owner: Option<i32>, mut items: Vec<i32>) -> Result<i32> {
-        ensure!(
-            !items.is_empty() && items.len() <= 8,
-            "loot bag requires one to eight items"
-        );
+        ensure!(!items.is_empty(), "loot bag requires at least one item");
         ensure!(
             self.bag_expiry.len() < 128,
             "transient loot bag limit reached"
@@ -2166,6 +2605,10 @@ impl World {
             4 => 0x509,
             _ => bail!("unsupported loot bag appearance"),
         };
+        ensure!(
+            items.len() <= 8,
+            "loot exceeds bag capacity; split rewards before packaging"
+        );
         items.resize(8, -1);
         let id = self.spawn_entity(kind, pos, items)?;
         let bag = self.entities.get_mut(&id).unwrap();
@@ -2177,24 +2620,48 @@ impl World {
         tracing::info!(entity = id, owner, kind, "loot bag allocated");
         Ok(id)
     }
+    fn loot_bags(&mut self, pos: Pos, owner: Option<i32>, items: &[i32]) -> Result<()> {
+        for chunk in items.chunks(8) {
+            let bag = self.loot_bag(pos, owner, chunk.to_vec())?;
+            self.entities.get_mut(&bag).unwrap().drop_slots = (0..chunk.len()).collect();
+        }
+        Ok(())
+    }
     fn drop_loot(&mut self, defeated: &Entity) -> Result<()> {
-        if defeated.kind == 0x927 && self.name == "Pirate Cave" {
+        if crate::endgame::HEROES.contains(&defeated.kind) {
+            self.critical_deaths.push(defeated.id);
+        }
+        if let Some(index) = crate::dungeon::DUNGEONS
+            .iter()
+            .position(|(_, _, name, boss)| *name == self.name && *boss == defeated.kind)
+        {
             ensure!(!self.cleared, "dungeon clear already recorded");
             self.cleared = true;
-            for p in self.players.values_mut().filter(|p| {
+            for (id, p) in self.players.iter_mut().filter(|(_, p)| {
                 p.character.alive
                     && !p.death_pending
                     && !p.departing
                     && p.pos.distance(defeated.pos) < 25.
+                    && (index == 0 || defeated.damage.get(&p.character.id).is_some_and(|n| *n > 0))
             }) {
-                p.caves_queued += 1;
+                p.clears_queued[index] = p.clears_queued[index]
+                    .checked_add(1)
+                    .context("queued dungeon clear overflow")?;
+                tracing::info!(
+                    player = id,
+                    boss = defeated.id,
+                    "dungeon participation clear queued"
+                );
             }
-            let exit = self.spawn_entity(0x71d, defeated.pos, vec![])?;
-            self.entities.get_mut(&exit).unwrap().published = false;
-            self.clear_exit = Some(exit);
+            if self.clear_exit.is_none() {
+                let exit = self.spawn_entity(0x71d, defeated.pos, vec![])?;
+                self.entities.get_mut(&exit).unwrap().published = false;
+                self.clear_exit = Some(exit);
+            }
             tracing::info!(
                 boss = defeated.id,
-                "Pirate Cave clear and Nexus exit staged for durable commit"
+                dungeon = self.name,
+                "dungeon clear and exit staged for durable commit"
             );
         }
         let private = crate::loot::private(defeated.kind);
@@ -2221,9 +2688,14 @@ impl World {
             return Ok(());
         }
         let mut drops = BTreeMap::<i32, Vec<i32>>::new();
-        let attempts = (eligible.len() * if private { 1 } else { 2 }).min(8);
+        // Private boss rewards belong to every eligible character, not only the first eight.
+        let attempts = if private {
+            eligible.len()
+        } else {
+            (eligible.len() * 2).min(8)
+        };
         for i in 0..attempts {
-            if let Some(item) = crate::loot::roll(&self.content, defeated.kind, &mut self.rng) {
+            for item in crate::loot::rewards(&self.content, defeated.kind, &mut self.rng) {
                 let owner = if private {
                     eligible[i % eligible.len()].0
                 } else {
@@ -2236,9 +2708,7 @@ impl World {
             }
         }
         for (owner, items) in drops {
-            let slots = (0..items.len()).collect();
-            let bag = self.loot_bag(defeated.pos, (owner >= 0).then_some(owner), items)?;
-            self.entities.get_mut(&bag).unwrap().drop_slots = slots;
+            self.loot_bags(defeated.pos, (owner >= 0).then_some(owner), &items)?;
         }
         Ok(())
     }
@@ -2336,7 +2806,7 @@ impl World {
         Ok(())
     }
     fn npc_step(&mut self) -> Vec<(i32, Vec<u8>)> {
-        use crate::encounter::{Motion, attacks, profile};
+        use crate::encounter::{Motion, phased_attacks, profile};
         let mut packets = Vec::new();
         if !self.encounter || self.safe {
             return packets;
@@ -2344,11 +2814,13 @@ impl World {
         let ids: Vec<_> = self
             .entities
             .values()
-            .filter(|e| self.content.objects[&e.kind].enemy)
+            .filter(|e| self.content.objects[&e.kind].enemy || matches!(e.kind, 0x173 | 0xd7d))
             .map(|e| e.id)
             .collect();
         for id in ids {
-            let entity = &self.entities[&id];
+            let Some(entity) = self.entities.get(&id) else {
+                continue;
+            };
             let kind = entity.kind;
             let pos = entity.pos;
             let profile = profile(kind).expect("validated encounter profile");
@@ -2358,16 +2830,85 @@ impl World {
                 .filter(|p| p.character.alive && !p.death_pending && !p.departing && !p.paused)
                 .min_by(|a, b| pos.distance(a.pos).total_cmp(&pos.distance(b.pos)))
                 .map(|p| p.pos);
-            let Some(target) = nearest.filter(|p| pos.distance(*p) < 20.) else {
+            let wake = match kind {
+                0xd06 => 11.,
+                0xd90 => 8.,
+                _ => 20.,
+            };
+            let Some(target) = nearest.filter(|p| {
+                pos.distance(*p)
+                    < if entity.activated.is_some() {
+                        20.
+                    } else {
+                        wake
+                    }
+            }) else {
                 continue;
             };
-            let mut speed = profile.speed;
-            let goal = match profile.motion {
+            let activated = *self
+                .entities
+                .get_mut(&id)
+                .unwrap()
+                .activated
+                .get_or_insert(self.now);
+            let elapsed = self.now - activated;
+            if let Err(error) = self.encounter_mechanics(id, target, elapsed) {
+                tracing::error!(entity=id, kind, %error, "encounter mechanic refused");
+                continue;
+            }
+            let flags = self.entities[&id].conditions(self.now);
+            let (motion, mut speed) = if crate::endgame::ROSTER.contains(&kind) {
+                match self.finale_movement(id, elapsed) {
+                    Ok(movement) => movement,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"endgame movement refused");
+                        continue;
+                    }
+                }
+            } else {
+                crate::encounter::movement(kind, self.entities[&id].hp, elapsed)
+            };
+            let goal = match motion {
+                Motion::Stationary => {
+                    speed = 0.;
+                    Some(pos)
+                }
+                Motion::Protect { anchor, distance } => {
+                    let leader = match self.orbit_anchor(id, anchor, target) {
+                        Ok(leader) => leader,
+                        Err(error) => {
+                            tracing::error!(entity=id, %error, "protection anchor refused");
+                            continue;
+                        }
+                    };
+                    if pos.distance(leader) <= distance {
+                        speed = 0.;
+                    }
+                    Some(leader)
+                }
                 Motion::Chase { sight, stop } if pos.distance(target) < sight => {
                     if pos.distance(target) <= stop {
                         speed = 0.;
                     }
                     Some(target)
+                }
+                Motion::Orbit { anchor, radius } => {
+                    let target = match self.orbit_anchor(id, anchor, target) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            tracing::error!(entity=id, %error, "orbit anchor refused");
+                            continue;
+                        }
+                    };
+                    let e = self.entities.get_mut(&id).unwrap();
+                    if e.goal.is_none() {
+                        e.phase = (pos.y - target.y).atan2(pos.x - target.x);
+                    }
+                    e.phase = (e.phase + speed / radius * 0.05) % std::f32::consts::TAU;
+                    Some(Pos {
+                        x: target.x + e.phase.cos() * radius,
+                        y: target.y + e.phase.sin() * radius,
+                    })
                 }
                 Motion::Circle => {
                     let boss = self
@@ -2389,13 +2930,24 @@ impl World {
                 }
                 _ => None,
             };
+            let goal = if kind == 0xd06 && pos.distance(self.entities[&id].home) > 7. {
+                speed = 7.8;
+                Some(
+                    self.orbit_anchor(id, crate::encounter::Anchor::Home, target)
+                        .expect("live boss home"),
+                )
+            } else {
+                goal
+            };
             let goal = if let Some(goal) = goal {
                 goal
             } else {
                 let e = self.entities.get_mut(&id).unwrap();
-                speed = match profile.motion {
-                    Motion::Wander => profile.speed,
+                speed = match motion {
+                    Motion::Wander => speed,
                     Motion::Chase { .. } if kind == 0x600 => 4.,
+                    Motion::Chase { .. } if !(0x687..=0x689).contains(&kind) => 4.,
+                    Motion::Protect { .. } => profile.speed,
                     _ => 2.,
                 };
                 if e.goal
@@ -2410,6 +2962,11 @@ impl World {
                 }
                 e.goal.expect("wander destination assigned")
             };
+            if flags & crate::condition::bit(crate::condition::PARALYZED) != 0 {
+                speed = 0.;
+            } else if flags & crate::condition::bit(crate::condition::SLOWED) != 0 {
+                speed *= 0.5;
+            }
             self.entities.get_mut(&id).unwrap().goal = Some(goal);
             if let Err(error) = self.move_entity(id, goal, speed / 1.5 * 0.05) {
                 self.entities.get_mut(&id).unwrap().goal = None;
@@ -2419,12 +2976,41 @@ impl World {
             if profile.interval == 0
                 || self.now < e.next_shot
                 || e.pos.distance(target) > profile.range
+                || flags & crate::condition::bit(crate::condition::STUNNED) != 0
             {
                 continue;
             }
             let heading = (target.y - e.pos.y).atan2(target.x - e.pos.x);
-            let shots = attacks(kind, e.hp, heading);
-            self.entities.get_mut(&id).unwrap().next_shot = self.now + profile.interval;
+            let shots = if crate::endgame::ROSTER.contains(&kind) {
+                match self.finale_shots(id, heading, elapsed) {
+                    Ok(shots) => shots,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"endgame projectiles refused");
+                        continue;
+                    }
+                }
+            } else {
+                phased_attacks(kind, e.hp, heading, elapsed)
+            };
+            let interval = match kind {
+                0x633 if elapsed % 10000 >= 5000 => 500,
+                0x917 if !(1875..3750).contains(&e.hp) => 1000,
+                0xd06 if elapsed % 43300 >= 32300 => 1300,
+                0xd06 if elapsed % 43300 >= 12300 => 500,
+                0xd90 if (elapsed / 13000) % 4 == 1 => 2000,
+                0xd90 if (elapsed / 13000) % 4 >= 2 => 1000,
+                _ => profile.interval,
+            };
+            self.entities.get_mut(&id).unwrap().next_shot = self.now + interval;
+            if self.bullets.len() + shots.len() > 2048 {
+                tracing::warn!(
+                    entity = id,
+                    active = self.bullets.len(),
+                    "NPC shot refused at global projectile limit"
+                );
+                continue;
+            }
+            let mut notices = Vec::with_capacity(shots.len());
             for (index, angle) in shots {
                 let spec = self.content.objects[&kind]
                     .projectiles
@@ -2442,19 +3028,21 @@ impl World {
                     pos: e.pos,
                     angle,
                     born: self.now,
-                    damage: spec.min,
+                    damage: if spec.min == spec.max {
+                        spec.min
+                    } else {
+                        self.rng.gen_range(spec.min..spec.max)
+                    },
                     spec,
                     hit: BTreeSet::new(),
                 };
-                let mut out = Writer::new();
-                out.u8(bullet.id)
-                    .i32(id)
-                    .u8(index)
-                    .f32(bullet.start.x)
-                    .f32(bullet.start.y)
-                    .f32(angle)
-                    .i16(bullet.damage as i16);
-                packets.push((id, out.0));
+                notices.push(enemy_shots::EnemyShot {
+                    bullet: bullet.id,
+                    projectile: index,
+                    start: bullet.start,
+                    angle,
+                    damage: bullet.damage,
+                });
                 if kind == 0x927 {
                     tracing::info!(
                         boss = id,
@@ -2465,6 +3053,11 @@ impl World {
                 }
                 self.bullets.push(bullet);
             }
+            packets.extend(
+                enemy_shots::packets(id, &notices)
+                    .into_iter()
+                    .map(|body| (id, body)),
+            );
         }
         packets
     }
@@ -2472,6 +3065,7 @@ impl World {
         self.now += 50;
         self.tick += 1;
         self.trade_step();
+        self.expire_goto_acks();
         let ids: Vec<_> = self.players.keys().copied().collect();
         for id in &ids {
             let p = &self.players[id];
@@ -2488,7 +3082,15 @@ impl World {
                 .character
                 .effective(&self.content)
                 .expect("validated player equipment and base stats");
-            if p.character.hp < values[0] {
+            let flags = p.conditions(self.now);
+            p.statuses
+                .retain(|_, (_, deadline)| deadline.saturating_add(1000) > self.now);
+            if p.character.hp < values[0]
+                && flags
+                    & (crate::condition::bit(crate::condition::SICK)
+                        | crate::condition::bit(crate::condition::BLEEDING))
+                    == 0
+            {
                 p.hp_fraction += (1. + values[6] as f32 / 8.) * 0.05;
                 let n = p.hp_fraction as i32;
                 p.character.hp = (p.character.hp + n).min(values[0]);
@@ -2496,7 +3098,15 @@ impl World {
             } else {
                 p.hp_fraction = 0.;
             }
-            if p.character.mp < values[1] {
+            if flags & crate::condition::bit(crate::condition::BLEEDING) != 0 {
+                p.character.hp = (p.character.hp - 1).max(1);
+            }
+            if flags & crate::condition::bit(crate::condition::QUIET) != 0 {
+                p.character.mp = 0;
+            }
+            if p.character.mp < values[1]
+                && flags & crate::condition::bit(crate::condition::QUIET) == 0
+            {
                 p.mp_fraction += (0.6 + values[7] as f32 / 125.) * 0.05;
                 let n = p.mp_fraction as i32;
                 p.character.mp = (p.character.mp + n).min(values[1]);
@@ -2567,15 +3177,19 @@ impl World {
             .filter(|(id, deadline)| {
                 let bag = &self.entities[id];
                 !bag.reserved
-                    && (**deadline <= self.now || bag.items.iter().all(|item| *item == -1))
+                    && (**deadline <= self.now
+                        || (self.content.objects[&bag.kind].class == "Container"
+                            && bag.items.iter().all(|item| *item == -1)))
             })
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
             self.remove_entity(id);
-            tracing::debug!(entity = id, "empty or expired transient loot bag removed");
+            tracing::debug!(entity = id, "expired transient or empty container removed");
         }
+        self.mechanic_expiry();
         let shots = self.npc_step();
+        self.grenade_step();
         for id in &ids {
             if let Err(e) = self.updates(*id, false) {
                 tracing::error!(player=id,error=%e,"world update failed");
@@ -2638,7 +3252,7 @@ impl World {
         let mut bullets = std::mem::take(&mut self.bullets);
         for b in &mut bullets {
             for sample in 1..=5 {
-                if !b.hit.is_empty() {
+                if b.hit.contains(&-1) || (!b.spec.multi_hit && !b.hit.is_empty()) {
                     break;
                 }
                 let old = b.pos;
@@ -2683,9 +3297,20 @@ impl World {
                             b.hit.insert(*target);
                             break;
                         }
+                        let e = &self.entities[target];
+                        let damage = crate::condition::damage(
+                            b.damage,
+                            self.content.objects[&e.kind].defense,
+                            e.conditions(self.now),
+                            b.spec.armor_piercing,
+                        );
+                        if damage > 0 {
+                            for (index, duration) in &b.spec.effects {
+                                self.apply_condition(*target, *index, *duration)
+                                    .expect("validated projectile condition");
+                            }
+                        }
                         let e = self.entities.get_mut(target).unwrap();
-                        let damage = (b.damage - self.content.objects[&e.kind].defense)
-                            .max(b.damage * 3 / 20);
                         if let Some(p) = self.players.get(&b.owner) {
                             *e.damage.entry(p.character.id).or_default() += damage.min(e.hp).max(0);
                         }
@@ -2704,9 +3329,17 @@ impl World {
                             }
                         }
                         let mut o = Writer::new();
-                        o.i32(*target)
-                            .u8(0)
-                            .i16(damage as i16)
+                        o.i32(*target).u8(if damage > 0 {
+                            b.spec.effects.len() as u8
+                        } else {
+                            0
+                        });
+                        if damage > 0 {
+                            for (index, _) in &b.spec.effects {
+                                o.u8(*index);
+                            }
+                        }
+                        o.i16(damage as i16)
                             .u8(u8::from(kill))
                             .u8(b.id)
                             .i32(b.owner);
@@ -2748,15 +3381,19 @@ impl World {
                                 }
                             }
                             if self.name == "Realm"
-                                && matches!(e.kind, 0x60e..=0x610)
-                                && self.rng.gen_bool(0.01)
+                                && let Some((portal, chance)) = crate::dungeon::portal_drop(e.kind)
+                                && self.rng.gen_bool(chance)
                             {
-                                self.portal_requests.push(e.pos);
+                                self.portal_requests.push((portal, e.pos));
                                 tracing::info!(
                                     enemy = e.kind,
                                     entity = target,
-                                    "Cube defeat earned a dungeon portal"
+                                    portal,
+                                    "defeat earned a dungeon portal"
                                 );
+                            }
+                            if let Err(error) = self.encounter_death(&e) {
+                                tracing::error!(enemy=e.kind, %error, "defeat mechanic failed");
                             }
                             if self.encounter
                                 && let Err(error) = self.drop_loot(&e)
@@ -2776,15 +3413,20 @@ impl World {
                             && !b.hit.contains(id)
                             && inside_box(p.pos, b.pos)
                         {
-                            let damage = (b.damage
-                                - self.defense(*id).expect("valid player equipment"))
-                            .max(b.damage * 3 / 20);
+                            let damage = crate::condition::damage(
+                                b.damage,
+                                self.defense(*id).expect("valid player equipment"),
+                                p.conditions(self.now),
+                                b.spec.armor_piercing,
+                            );
+                            if damage > 0 {
+                                for (index, duration) in &b.spec.effects {
+                                    self.apply_condition(*id, *index, *duration)
+                                        .expect("validated projectile condition");
+                                }
+                            }
                             let p = self.players.get_mut(id).unwrap();
                             p.character.hp = (p.character.hp - damage).max(0);
-                            // Reference-server reapplication replaces duration; world time also advances while paused.
-                            for &(effect, duration) in &b.spec.conditions {
-                                p.conditions.insert(effect, (self.now, self.now + duration));
-                            }
                             if p.character.hp == 0 {
                                 p.death_pending = true;
                                 p.killer = self.content.objects[&b.source_kind].name.clone();
@@ -2792,12 +3434,17 @@ impl World {
                                 p.bot_aim = None;
                             }
                             let mut o = Writer::new();
-                            o.i32(*id)
-                                .u8(0)
-                                .i16(damage as i16)
-                                .u8(0)
-                                .u8(b.id)
-                                .i32(b.owner);
+                            o.i32(*id).u8(if damage > 0 {
+                                b.spec.effects.len() as u8
+                            } else {
+                                0
+                            });
+                            if damage > 0 {
+                                for (index, _) in &b.spec.effects {
+                                    o.u8(*index);
+                                }
+                            }
+                            o.i16(damage as i16).u8(0).u8(b.id).i32(b.owner);
                             send(p, 47, o.0);
                             b.hit.insert(*id);
                             tracing::debug!(
@@ -2806,12 +3453,19 @@ impl World {
                                 hp = p.character.hp,
                                 "player damaged"
                             );
+                            if !b.spec.multi_hit {
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
-        bullets.retain(|b| self.now - b.born < b.spec.lifetime as u64 && b.hit.is_empty());
+        bullets.retain(|b| {
+            self.now - b.born < b.spec.lifetime as u64
+                && !b.hit.contains(&-1)
+                && (b.spec.multi_hit || b.hit.is_empty())
+        });
         self.bullets = bullets;
         if self.tick.is_multiple_of(2) {
             for id in ids {
@@ -2838,7 +3492,46 @@ impl World {
                     o.0.extend(self.stats(entity).expect("visible entity must exist"));
                 }
                 send(p, wire::NEW_TICK, o.0);
-                self.players.get_mut(&id).unwrap().tick += 1;
+                let p = self.players.get_mut(&id).unwrap();
+                let slow = crate::condition::bit(crate::condition::SLOWED);
+                let paralyzed = crate::condition::bit(crate::condition::PARALYZED);
+                let motion_condition = p.conditions(self.now) & (slow | paralyzed | SPEEDY);
+                let base = 0.004
+                    + 0.0056
+                        * p.character
+                            .effective(&self.content)
+                            .expect("valid player equipment")[4] as f32
+                        / 75.;
+                let speed = |flags: i32| {
+                    if flags & paralyzed != 0 {
+                        0.
+                    } else if flags & slow != 0 {
+                        0.004
+                    } else {
+                        base * if flags & SPEEDY != 0 { 1.5 } else { 1. }
+                    }
+                };
+                let restricts_motion = speed(motion_condition) < speed(p.native_motion_condition);
+                if p.controller == Controller::Human
+                    && p.character.alive
+                    && !p.death_pending
+                    && !p.departing
+                    && p.persistence_failure.is_none()
+                    && restricts_motion
+                {
+                    // The client must consume its real stat29 before acknowledging the new motor baseline.
+                    let mut out = Writer::new();
+                    out.i32(id).f32(p.pos.x).f32(p.pos.y);
+                    reconciliation::goto(p, true, out.0);
+                    tracing::info!(
+                        player = id,
+                        previous = p.native_motion_condition,
+                        current = motion_condition,
+                        "native movement condition synchronized"
+                    );
+                }
+                p.native_motion_condition = motion_condition;
+                p.tick += 1;
             }
         }
     }
@@ -2886,6 +3579,7 @@ mod tests {
             quests: 0,
             tiles: 0,
             pirate_caves: 0,
+            dungeons: [0; 3],
         }
     }
     pub(super) fn receive(
@@ -3785,6 +4479,46 @@ mod tests {
         assert_eq!(own[0]["angle"], 0.);
     }
     #[test]
+    fn native_spread_uses_central_muzzle_without_funding_false_centres() {
+        let mut w = world();
+        let player = w.enter(ch(&w), None).unwrap();
+        let kind = 0xc03;
+        let item = w.content.get(kind).unwrap();
+        let shots = item.shots;
+        let gap = item.arc.to_radians();
+        assert_eq!(shots, 10);
+        let p = w.players.get_mut(&player).unwrap();
+        p.character.items[0] = i32::from(kind);
+        p.next_bullet = 0;
+        p.last_move = 1000;
+        p.last_move_at = w.now;
+        p.movement_credit = 0.;
+        let pos = p.pos;
+        let aim = 0.8f32;
+        let muzzle = Pos {
+            x: pos.x + 0.3 * aim.cos(),
+            y: pos.y + 0.3 * aim.sin(),
+        };
+        for index in 0..shots {
+            let angle = aim + gap * (index as f32 - (shots - 1) as f32 / 2.);
+            if index == 1 {
+                assert!(
+                    w.shoot(player, 1000, index as u8, kind, muzzle, angle + 0.5)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("invalid shot origin")
+                );
+                assert_eq!(w.players[&player].attack_count, 1);
+            }
+            w.shoot(player, 1000, index as u8, kind, muzzle, angle)
+                .unwrap();
+        }
+        assert_eq!(w.players[&player].attack_count, shots);
+        assert_eq!(w.players[&player].movement_credit, 0.);
+        assert_eq!(w.players[&player].pos.x, pos.x);
+        assert_eq!(w.players[&player].pos.y, pos.y);
+    }
+    #[test]
     fn native_shoot_before_move_uses_the_same_speed_time_and_wall_budget() {
         let mut w = world();
         let id = w.enter(ch(&w), None).unwrap();
@@ -4118,10 +4852,20 @@ mod tests {
     fn shore_population_is_bounded_sourced_and_cannot_respawn_on_players() {
         let mut d = Directory::load(Path::new("data"), world().content, 16).unwrap();
         let w = d.worlds.get_mut(&-3).unwrap();
-        assert_eq!(w.population.len(), 24);
+        assert_eq!(
+            w.population
+                .iter()
+                .filter(|s| matches!(s.kind, 0x600 | 0x60e | 0x60f | 0x610))
+                .count(),
+            24
+        );
         let (x, y) = w.map.spawns[0];
         let arrival = Pos { x, y };
-        for spawn in &w.population {
+        for spawn in w
+            .population
+            .iter()
+            .filter(|s| matches!(s.kind, 0x600 | 0x60e | 0x60f | 0x610))
+        {
             assert!((12.0..60.0).contains(&spawn.pos.distance(arrival)));
             let cell =
                 &w.map.cells[spawn.pos.y as usize * w.map.width as usize + spawn.pos.x as usize];
@@ -4154,7 +4898,13 @@ mod tests {
                 .values()
                 .filter(|e| w.content.objects[&e.kind].enemy)
                 .count(),
-            24
+            w.population.len() + w.hero_identities().len()
+        );
+        assert_eq!(w.hero_identities().len(), 6);
+        assert!(
+            w.population
+                .iter()
+                .all(|spawn| !crate::endgame::HEROES.contains(&spawn.kind))
         );
     }
     #[test]
@@ -4298,6 +5048,129 @@ mod tests {
         }
     }
     #[test]
+    fn native_movement_and_shot_origin_use_receive_time_without_funding_client_time() {
+        let mut w = world();
+        let player = w.enter(ch(&w), None).unwrap();
+        let pos = w
+            .map
+            .cells
+            .iter()
+            .enumerate()
+            .map(|(i, _)| Pos {
+                x: (i % w.map.width as usize) as f32 + 0.5,
+                y: (i / w.map.width as usize) as f32 + 0.5,
+            })
+            .find(|p| {
+                w.walkable(*p)
+                    && w.walkable(Pos {
+                        x: p.x + 2.,
+                        y: p.y,
+                    })
+            })
+            .unwrap();
+        let p = w.players.get_mut(&player).unwrap();
+        p.pos = pos;
+        p.last_move = 1000;
+        p.last_move_at = 1000;
+        p.movement_credit = 0.;
+        w.now = 1000;
+        w.attack_epoch = Instant::now() - std::time::Duration::from_millis(2000);
+        let next = Pos {
+            x: pos.x + 0.4,
+            y: pos.y,
+        };
+        assert!(w.move_to(player, next, 1100).is_err());
+        w.native_move_to(player, next, 1100).unwrap();
+        let received = w.players[&player].last_move_at;
+        assert!(received >= 2000);
+        w.players.get_mut(&player).unwrap().movement_credit = 0.;
+        let forged = Pos {
+            x: next.x + 0.4,
+            y: next.y,
+        };
+        assert!(
+            w.move_timed(player, forged, 1200, received)
+                .unwrap_err()
+                .to_string()
+                .contains("server time budget")
+        );
+        let error = w
+            .shoot_timed(
+                player,
+                (1200, received, true),
+                1,
+                0xa97,
+                Pos {
+                    x: forged.x + 0.3,
+                    y: forged.y,
+                },
+                0.,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("server time budget"));
+        assert_eq!(w.players[&player].movement_credit, 0.);
+        assert_eq!(w.players[&player].pos.x, next.x);
+        assert!(
+            w.move_timed(player, next, 1200, received - 1)
+                .unwrap_err()
+                .to_string()
+                .contains("server clock regressed")
+        );
+    }
+
+    #[test]
+    fn queued_native_receipt_does_not_borrow_later_actor_processing_time() {
+        let mut w = world();
+        let player = w.enter(ch(&w), None).unwrap();
+        let pos = w.players[&player].pos;
+        w.attack_epoch = Instant::now() - std::time::Duration::from_millis(2000);
+        let received = w.attack_epoch + std::time::Duration::from_millis(1100);
+        let p = w.players.get_mut(&player).unwrap();
+        p.last_move = 1000;
+        p.last_move_at = 1000;
+        p.movement_credit = 0.;
+        let forged = Pos {
+            x: pos.x + 0.7,
+            y: pos.y,
+        };
+        assert!(
+            w.native_move_received(player, forged, (1100, received))
+                .unwrap_err()
+                .to_string()
+                .contains("server time budget")
+        );
+        assert!(
+            format!(
+                "{:#}",
+                w.native_shoot_received(
+                    player,
+                    (1100, received),
+                    1,
+                    0xa97,
+                    Pos {
+                        x: forged.x + 0.3,
+                        y: forged.y
+                    },
+                    0.
+                )
+                .unwrap_err()
+            )
+            .contains("server time budget")
+        );
+        assert_eq!(w.players[&player].movement_credit, 0.);
+        assert_eq!(w.players[&player].pos.x, pos.x);
+        w.native_move_received(
+            player,
+            Pos {
+                x: pos.x + 0.4,
+                y: pos.y,
+            },
+            (1100, received),
+        )
+        .unwrap();
+        assert_eq!(w.players[&player].last_move_at, 1100);
+    }
+    #[test]
     fn native_attack_credit_uses_receive_time_not_skipped_simulation_ticks() {
         let mut w = world();
         let mut character = ch(&w);
@@ -4313,26 +5186,37 @@ mod tests {
         p.last_attack_at = 1000;
         p.attack_credit = 0.;
         w.now = 1200;
-        assert!(
+        assert_eq!(
             w.shoot_timed(player, (1298, 1200, true), 1, 0xa97, start, 0.)
-                .is_err()
+                .unwrap(),
+            NativeInput::DeniedAttackBudget
         );
+        assert_eq!(
+            w.shoot_timed(player, (1298, 1298, true), 2, 0xa97, start, 0.)
+                .unwrap(),
+            NativeInput::DeniedAttackBudget
+        );
+        assert_eq!(w.players[&player].attack_credit, 200.);
+        assert_eq!(w.players[&player].last_attack_at, 1200);
         w.attack_epoch = Instant::now() - std::time::Duration::from_millis(1298);
-        w.native_shoot(player, 1298, 1, 0xa97, start, 0.).unwrap();
-        w.native_shoot(player, 1298, 2, 0xa97, start, 0.).unwrap();
+        for bullet in [3, 4] {
+            w.native_shoot(player, 1596, bullet, 0xa97, start, 0.)
+                .unwrap();
+        }
         assert_eq!(w.players[&player].character.shots, 2);
         w.now = 9000;
         let p = w.players.get_mut(&player).unwrap();
         p.last_attack_at = 1298;
         p.attack_credit = 0.;
-        assert!(
-            w.shoot_timed(player, (1596, 1400, true), 3, 0xa97, start, 0.)
-                .unwrap_err()
-                .to_string()
-                .contains("attack exceeds server time budget")
+        assert_eq!(
+            w.shoot_timed(player, (1894, 1400, true), 5, 0xa97, start, 0.)
+                .unwrap(),
+            NativeInput::DeniedAttackBudget
         );
+        assert_eq!(w.players[&player].attack_credit, 102.);
+        assert_eq!(w.players[&player].last_attack_at, 1400);
         assert!(
-            w.shoot_timed(player, (1596, 1200, true), 3, 0xa97, start, 0.)
+            w.shoot_timed(player, (2192, 1200, true), 6, 0xa97, start, 0.)
                 .unwrap_err()
                 .to_string()
                 .contains("attack receive clock regressed")

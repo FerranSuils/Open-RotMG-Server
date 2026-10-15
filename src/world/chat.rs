@@ -17,7 +17,7 @@ pub(crate) fn chat_info(text: &str) -> Packet {
     text_packet("", -1, 0, text)
 }
 
-fn text_packet(name: &str, object: i32, bubble: u8, text: &str) -> Packet {
+pub(super) fn text_packet(name: &str, object: i32, bubble: u8, text: &str) -> Packet {
     text_to(name, object, bubble, "", text)
 }
 

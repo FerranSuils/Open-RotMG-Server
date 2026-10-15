@@ -12,7 +12,7 @@ async fn enter(
     profile: Profile,
     character: Character,
     world: i32,
-) -> Result<(i32, mpsc::Receiver<Packet>, Brain)> {
+) -> Result<(i32, mpsc::Receiver<Packet>, mpsc::Sender<Packet>, Brain)> {
     let world = if world == -3 {
         app.world.directory(|d| d.initial(-3)).await?
     } else {
@@ -22,6 +22,7 @@ async fn enter(
         "autonomous saved character loaded");
     // Concurrent novas and hit receipts must fit between bounded perception updates.
     let (packets, output) = mpsc::channel(OUTPUT_CAPACITY);
+    let sender = packets.clone();
     let (lost, _) = watch::channel(false);
     let id = app
         .world
@@ -43,7 +44,7 @@ async fn enter(
         revision = view.character.inventory_revision,
         "autonomous character entered"
     );
-    Ok((id, output, Brain::new(profile, &view)))
+    Ok((id, output, sender, Brain::new(profile, &view)))
 }
 
 async fn continue_character(
@@ -142,7 +143,8 @@ pub async fn start(app: &App) -> Result<()> {
             .await?;
         let account = character.account;
         let owner = app.claim(account)?;
-        let (mut id, mut output, mut brain) = enter(app, profile, character, -3).await?;
+        let (mut id, mut output, mut sender, mut brain) =
+            enter(app, profile, character, -3).await?;
         let app = app.clone();
         tokio::spawn(async move {
             let mut shutdown = app.shutdown.subscribe();
@@ -151,6 +153,17 @@ pub async fn start(app: &App) -> Result<()> {
                     tokio::select! {
                         _=tokio::time::sleep(Duration::from_millis(50))=>{},
                         _=shutdown.changed()=>break,
+                    }
+                    if let Some(transfer) = server::automatic_transfer(&app, id).await? {
+                        ensure!(transfer.player == id && transfer.output.packets.same_channel(&sender), "collective transfer does not belong to autonomous output");
+                        while output.try_recv().is_ok() {}
+                        let destination = transfer.destination;
+                        let character_id = app.world.directory(move |d| d.consume(account, destination, transfer.key_time, transfer.key)).await?;
+                        ensure!(character_id == brain.session.2, "collective transfer character binding changed");
+                        let character = app.store.load(account, character_id).await?;
+                        (id, output, sender, brain) = enter(&app, profile, character, destination).await?;
+                        tracing::info!(player=id,account,character=character_id,destination,"autonomous collective transfer completed");
+                        continue;
                     }
                     let view = app.world.directory(move |d| d.player_view(id)).await?;
                     ensure!(view.session.account == account, "autonomous account binding changed");
@@ -167,12 +180,16 @@ pub async fn start(app: &App) -> Result<()> {
                         let character = app.store.shore_character(profile.name.into(), &app.content, profile.healer).await?;
                         ensure!(character.account == account && character.id != view.session.character,
                             "replacement did not preserve account and replace the dead character");
-                        (id, output, brain) = enter(&app, profile, character, -3).await?;
+                        (id, output, sender, brain) = enter(&app, profile, character, -3).await?;
                         continue;
                     }
                     ensure!(matches!(view.lifecycle.output, OutputState::Live)
                         && !view.lifecycle.departing && !view.lifecycle.quarantined, "controller is not live");
                     while let Ok(packet) = output.try_recv() {
+                        if packet.id == crate::wire::GOTO {
+                            app.world.for_player(id).call(move |w| w.acknowledge_autonomous_goto(id)).await?;
+                            continue;
+                        }
                         if brain.receive(packet, &view)? {
                             if let Err(error) = app.world.directory(move |d| d.chat(id, "omw".into(), Instant::now())).await {
                                 tracing::warn!(player=id,%error,"invitation acknowledgement rejected");
@@ -247,7 +264,7 @@ pub async fn start(app: &App) -> Result<()> {
                                 if current_character != character_id {
                                     tracing::info!(account,character=character_id,replacement=current_character,"autonomous transfer interrupted by permanent death");
                                 }
-                                (id, output, brain) = enter(&app, profile, character, destination).await?;
+                                (id, output, sender, brain) = enter(&app, profile, character, destination).await?;
                                 tracing::info!(player=id,account,character=current_character,destination,?portal,"autonomous durable transfer completed");
                             }
                         }

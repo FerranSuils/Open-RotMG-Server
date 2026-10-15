@@ -20,7 +20,7 @@ pub const TELEPORT: u8 = 49;
 pub const GOTO: u8 = 52;
 pub const SHOW_EFFECT: u8 = 56;
 pub const NOTIFICATION: u8 = 63;
-const MAX_FRAME: usize = 1_048_576;
+pub(crate) const MAX_FRAME: usize = 1_048_576;
 const CLIENT_OUT: &[u8] = &[
     0x31, 0x1f, 0x80, 0x69, 0x14, 0x51, 0xc7, 0x1b, 0x09, 0xa1, 0x3a, 0x2a, 0x6e,
 ];
@@ -162,7 +162,7 @@ impl Codec {
         }
     }
     #[cfg(test)]
-    fn client() -> Self {
+    pub(crate) fn client() -> Self {
         Self {
             incoming: Rc4::new(CLIENT_IN),
             outgoing: Rc4::new(CLIENT_OUT),

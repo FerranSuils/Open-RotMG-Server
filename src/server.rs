@@ -1,3 +1,4 @@
+mod input;
 use crate::{
     content::{Content, WIZARD},
     crypto::Keys,
@@ -17,6 +18,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
+use input::Incoming;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -423,27 +425,32 @@ fn slot(r: &mut Reader<'_>) -> Result<Slot> {
     })
 }
 pub(crate) async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
-    let result = a
-        .store
-        .exchange_collected(
-            vec![InventoryWrite {
-                id: plan.character,
-                account: plan.account,
-                revision: plan.revision,
-                items: plan.items.clone(),
-            }],
-            plan.vault.clone(),
-            plan.collected,
-        )
-        .await
-        .and_then(|mut revisions| {
-            revisions
-                .pop()
-                .context("inventory commit returned no revision")
-        });
+    let plan = a.world.directory(move |d| d.stage_unlock(plan)).await?;
+    let result = if let Some((snapshot, slot, index, amount)) = &plan.stat_growth {
+        a.store
+            .consume_stat(snapshot.clone(), slot.slot, *index, *amount)
+            .await
+    } else {
+        a.store
+            .exchange_collected(
+                vec![InventoryWrite {
+                    id: plan.character,
+                    account: plan.account,
+                    revision: plan.revision,
+                    items: plan.items.clone(),
+                }],
+                plan.vault.clone(),
+                plan.collected,
+            )
+            .await
+            .and_then(|mut revisions| {
+                revisions
+                    .pop()
+                    .context("inventory commit returned no revision")
+            })
+    };
     a.world
-        .for_player(plan.player)
-        .call(move |w| w.finish_inventory(plan, result))
+        .directory(move |d| d.finish_inventory(plan, result))
         .await
 }
 async fn persist_trade(a: &App, plan: TradePlan) -> Result<()> {
@@ -502,6 +509,7 @@ async fn handle(
     session: &mut Session,
     tx: &mpsc::Sender<Packet>,
     lost: &tokio::sync::watch::Sender<bool>,
+    received: std::time::Instant,
 ) -> Result<()> {
     let Session {
         account,
@@ -648,10 +656,12 @@ async fn handle(
             r.done()?;
             let id = player.context("MOVE before character")?;
             a.world
-                .call(move |w| match w.move_to(id, pos, time) {
-                    Ok(()) => Ok(()),
-                    Err(e) => w.correct_position(id, time, &e.to_string()),
-                })
+                .call(
+                    move |w| match w.native_move_received(id, pos, (time, received)) {
+                        Ok(_) => Ok(()),
+                        Err(e) => w.correct_position(id, time, &e.to_string()),
+                    },
+                )
                 .await?;
         }
         wire::PLAYER_SHOOT => {
@@ -666,13 +676,24 @@ async fn handle(
             r.done()?;
             let id = player.context("shoot before character")?;
             a.world
-                .call(move |w| w.native_shoot(id, time, bullet, kind, pos, angle))
+                .call(move |w| {
+                    match w.native_shoot_received(id, (time, received), bullet, kind, pos, angle) {
+                        Ok(_) => Ok(()),
+                        Err(error)
+                            if error
+                                .downcast_ref::<crate::world::RejectedNativeShot>()
+                                .is_some() =>
+                        {
+                            w.correct_native_shot(id, time, bullet, kind, &format!("{error:#}"))
+                        }
+                        Err(error) => Err(error),
+                    }
+                })
                 .await?;
         }
         wire::PLAYER_TEXT => {
             let text = player_text(&mut r)?;
             let id = player.context("chat before character")?;
-            let received = std::time::Instant::now();
             if matches!(
                 text.trim(),
                 "/discord" | "/discord recovery" | "/discord norecovery"
@@ -794,7 +815,6 @@ async fn handle(
             let target = r.i32()?;
             r.done()?;
             let id = player.context("teleport before character")?;
-            let received = std::time::Instant::now();
             if let Err(error) = a
                 .world
                 .directory(move |d| d.teleport(id, target, received))
@@ -824,6 +844,13 @@ async fn handle(
         24 => {
             r.u8()?;
             r.i32()?;
+            r.done()?;
+        }
+        59 => {
+            player.context("area acknowledgement before character")?;
+            r.i32()?;
+            r.f32()?;
+            r.f32()?;
             r.done()?;
         }
         66 | 51 => collision_report(packet.id == 66, &mut r)?,
@@ -900,8 +927,10 @@ async fn handle(
             persist(a, plan).await?;
         }
         14 => {
-            r.i32()?;
+            let time = r.i32()?;
             r.done()?;
+            let id = player.context("GOTO ACK before character")?;
+            a.world.call(move |w| w.acknowledge_goto(id, time)).await?;
         }
         48 => {
             r.done()?;
@@ -976,9 +1005,11 @@ async fn handle(
     Ok(())
 }
 async fn connection(socket: WebSocket, mut a: App) {
-    let (mut wsout, mut wsin) = socket.split();
+    let (mut wsout, wsin) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Packet>(64);
     let (lost, mut lost_rx) = tokio::sync::watch::channel(false);
+    // Actor work and output backpressure must not manufacture late, clustered input receipts.
+    let (mut incoming, _input_task) = input::receive(wsin, lost.clone());
     let mut shutdown = a.shutdown.subscribe();
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
     tokio::pin!(deadline);
@@ -987,20 +1018,14 @@ async fn connection(socket: WebSocket, mut a: App) {
     let mut reconnect_sent = false;
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut serial = 0;
-    let mut packet_window = std::time::Instant::now();
-    let mut packet_count = 0usize;
+    let mut transfers = tokio::time::interval(std::time::Duration::from_millis(250));
     'connection: loop {
         tokio::select! {
-            incoming=wsin.next()=>match incoming {
-                Some(Ok(Message::Binary(bytes)))=>{
-                    let packets=match codec.feed(&bytes) {Ok(p)=>p,Err(e)=>{tracing::error!(error=%e,"invalid packet stream");break;}};
-                    if packet_window.elapsed().as_secs()>=1 {packet_window=std::time::Instant::now();packet_count=0;}
-                    packet_count=packet_count.saturating_add(packets.len());
-                    if packet_count>512 {tracing::warn!(player=session.player,"input packet rate exceeded");break;}
-                    for packet in packets {
-                        if session.reconnecting { break; }
+            event=incoming.recv()=>match event {
+                Some(Incoming::Command(packet, received, _bytes))=>{
+                    if !session.reconnecting {
                         let id=packet.id;
-                        if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost).await {
+                        if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost,received).await {
                             tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,error=%format_args!("{e:#}"),"game command rejected");
                             if matches!(id,1|21|37|57) && let Some(player) = session.player {
                                 let reason = e.to_string();
@@ -1019,10 +1044,35 @@ async fn connection(socket: WebSocket, mut a: App) {
                         }
                     }
                 },
-                Some(Ok(Message::Ping(bytes)))=>{if wsout.send(Message::Pong(bytes)).await.is_err(){break}},
-                Some(Ok(Message::Close(_)))|None=>break,
-                Some(Ok(_))=>{tracing::warn!("non-binary game message rejected");break},
-                Some(Err(e))=>{tracing::warn!(error=%e,"WebSocket failed");break},
+                Some(Incoming::Ping(bytes))=>{if wsout.send(Message::Pong(bytes)).await.is_err(){break}},
+                None=>break,
+            },
+            _=transfers.tick(),if session.player.is_some() && !session.reconnecting=>{
+                let player = session.player.expect("guarded loaded player");
+                match automatic_transfer(&a, player).await {
+                    Ok(Some(transfer)) => {
+                        if transfer.player!=player || !transfer.output.packets.same_channel(&tx) {
+                            tracing::error!(player,"automatic transfer recipient differs from owned session");
+                            break;
+                        }
+                        session.player = None;
+                        session.reconnecting = true;
+                        session.account.take();
+                        let packet = transfer.packet();
+                        // Retired-world frames must not follow RECONNECT into a replacement scene.
+                        while rx.try_recv().is_ok() {}
+                        if wsout.send(Message::Binary(codec.frame(packet.id,packet.body).into())).await.is_err(){break;}
+                        reconnect_sent=true;
+                        deadline.as_mut().reset(tokio::time::Instant::now()+std::time::Duration::from_secs(10));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(player,%error,"automatic durable transfer failed");
+                        let f=fail(&error.to_string());
+                        let _=wsout.send(Message::Binary(codec.frame(f.id,f.body).into())).await;
+                        break;
+                    }
+                }
             },
             _=async {
                 match session.account.as_ref().and_then(|o| o.cancel.clone()) {
@@ -1060,6 +1110,16 @@ async fn connection(socket: WebSocket, mut a: App) {
         owner.release();
     }
 }
+pub(crate) async fn automatic_transfer(
+    a: &App,
+    id: i32,
+) -> Result<Option<crate::world::ForcedTransfer>> {
+    let transfer = a.world.directory(move |d| d.forced_transfer(id)).await?;
+    if transfer.is_some() {
+        depart(a, id).await?;
+    }
+    Ok(transfer)
+}
 pub(crate) async fn depart(a: &App, id: i32) -> Result<()> {
     loop {
         if let Some(ch) = a
@@ -1068,8 +1128,15 @@ pub(crate) async fn depart(a: &App, id: i32) -> Result<()> {
             .call(move |w| w.begin_departure(id))
             .await?
         {
-            if ch.alive {
-                a.store.progress(ch).await?;
+            if ch.alive
+                && let Err(error) = a.store.progress(ch).await
+            {
+                let reason = format!("departure persistence failed: {error:#}");
+                a.world
+                    .for_player(id)
+                    .call(move |w| w.poison(id, reason))
+                    .await?;
+                return Err(error);
             }
             return a
                 .world

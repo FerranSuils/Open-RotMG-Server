@@ -140,7 +140,13 @@ mod tests {
         for id in [0, 1] {
             for age in [0_u64, 125, 550, 1200] {
                 let spec = crate::content::Projectile {
-                    conditions: vec![],
+                    effects: vec![],
+                    multi_hit: false,
+                    armor_piercing: false,
+                    wavy: false,
+                    parametric: false,
+                    boomerang: false,
+                    magnitude: 3.,
                     speed: 60.,
                     lifetime: 1800.,
                     min: 1,

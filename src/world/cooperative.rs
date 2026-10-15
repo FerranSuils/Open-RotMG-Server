@@ -58,10 +58,19 @@ impl Directory {
             "Teleport rate registry is full."
         );
         let world = self.resolve(Target::Player(id))?;
+        let movement_received = received
+            .checked_duration_since(world.attack_epoch)
+            .context("teleport predates world epoch")?
+            .as_millis() as u64;
         let p = world.players.get_mut(&id).unwrap();
         p.pos = position;
         p.movement_credit = 0.78;
-        p.last_move_at = world.now;
+        // Server-driven motors budget against simulation time, not native packet arrival time.
+        p.last_move_at = if p.controller == Controller::Human {
+            movement_received
+        } else {
+            world.now
+        };
         let receipt = TeleportReceipt {
             player: id,
             character: p.character.id,
@@ -73,12 +82,12 @@ impl Directory {
         world.updates(id, false)?;
         let mut out = Writer::new();
         out.i32(id).f32(position.x).f32(position.y);
-        for p in world
+        for (receiver, p) in world
             .players
-            .values()
-            .filter(|p| ready(p) && p.known.contains(&id))
+            .iter_mut()
+            .filter(|(_, p)| ready(p) && p.known.contains(&id))
         {
-            send(p, wire::GOTO, out.0.clone());
+            reconciliation::goto(p, *receiver == id, out.0.clone());
             send(p, wire::SHOW_EFFECT, effect(2, id, position));
         }
         tracing::info!(player=id, account, target, x=position.x, y=position.y, world=%world.name, "player teleported");
@@ -89,7 +98,10 @@ impl Directory {
 
 impl World {
     pub(super) fn allow_teleport(&self) -> bool {
-        matches!(self.name.as_str(), "Nexus" | "Realm" | "Pirate Cave")
+        matches!(
+            self.name.as_str(),
+            "Nexus" | "Realm" | "Pirate Cave" | "Snake Pit" | "Sprite World" | "Undead Lair"
+        )
     }
 
     fn teleport_destination(&self, id: i32, target: i32) -> Result<Pos> {
@@ -101,6 +113,10 @@ impl World {
         ensure!(
             ready(p),
             "Busy, dead, departing or quarantined players cannot teleport."
+        );
+        ensure!(
+            !p.correcting()?,
+            "Position correction awaits GOTO acknowledgement."
         );
         ensure!(!p.paused, "Cannot teleport while paused.");
         ensure!(id != target, "You are already at yourself.");
@@ -122,6 +138,43 @@ impl World {
             "Teleport target's position is blocked."
         );
         Ok(q.pos)
+    }
+
+    pub(super) fn consumable_heal_nova(
+        &mut self,
+        owner: i32,
+        amount: i32,
+        range: f32,
+    ) -> Result<()> {
+        let p = self
+            .players
+            .get(&owner)
+            .context("committed healer disappeared")?;
+        if !ready(p) {
+            return Ok(());
+        }
+        let position = p.pos;
+        for q in self.players.values_mut().filter(|q| {
+            ready(q)
+                && q.pos.distance(position) < range
+                && q.conditions(self.now) & crate::condition::bit(crate::condition::SICK) == 0
+        }) {
+            let cap = q.character.effective(&self.content)?[0];
+            q.character.hp = (q.character.hp + amount).min(cap);
+        }
+        for q in self
+            .players
+            .values()
+            .filter(|q| ready(q) && q.known.contains(&owner))
+        {
+            send(
+                q,
+                wire::SHOW_EFFECT,
+                effect(5, owner, Pos { x: range, y: 0. }),
+            );
+        }
+        tracing::info!(owner, amount, range, "committed Snake Oil healing applied");
+        Ok(())
     }
 
     pub(super) fn heal_nova(&mut self, id: i32, slot: Slot, item: &Object) -> Result<()> {
@@ -152,6 +205,10 @@ impl World {
                 && item.cooldown_ms > 0,
             "Invalid healing tome definition."
         );
+        ensure!(
+            p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET) == 0,
+            "Cannot heal while Quiet."
+        );
         ensure!(p.character.mp >= item.mana_cost, "Not enough mana to heal.");
         ensure!(
             self.now >= p.last_ability + item.cooldown_ms,
@@ -161,7 +218,11 @@ impl World {
         let healing = self
             .players
             .iter()
-            .filter(|(_, q)| ready(q) && q.pos.distance(position) < item.heal_range)
+            .filter(|(_, q)| {
+                ready(q)
+                    && q.pos.distance(position) < item.heal_range
+                    && q.conditions(self.now) & crate::condition::bit(crate::condition::SICK) == 0
+            })
             .map(|(id, q)| {
                 Ok((
                     *id,
