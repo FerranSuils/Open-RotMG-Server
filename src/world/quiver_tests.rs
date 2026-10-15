@@ -99,7 +99,7 @@ fn quiver_failures_do_not_spend_mana_or_create_projectiles() {
                 w.apply_condition(id, crate::condition::QUIET, 1000)
                     .unwrap();
             }
-            2 => w.players.get_mut(&id).unwrap().last_ability = w.now,
+            2 => w.players.get_mut(&id).unwrap().last_ability = Some(w.now),
             3 => w.players.get_mut(&id).unwrap().character.class = crate::content::WIZARD,
             4 => target.x = f32::NAN,
             5 => target.x += 20.,
@@ -241,7 +241,7 @@ fn rejected_predicted_quivers_preserve_counter_and_rng_alignment_for_the_next_bo
                 w.apply_condition(id, crate::condition::QUIET, 1000)
                     .unwrap();
             }
-            2 => w.players.get_mut(&id).unwrap().last_ability = w.now,
+            2 => w.players.get_mut(&id).unwrap().last_ability = Some(w.now),
             _ => unreachable!(),
         }
         let mp = w.players[&id].character.mp;
@@ -304,7 +304,7 @@ fn quiver_in_flight_during_position_correction_consumes_prediction_without_damag
     .unwrap();
     assert!(w.bullets.is_empty());
     assert_eq!(w.players[&id].next_bullet, 1);
-    assert!(w.players[&id].quiver_shot.is_none());
+    assert!(w.players[&id].ability_shot.is_none());
 }
 
 #[test]

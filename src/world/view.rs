@@ -194,12 +194,11 @@ impl Directory {
                 items: p.character.items.clone(),
                 inventory_revision: p.character.revision,
                 pirate_caves: p.character.pirate_caves,
-                ability_ready_ms: if p.character.items[1] >= 0 {
-                    p.last_ability
-                        .checked_add(w.content.get(p.character.items[1] as u16)?.cooldown_ms)
-                        .context("own ability cooldown overflow")?
-                } else {
-                    0
+                ability_ready_ms: match (p.last_ability, p.character.items[1]) {
+                    (Some(last), item) if item >= 0 => last
+                        .checked_add(w.content.get(item as u16)?.cooldown_ms)
+                        .context("own ability cooldown overflow")?,
+                    _ => 0,
                 },
             },
             lifecycle: Lifecycle {
