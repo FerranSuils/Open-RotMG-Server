@@ -4,7 +4,7 @@ use crate::{
     store::Character,
     world::Output,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 async fn enter(
@@ -12,8 +12,9 @@ async fn enter(
     profile: Profile,
     character: Character,
     world: i32,
-) -> Result<(i32, mpsc::Receiver<Packet>, Brain)> {
-    let world = if world == -3 {
+    position: Option<Pos>,
+) -> Result<(i32, mpsc::Receiver<Packet>, mpsc::Sender<Packet>, Brain)> {
+    let world = if world == -3 && position.is_none() {
         app.world.directory(|d| d.initial(-3)).await?
     } else {
         world
@@ -22,11 +23,22 @@ async fn enter(
         "autonomous saved character loaded");
     // Concurrent novas and hit receipts must fit between bounded perception updates.
     let (packets, output) = mpsc::channel(OUTPUT_CAPACITY);
+    let sender = packets.clone();
     let (lost, _) = watch::channel(false);
     let id = app
         .world
         .in_world(world)
-        .call(move |w| w.enter_autonomous(character, Output { packets, lost }))
+        .call(move |w| match position {
+            None => w.enter_autonomous(character, Output { packets, lost }),
+            Some(position) => {
+                let id = w.enter_at(character, Some(Output { packets, lost }), Some(position))?;
+                w.players
+                    .get_mut(&id)
+                    .context("new selected bot missing")?
+                    .controller = crate::world::Controller::Autonomous;
+                Ok(id)
+            }
+        })
         .await?;
     let view = app.world.directory(move |d| d.player_view(id)).await?;
     tracing::info!(
@@ -43,7 +55,7 @@ async fn enter(
         revision = view.character.inventory_revision,
         "autonomous character entered"
     );
-    Ok((id, output, Brain::new(profile, &view)))
+    Ok((id, output, sender, Brain::new(profile, &view)))
 }
 
 async fn continue_character(
@@ -69,6 +81,44 @@ async fn continue_character(
     Ok((character, destination))
 }
 
+async fn continue_selected(
+    store: &crate::store::Store,
+    account: i32,
+    character: i32,
+) -> Result<Character> {
+    store
+        .load(account, character)
+        .await
+        .context("selected autonomous character is missing or dead; no replacement was selected")
+}
+#[cfg(test)]
+#[tokio::test]
+async fn selected_character_death_never_creates_a_replacement() {
+    let content = Content::load(std::path::Path::new("data")).unwrap();
+    let store = crate::store::Store::open(std::path::Path::new(":memory:"), &content).unwrap();
+    let account = store.list("selected-lifetime-test".into()).await.unwrap();
+    let mut character = store
+        .create(account.id, content.get(crate::content::WIZARD).unwrap())
+        .await
+        .unwrap();
+    let selected = character.id;
+    character.hp = 0;
+    character.alive = false;
+    store.death(character, "unit-test".into()).await.unwrap();
+    assert!(
+        continue_selected(&store, account.id, selected)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .list("selected-lifetime-test".into())
+            .await
+            .unwrap()
+            .characters
+            .is_empty()
+    );
+}
 #[cfg(test)]
 #[tokio::test]
 async fn death_committed_during_departure_rebuilds_in_realm_without_resurrection() {
@@ -140,26 +190,71 @@ pub async fn start(app: &App) -> Result<()> {
             .store
             .shore_character(profile.name.into(), &app.content, profile.healer)
             .await?;
-        let account = character.account;
-        let owner = app.claim(account)?;
-        let (mut id, mut output, mut brain) = enter(app, profile, character, -3).await?;
-        let app = app.clone();
-        tokio::spawn(async move {
-            let mut shutdown = app.shutdown.subscribe();
-            let result: Result<()> = async {
+        launch(app, profile, character, -3, None, None).await?;
+    }
+    Ok(())
+}
+pub(super) async fn start_selected(
+    app: &App,
+    profile: Profile,
+    character: Character,
+    world: i32,
+    position: Pos,
+) -> Result<()> {
+    let selected = character.id;
+    launch(
+        app,
+        profile,
+        character,
+        world,
+        Some(position),
+        Some(selected),
+    )
+    .await
+}
+async fn launch(
+    app: &App,
+    profile: Profile,
+    character: Character,
+    world: i32,
+    position: Option<Pos>,
+    selected: Option<i32>,
+) -> Result<()> {
+    let account = character.account;
+    let owner = app.claim(account)?;
+    let (mut id, mut output, mut sender, mut brain) =
+        enter(app, profile, character, world, position).await?;
+    let app = app.clone();
+    tokio::spawn(async move {
+        let mut shutdown = app.shutdown.subscribe();
+        let result: Result<()> = async {
                 loop {
                     tokio::select! {
                         _=tokio::time::sleep(Duration::from_millis(50))=>{},
                         _=shutdown.changed()=>break,
                     }
+                    if app.world.clock.paused() { continue; }
+                    if let Some(transfer) = server::automatic_transfer(&app, id).await? {
+                        ensure!(transfer.player == id && transfer.output.packets.same_channel(&sender), "collective transfer does not belong to autonomous output");
+                        while output.try_recv().is_ok() {}
+                        let destination = transfer.destination;
+                        let character_id = app.world.directory(move |d| d.consume(account, destination, transfer.key_time, transfer.key)).await?;
+                        ensure!(character_id == brain.session.2, "collective transfer character binding changed");
+                        let character = app.store.load(account, character_id).await?;
+                        (id, output, sender, brain) = enter(&app, profile, character, destination, None).await?;
+                        tracing::info!(player=id,account,character=character_id,destination,"autonomous collective transfer completed");
+                        continue;
+                    }
                     let view = app.world.directory(move |d| d.player_view(id)).await?;
                     ensure!(view.session.account == account, "autonomous account binding changed");
+                    if let Some(selected) = selected { ensure!(view.session.character == selected, "selected autonomous character changed"); }
                     if view.lifecycle.death_pending {
                         while output.try_recv().is_ok() {}
                         continue;
                     }
                     if !view.lifecycle.alive {
                         server::depart(&app, id).await?;
+                        if selected.is_some() { return Ok(()); }
                         tokio::select! {
                             _=tokio::time::sleep(Duration::from_secs(3))=>{},
                             _=shutdown.changed()=>return Ok(()),
@@ -167,14 +262,19 @@ pub async fn start(app: &App) -> Result<()> {
                         let character = app.store.shore_character(profile.name.into(), &app.content, profile.healer).await?;
                         ensure!(character.account == account && character.id != view.session.character,
                             "replacement did not preserve account and replace the dead character");
-                        (id, output, brain) = enter(&app, profile, character, -3).await?;
+                        (id, output, sender, brain) = enter(&app, profile, character, -3, None).await?;
                         continue;
                     }
                     ensure!(matches!(view.lifecycle.output, OutputState::Live)
                         && !view.lifecycle.departing && !view.lifecycle.quarantined, "controller is not live");
                     while let Ok(packet) = output.try_recv() {
+                        if packet.id == crate::wire::GOTO {
+                            app.world.for_player(id).call(move |w| w.acknowledge_autonomous_goto(id)).await?;
+                            continue;
+                        }
                         if brain.receive(packet, &view)? {
-                            if let Err(error) = app.world.directory(move |d| d.chat(id, "omw".into(), Instant::now())).await {
+                            let received = app.world.clock.now();
+                            if let Err(error) = app.world.directory(move |d| d.chat(id, "omw".into(), received)).await {
                                 tracing::warn!(player=id,%error,"invitation acknowledgement rejected");
                             }
                             tracing::info!(player=id, companion=brain.companion, "visible invitation accepted");
@@ -183,7 +283,8 @@ pub async fn start(app: &App) -> Result<()> {
                     if view.lifecycle.busy || view.tick < brain.next_decision { continue; }
                     let decision = brain.decide(&view, &app.content)?;
                     if let Some(text) = decision.chat {
-                        match app.world.directory(move |d| d.chat(id, text.into(), Instant::now())).await {
+                        let received = app.world.clock.now();
+                        match app.world.directory(move |d| d.chat(id, text.into(), received)).await {
                             Ok(()) => tracing::info!(player=id,text,"autonomous public call delivered"),
                             Err(error) => tracing::warn!(player=id,text,%error,"autonomous public call rejected"),
                         }
@@ -220,12 +321,14 @@ pub async fn start(app: &App) -> Result<()> {
                     if let Some(journey) = decision.journey {
                         match journey {
                             Journey::Regroup(target) => {
-                                if let Err(error) = app.world.directory(move |d| d.teleport(id, target, Instant::now())).await {
+                                let received = app.world.clock.now();
+                                if let Err(error) = app.world.directory(move |d| d.teleport(id, target, received)).await {
                                     tracing::warn!(player=id,target,%error,"autonomous regroup rejected");
                                 }
                             }
                             Journey::Portal(_) | Journey::Nexus => {
                                 let portal = match journey { Journey::Portal(portal) => Some(portal), Journey::Nexus => None, Journey::Regroup(_) => unreachable!() };
+                                let portal_kind = portal.and_then(|target| view.objects.iter().find(|o| o.id == target).map(|o| o.kind));
                                 let request = app.world.directory(move |d| {
                                     let (account, character, destination) = d.destination(id, portal)?;
                                     let (time, key, _) = d.issue(account, character, destination)?;
@@ -242,36 +345,38 @@ pub async fn start(app: &App) -> Result<()> {
                                 server::depart(&app, id).await?;
                                 let character_id = app.world.directory(move |d| d.consume(account, destination, time, key)).await?;
                                 ensure!(character_id == view.session.character, "transfer character binding changed");
-                                let (character, destination) = continue_character(&app.store, &app.content, profile, &view.session, destination).await?;
+                                let (character, destination) = match selected {
+                                    Some(selected) => (continue_selected(&app.store, account, selected).await?, destination),
+                                    None => continue_character(&app.store, &app.content, profile, &view.session, destination).await?,
+                                };
                                 let current_character = character.id;
                                 if current_character != character_id {
                                     tracing::info!(account,character=character_id,replacement=current_character,"autonomous transfer interrupted by permanent death");
                                 }
-                                (id, output, brain) = enter(&app, profile, character, destination).await?;
-                                tracing::info!(player=id,account,character=current_character,destination,?portal,"autonomous durable transfer completed");
+                                (id, output, sender, brain) = enter(&app, profile, character, destination, None).await?;
+                                tracing::info!(player=id,account,character=current_character,destination,?portal,portal_kind,"autonomous durable transfer completed");
                             }
                         }
                     }
                 }
                 server::depart(&app, id).await
             }.await;
-            if let Err(error) = result {
-                tracing::error!(player=id,name=profile.name,%error,"autonomous controller stopped; account retained for diagnosis");
-                let reason = error.to_string();
-                if let Err(error) = app
-                    .world
-                    .for_player(id)
-                    .call(move |w| w.poison(id, reason))
-                    .await
-                {
-                    tracing::error!(player=id,%error,"autonomous quarantine failed");
-                }
-                app.quarantined
-                    .lock()
-                    .expect("quarantine registry poisoned")
-                    .push(owner);
+        if let Err(error) = result {
+            tracing::error!(player=id,name=profile.name,%error,"autonomous controller stopped; account retained for diagnosis");
+            let reason = error.to_string();
+            if let Err(error) = app
+                .world
+                .for_player(id)
+                .call(move |w| w.poison(id, reason))
+                .await
+            {
+                tracing::error!(player=id,%error,"autonomous quarantine failed");
             }
-        });
-    }
+            app.quarantined
+                .lock()
+                .expect("quarantine registry poisoned")
+                .push(owner);
+        }
+    });
     Ok(())
 }

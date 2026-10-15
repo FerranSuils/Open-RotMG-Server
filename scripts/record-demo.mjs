@@ -65,7 +65,7 @@ export async function connect({port, target, url, helper}) {
   } catch (error) { raw.close(); throw error; }
 }
 
-function browser(command, value) {
+export function browser(command, value) {
   const find = root => [...root.querySelectorAll('*')].flatMap(e => [
     ...(e.tagName === 'CANVAS' ? [e] : []), ...(e.shadowRoot ? find(e.shadowRoot) : []),
   ]);
@@ -84,17 +84,22 @@ function browser(command, value) {
     if (command === 'gesture' && r) {
       if (r.active !== null) throw Error('Another input gesture is active');
       r.rect = b; r.active = r.gestures.length;
-      r.gestures.push({id:r.active, start:performance.now()-r.start, end:null});
+      r.gestures.push({id:r.active, start:r.now()-r.start, end:null});
     }
     return b;
   }
-  if (command === 'endGesture') { if (r) { r.gestures[r.active].end = performance.now()-r.start; r.active = null; } return; }
+  if (command === 'endGesture') { if (r) { r.gestures[r.active].end = r.now()-r.start; r.active = null; } return; }
   if (command === 'start') {
     if (r) throw Error('Recording already active; refusing another controller');
+    // Encoded video timestamps include pauses that the native playback clock excludes.
+    const native=globalThis[Symbol.for('openrotmg.testing.native-clock.v4')];
+    if(native&&value!=='native_wall')throw Error('Paused native clocks require explicit native_wall recording');
+    const now=value==='native_wall'?native?.wallNow:performance.now.bind(performance);
+    if(typeof now!=='function')throw Error('Native wall recording requires the current clock; reopen the same living character');
     const rect = geometry(), mime = 'video/webm;codecs=vp8';
     if (!MediaRecorder.isTypeSupported(mime)) throw Error('VP8 MediaRecorder is unavailable');
     const stream = canvas.captureStream(60), recorder = new MediaRecorder(stream, {mimeType:mime, videoBitsPerSecond:2000000});
-    r = window.__rotmgDemo = {recorder, stream, rect, size:rect.pixels, chunks:[], inputs:[], gestures:[], active:null, failure:null, rafCount:0};
+    r = window.__rotmgDemo = {recorder, stream, rect, now, size:rect.pixels, chunks:[], inputs:[], gestures:[], active:null, failure:null, rafCount:0};
     r.update = () => {
       try { r.rect = geometry(); if (canvas.width !== r.size[0] || canvas.height !== r.size[1]) r.failure = 'Canvas dimensions changed during recording'; }
       catch (error) { r.failure = error.message; }
@@ -104,7 +109,7 @@ function browser(command, value) {
     document.addEventListener('visibilitychange', r.update);
     r.input = e => {
       if (document.activeElement?.type === 'password') { r.failure = 'Password input during capture is forbidden'; return; }
-      const event = {type:e.type, time:performance.now()-r.start};
+      const event = {type:e.type, time:now()-r.start};
       if (e.type.startsWith('mouse')) {
         event.x = (e.clientX-r.rect.x)*r.size[0]/r.rect.width;
         event.y = (e.clientY-r.rect.y)*r.size[1]/r.rect.height;
@@ -120,10 +125,10 @@ function browser(command, value) {
     r.events = ['mousemove','mousedown','mouseup','keydown','keyup'];
     recorder.ondataavailable = e => { if (e.data.size) r.chunks.push(e.data); };
     recorder.onerror = e => { r.failure = e.error.message; };
-    r.start = performance.now(); r.mediaStartOffset = null;
+    r.start = now(); r.mediaStartOffset = null;
     const last = window.__rotmgDemoPointer;
     if (last) r.inputs.push({...last.event,time:last.time-r.start,gesture:null});
-    recorder.onstart = () => { r.mediaStartOffset = performance.now()-r.start; };
+    recorder.onstart = () => { r.mediaStartOffset = now()-r.start; };
     for (const name of r.events) window.addEventListener(name, r.input, {capture:true, passive:true});
     const frame = () => { r.rafCount++; r.raf = requestAnimationFrame(frame); }; frame();
     // Waiting for onstart can deadlock a canvas that first repaints in response to input.
@@ -133,7 +138,7 @@ function browser(command, value) {
   if (!r) throw Error('No recording is present');
   if (command === 'stop') return new Promise((resolve, reject) => {
     r.recorder.onstop = () => {
-      r.duration = (performance.now()-r.start)/1000;
+      r.duration = (r.now()-r.start)/1000;
       for (const name of r.events) window.removeEventListener(name, r.input, true);
       r.resize.disconnect(); window.removeEventListener('scroll', r.update, true); document.removeEventListener('visibilitychange', r.update); cancelAnimationFrame(r.raf);
       r.stream.getTracks().forEach(t => t.stop());

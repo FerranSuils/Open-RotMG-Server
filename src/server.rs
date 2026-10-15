@@ -1,3 +1,4 @@
+mod input;
 use crate::{
     content::{Content, WIZARD},
     crypto::Keys,
@@ -17,6 +18,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
+use input::Incoming;
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -132,11 +134,13 @@ impl App {
 use tokio::sync::mpsc;
 mod account_actions;
 mod hiscores;
+pub(crate) mod testing;
 use account_actions::{discord_kick, discord_recover, reset_password};
 use hiscores::{collection, discord_link, hiscores};
 #[derive(Clone)]
 pub struct App {
     pub started: std::time::Instant,
+    pub testing: Option<testing::Testing>,
     pub store: Store,
     pub world: Handle,
     pub keys: Arc<Keys>,
@@ -423,27 +427,32 @@ fn slot(r: &mut Reader<'_>) -> Result<Slot> {
     })
 }
 pub(crate) async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
-    let result = a
-        .store
-        .exchange_collected(
-            vec![InventoryWrite {
-                id: plan.character,
-                account: plan.account,
-                revision: plan.revision,
-                items: plan.items.clone(),
-            }],
-            plan.vault.clone(),
-            plan.collected,
-        )
-        .await
-        .and_then(|mut revisions| {
-            revisions
-                .pop()
-                .context("inventory commit returned no revision")
-        });
+    let plan = a.world.directory(move |d| d.stage_unlock(plan)).await?;
+    let result = if let Some((snapshot, slot, index, amount)) = &plan.stat_growth {
+        a.store
+            .consume_stat(snapshot.clone(), slot.slot, *index, *amount)
+            .await
+    } else {
+        a.store
+            .exchange_collected(
+                vec![InventoryWrite {
+                    id: plan.character,
+                    account: plan.account,
+                    revision: plan.revision,
+                    items: plan.items.clone(),
+                }],
+                plan.vault.clone(),
+                plan.collected,
+            )
+            .await
+            .and_then(|mut revisions| {
+                revisions
+                    .pop()
+                    .context("inventory commit returned no revision")
+            })
+    };
     a.world
-        .for_player(plan.player)
-        .call(move |w| w.finish_inventory(plan, result))
+        .directory(move |d| d.finish_inventory(plan, result))
         .await
 }
 async fn persist_trade(a: &App, plan: TradePlan) -> Result<()> {
@@ -502,6 +511,7 @@ async fn handle(
     session: &mut Session,
     tx: &mpsc::Sender<Packet>,
     lost: &tokio::sync::watch::Sender<bool>,
+    received: std::time::Instant,
 ) -> Result<()> {
     let Session {
         account,
@@ -509,6 +519,18 @@ async fn handle(
         expected,
         reconnecting,
     } = session;
+    if *reconnecting
+        && matches!(
+            packet.id,
+            7 | 14 | 16 | 22 | 24 | 38 | 42 | 51 | 59 | 66 | 76
+        )
+    {
+        tracing::debug!(
+            packet = packet.id,
+            "discarded in-flight input after durable departure"
+        );
+        return Ok(());
+    }
     ensure!(!*reconnecting, "session is transferring");
     if let Some(id) = *player
         && matches!(packet.id, 7 | 38 | 30 | 65 | 33 | 42 | 3)
@@ -557,11 +579,25 @@ async fn handle(
             *account = Some(owner);
             drop(authentication);
             a.store.compete(id).await?;
+            let prepared = a
+                .testing
+                .as_ref()
+                .map(|t| t.native_entry(id))
+                .transpose()?
+                .flatten();
             let (destination, character) = a
                 .world
                 .directory(move |d| {
                     if key.is_empty() {
-                        Ok((d.initial(game)?, None))
+                        if let Some((world, _)) = prepared {
+                            ensure!(
+                                d.worlds.contains_key(&world),
+                                "prepared native world no longer exists"
+                            );
+                            Ok((world, None))
+                        } else {
+                            Ok((d.initial(game)?, None))
+                        }
                     } else {
                         Ok((game, Some(d.consume(id, game, keytime, key)?)))
                     }
@@ -615,21 +651,45 @@ async fn handle(
                 None
             };
             let lists = a.store.account_lists(account).await?;
+            let prepared = a
+                .testing
+                .as_ref()
+                .map(|t| t.native_entry(account))
+                .transpose()?
+                .flatten();
             *player = Some(
                 a.world
                     .call(move |w| {
                         if let Some(vault) = vault {
                             w.load_vault(vault)?;
                         }
-                        let id = w.enter(ch, Some(output))?;
+                        let id = w.enter_at(ch, Some(output), prepared.map(|(_, pos)| pos))?;
                         w.sync_account_lists(id, Some(lists))?;
                         Ok(id)
                     })
                     .await?,
             );
+            if let Some(testing) = &a.testing {
+                testing.native_entered(account)?;
+            }
         }
         wire::UPDATE_ACK => {
             r.done()?;
+            if a.testing.is_some()
+                && let Some(id) = player
+            {
+                let id = *id;
+                a.world
+                    .for_player(id)
+                    .call(move |w| {
+                        w.players
+                            .get_mut(&id)
+                            .context("native UPDATE_ACK player missing")?
+                            .native_update_acked = true;
+                        Ok(())
+                    })
+                    .await?;
+            }
         }
         wire::MOVE => {
             let _tick = r.i32()?;
@@ -648,10 +708,12 @@ async fn handle(
             r.done()?;
             let id = player.context("MOVE before character")?;
             a.world
-                .call(move |w| match w.move_to(id, pos, time) {
-                    Ok(()) => Ok(()),
-                    Err(e) => w.correct_position(id, time, &e.to_string()),
-                })
+                .call(
+                    move |w| match w.native_move_received(id, pos, (time, received)) {
+                        Ok(_) => Ok(()),
+                        Err(e) => w.correct_position(id, time, &e.to_string()),
+                    },
+                )
                 .await?;
         }
         wire::PLAYER_SHOOT => {
@@ -666,13 +728,24 @@ async fn handle(
             r.done()?;
             let id = player.context("shoot before character")?;
             a.world
-                .call(move |w| w.native_shoot(id, time, bullet, kind, pos, angle))
+                .call(move |w| {
+                    match w.native_shoot_received(id, (time, received), bullet, kind, pos, angle) {
+                        Ok(_) => Ok(()),
+                        Err(error)
+                            if error
+                                .downcast_ref::<crate::world::RejectedNativeShot>()
+                                .is_some() =>
+                        {
+                            w.correct_native_shot(id, time, bullet, kind, &format!("{error:#}"))
+                        }
+                        Err(error) => Err(error),
+                    }
+                })
                 .await?;
         }
         wire::PLAYER_TEXT => {
             let text = player_text(&mut r)?;
             let id = player.context("chat before character")?;
-            let received = std::time::Instant::now();
             if matches!(
                 text.trim(),
                 "/discord" | "/discord recovery" | "/discord norecovery"
@@ -794,7 +867,6 @@ async fn handle(
             let target = r.i32()?;
             r.done()?;
             let id = player.context("teleport before character")?;
-            let received = std::time::Instant::now();
             if let Err(error) = a
                 .world
                 .directory(move |d| d.teleport(id, target, received))
@@ -806,13 +878,18 @@ async fn handle(
             }
         }
         wire::PONG => {
-            r.i32()?;
+            let nonce = r.i32()?;
             r.i32()?;
             r.done()?;
+            if let (Some(testing), Some(player)) = (&a.testing, player) {
+                testing.acknowledge_native(nonce, *player);
+            }
         }
         22 => {
-            r.i32()?;
+            let time = r.i32()?;
             r.done()?;
+            let id = player.context("SHOOT ACK before character")?;
+            a.world.call(move |w| w.acknowledge_shoot(id, time)).await?;
         }
         76 => {
             r.i32()?;
@@ -822,8 +899,19 @@ async fn handle(
             r.done()?;
         }
         24 => {
-            r.u8()?;
+            let bullet = r.u8()?;
+            let owner = r.i32()?;
+            r.done()?;
+            let id = player.context("hit report before character")?;
+            a.world
+                .call(move |w| w.native_player_hit(id, owner, bullet))
+                .await?;
+        }
+        59 => {
+            player.context("area acknowledgement before character")?;
             r.i32()?;
+            r.f32()?;
+            r.f32()?;
             r.done()?;
         }
         66 | 51 => collision_report(packet.id == 66, &mut r)?,
@@ -900,8 +988,10 @@ async fn handle(
             persist(a, plan).await?;
         }
         14 => {
-            r.i32()?;
+            let time = r.i32()?;
             r.done()?;
+            let id = player.context("GOTO ACK before character")?;
+            a.world.call(move |w| w.acknowledge_goto(id, time)).await?;
         }
         48 => {
             r.done()?;
@@ -938,14 +1028,24 @@ async fn handle(
             let portal = if packet.id == 3 { Some(r.i32()?) } else { None };
             r.done()?;
             let id = player.context("transfer before character")?;
-            let (destination, keytime, key, name) = a
+            let transfer = a
                 .world
                 .directory(move |d| {
+                    if portal.is_none() && d.location(id)? == -2 {
+                        tracing::debug!(
+                            player = id,
+                            "redundant Nexus escape acknowledged without transfer"
+                        );
+                        return Ok(None);
+                    }
                     let (account, character, destination) = d.destination(id, portal)?;
                     let (keytime, key, name) = d.issue(account, character, destination)?;
-                    Ok((destination, keytime, key, name))
+                    Ok(Some((destination, keytime, key, name)))
                 })
                 .await?;
+            let Some((destination, keytime, key, name)) = transfer else {
+                return Ok(());
+            };
             depart(a, id).await?;
             *player = None;
             let mut o = Writer::new();
@@ -976,9 +1076,11 @@ async fn handle(
     Ok(())
 }
 async fn connection(socket: WebSocket, mut a: App) {
-    let (mut wsout, mut wsin) = socket.split();
+    let (mut wsout, wsin) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Packet>(64);
     let (lost, mut lost_rx) = tokio::sync::watch::channel(false);
+    // Actor work and output backpressure must not manufacture late, clustered input receipts.
+    let (mut incoming, _input_task) = input::receive(wsin, lost.clone(), a.world.clock.clone());
     let mut shutdown = a.shutdown.subscribe();
     let deadline = tokio::time::sleep(std::time::Duration::from_secs(10));
     tokio::pin!(deadline);
@@ -987,20 +1089,30 @@ async fn connection(socket: WebSocket, mut a: App) {
     let mut reconnect_sent = false;
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut serial = 0;
-    let mut packet_window = std::time::Instant::now();
-    let mut packet_count = 0usize;
+    let mut transfers = tokio::time::interval(std::time::Duration::from_millis(250));
+    let mut testing_stop = a.testing.as_ref().map(|t| t.stopped.subscribe());
+    let mut terminal_drain = false;
     'connection: loop {
         tokio::select! {
-            incoming=wsin.next()=>match incoming {
-                Some(Ok(Message::Binary(bytes)))=>{
-                    let packets=match codec.feed(&bytes) {Ok(p)=>p,Err(e)=>{tracing::error!(error=%e,"invalid packet stream");break;}};
-                    if packet_window.elapsed().as_secs()>=1 {packet_window=std::time::Instant::now();packet_count=0;}
-                    packet_count=packet_count.saturating_add(packets.len());
-                    if packet_count>512 {tracing::warn!(player=session.player,"input packet rate exceeded");break;}
-                    for packet in packets {
-                        if session.reconnecting { break; }
+            _=async { match testing_stop.as_mut() { Some(stop) => { if stop.borrow().is_none() { let _ = stop.changed().await; } }, None => std::future::pending::<()>().await } } => {
+                let player=session.player;
+                let terminal=a.world.directory(move |d|Ok(d.worlds.values().flat_map(|w|w.players.iter()).any(|(id,p)|Some(*id)==player && (!p.character.alive || p.death_pending)))).await;
+                match terminal {
+                    // Ruffle can discard its queued DEATH frame if this socket closes first.
+                    Ok(true) => {
+                        terminal_drain=true;testing_stop=None;
+                        deadline.as_mut().reset(tokio::time::Instant::now()+std::time::Duration::from_secs(5));
+                    }
+                    Ok(false) => {tracing::warn!("native test control stopped; closing living game connection");break;}
+                    Err(error) => {tracing::error!(%error,"terminal native drain inspection failed");break;}
+                }
+            },
+            event=incoming.recv()=>match event {
+                Some(Incoming::Command(packet, received, _bytes))=>{
+                    if a.testing.as_ref().is_some_and(|t| t.stopped.borrow().is_some()) { if terminal_drain {continue;} break; }
+                    if !session.reconnecting {
                         let id=packet.id;
-                        if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost).await {
+                        if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost,received).await {
                             tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,error=%format_args!("{e:#}"),"game command rejected");
                             if matches!(id,1|21|37|57) && let Some(player) = session.player {
                                 let reason = e.to_string();
@@ -1019,10 +1131,35 @@ async fn connection(socket: WebSocket, mut a: App) {
                         }
                     }
                 },
-                Some(Ok(Message::Ping(bytes)))=>{if wsout.send(Message::Pong(bytes)).await.is_err(){break}},
-                Some(Ok(Message::Close(_)))|None=>break,
-                Some(Ok(_))=>{tracing::warn!("non-binary game message rejected");break},
-                Some(Err(e))=>{tracing::warn!(error=%e,"WebSocket failed");break},
+                Some(Incoming::Ping(bytes))=>{if wsout.send(Message::Pong(bytes)).await.is_err(){break}},
+                None=>break,
+            },
+            _=transfers.tick(),if session.player.is_some() && !session.reconnecting=>{
+                let player = session.player.expect("guarded loaded player");
+                match automatic_transfer(&a, player).await {
+                    Ok(Some(transfer)) => {
+                        if transfer.player!=player || !transfer.output.packets.same_channel(&tx) {
+                            tracing::error!(player,"automatic transfer recipient differs from owned session");
+                            break;
+                        }
+                        session.player = None;
+                        session.reconnecting = true;
+                        session.account.take();
+                        let packet = transfer.packet();
+                        // Retired-world frames must not follow RECONNECT into a replacement scene.
+                        while rx.try_recv().is_ok() {}
+                        if wsout.send(Message::Binary(codec.frame(packet.id,packet.body).into())).await.is_err(){break;}
+                        reconnect_sent=true;
+                        deadline.as_mut().reset(tokio::time::Instant::now()+std::time::Duration::from_secs(10));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(player,%error,"automatic durable transfer failed");
+                        let f=fail(&error.to_string());
+                        let _=wsout.send(Message::Binary(codec.frame(f.id,f.body).into())).await;
+                        break;
+                    }
+                }
             },
             _=async {
                 match session.account.as_ref().and_then(|o| o.cancel.clone()) {
@@ -1032,15 +1169,18 @@ async fn connection(socket: WebSocket, mut a: App) {
             }=>{tracing::info!(account=session.account.as_ref().map(|o|o.id),"closing requested game session");break;},
             _=shutdown.changed()=>break,
             _=lost_rx.changed()=>{tracing::warn!(player=session.player,"closing slow game connection before its state diverges");break;},
-            _=&mut deadline,if session.player.is_none() && (!session.reconnecting || reconnect_sent)=>{tracing::warn!(reconnecting=session.reconnecting,reconnect_sent,"game selection or reconnect-close deadline exceeded");break;},
+            _=&mut deadline,if terminal_drain || session.player.is_none() && (!session.reconnecting || reconnect_sent)=>{tracing::warn!(reconnecting=session.reconnecting,reconnect_sent,terminal_drain,"game selection, reconnect-close or terminal-drain deadline exceeded");break;},
             outgoing=rx.recv()=>{
                 let Some(packet)=outgoing else {break};
                 let reconnect=packet.id==39;
-                if wsout.send(Message::Binary(codec.frame(packet.id,packet.body).into())).await.is_err(){break;}
+                let nonce = (packet.id==wire::PING && packet.body.len()==4).then(|| i32::from_be_bytes(packet.body[..4].try_into().unwrap()));
+                let frame = codec.frame(packet.id,packet.body);
+                if let (Some(testing),Some(player),Some(nonce)) = (&a.testing,session.player,nonce) { testing.note_native_frame(nonce,player,&frame); }
+                if wsout.send(Message::Binary(frame.into())).await.is_err(){break;}
                 // Ruffle can discard unread TCP bytes when the proxy closes before its next frame.
                 if reconnect {reconnect_sent=true;deadline.as_mut().reset(tokio::time::Instant::now()+std::time::Duration::from_secs(10));}
             },
-            _=ping.tick()=>{if session.account.is_some(){serial+=1;let mut o=Writer::new();o.i32(serial);
+            _=ping.tick()=>{if session.account.is_some() && !a.world.clock.paused(){serial+=1;let mut o=Writer::new();o.i32(serial);
                 if wsout.send(Message::Binary(codec.frame(wire::PING,o.0).into())).await.is_err(){break;}}}
         }
     }
@@ -1060,6 +1200,16 @@ async fn connection(socket: WebSocket, mut a: App) {
         owner.release();
     }
 }
+pub(crate) async fn automatic_transfer(
+    a: &App,
+    id: i32,
+) -> Result<Option<crate::world::ForcedTransfer>> {
+    let transfer = a.world.directory(move |d| d.forced_transfer(id)).await?;
+    if transfer.is_some() {
+        depart(a, id).await?;
+    }
+    Ok(transfer)
+}
 pub(crate) async fn depart(a: &App, id: i32) -> Result<()> {
     loop {
         if let Some(ch) = a
@@ -1068,8 +1218,15 @@ pub(crate) async fn depart(a: &App, id: i32) -> Result<()> {
             .call(move |w| w.begin_departure(id))
             .await?
         {
-            if ch.alive {
-                a.store.progress(ch).await?;
+            if ch.alive
+                && let Err(error) = a.store.progress(ch).await
+            {
+                let reason = format!("departure persistence failed: {error:#}");
+                a.world
+                    .for_player(id)
+                    .call(move |w| w.poison(id, reason))
+                    .await?;
+                return Err(error);
             }
             return a
                 .world
@@ -1407,6 +1564,7 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
         .route("/internal/discord/recover", post(discord_recover))
         .route("/api/account/recover", post(reset_password));
     let app = app
+        .route("/dev/testing", post(testing::command))
         .route("/dev/join", post(bot_create))
         .route("/dev/action", post(bot_action))
         .route("/dev/trade", post(bot_trade))

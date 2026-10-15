@@ -10,6 +10,8 @@ pub struct Config {
     pub data: PathBuf,
     pub client: PathBuf,
     pub state: PathBuf,
+    #[serde(default)]
+    pub test_state: bool,
     pub max_players: usize,
     pub behind_proxy: bool,
     #[serde(default = "default_shore_bots")]
@@ -27,6 +29,7 @@ impl Config {
         let mut shore_bots = None;
         let mut client_dir = None;
         let mut state_dir = None;
+        let mut test_state = false;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -55,8 +58,11 @@ impl Config {
                         args.next().context("--client requires a directory")?,
                     ));
                 }
-                "--state" => {
-                    ensure!(state_dir.is_none(), "duplicate --state");
+                "--state" | "--test-state" => {
+                    ensure!(state_dir.is_none(), "duplicate state directory");
+                    if arg == "--test-state" {
+                        test_state = true;
+                    }
                     state_dir = Some(PathBuf::from(
                         args.next().context("--state requires a directory")?,
                     ));
@@ -81,6 +87,7 @@ impl Config {
                     .context("workspace parent missing")?
                     .join("client"),
                 state: root.join(".local"),
+                test_state: false,
                 max_players: 85,
                 behind_proxy: false,
                 shore_bots: true,
@@ -102,6 +109,16 @@ impl Config {
         if let Some(enabled) = shore_bots {
             config.shore_bots = enabled;
         }
+        config.test_state |= test_state;
+        control |= test_state;
+        ensure!(
+            !config.test_state || control,
+            "test state requires local development control"
+        );
+        ensure!(
+            !config.test_state || !config.shore_bots,
+            "prepared sessions require --no-shore-bots or shore_bots:false; spawn every controller explicitly"
+        );
         config.validate(control)?;
         Ok((config, control))
     }
@@ -238,6 +255,17 @@ mod tests {
                 original.origin
             )
         );
+    }
+    #[test]
+    fn prepared_sessions_require_an_explicitly_disabled_automatic_roster() {
+        assert!(Config::load(&["--test-state".into(), "/tmp/explicit-qa".into()]).is_err());
+        let (prepared, control) = Config::load(&[
+            "--test-state".into(),
+            "/tmp/explicit-qa".into(),
+            "--no-shore-bots".into(),
+        ])
+        .unwrap();
+        assert!(prepared.test_state && !prepared.shore_bots && control);
     }
     #[test]
     fn malformed_state_arguments_are_rejected() {

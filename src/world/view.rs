@@ -75,6 +75,8 @@ pub struct VisibleObject {
     pub equipped: Vec<i32>,
     pub contents: Vec<i32>,
     pub blocks: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_mask: Option<i32>,
 }
 #[derive(Serialize)]
 pub struct VisibleProjectile {
@@ -111,6 +113,7 @@ impl Directory {
                         equipped: q.character.items[..4].to_vec(),
                         contents: vec![],
                         blocks: false,
+                        condition_mask: None,
                     }
                 } else {
                     let e = &w.entities[entity];
@@ -124,6 +127,7 @@ impl Directory {
                         equipped: vec![],
                         contents: e.items.clone(),
                         blocks: w.content.objects[&e.kind].blocks,
+                        condition_mask: Some(e.conditions(w.now)),
                     }
                 })
             })
@@ -180,7 +184,7 @@ impl Directory {
                 height: w.map.height,
             },
             character: OwnCharacter {
-                conditions: p.condition(w.now) | if p.paused { 1 << 20 } else { 0 },
+                conditions: p.conditions(w.now) | if p.paused { 1 << 20 } else { 0 },
                 class: p.character.class,
                 level: p.character.level,
                 experience: p.character.exp,

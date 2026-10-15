@@ -6,7 +6,6 @@ use std::{collections::BTreeMap, io::Read, path::Path};
 pub const WIZARD: u16 = 0x030e;
 pub const PRIEST: u16 = 0x0310;
 pub const SLOWED: i32 = 1 << 3;
-pub const DAZED: i32 = 1 << 5;
 pub const STUNNED: i32 = 1 << 6;
 pub const PARALYZED: i32 = 1 << 13;
 pub const SPEEDY: i32 = 1 << 14;
@@ -36,7 +35,47 @@ pub struct Projectile {
     pub amplitude: f32,
     pub frequency: f32,
     pub passes_cover: bool,
-    pub conditions: Vec<(i32, u64)>,
+    pub multi_hit: bool,
+    pub armor_piercing: bool,
+    pub wavy: bool,
+    pub parametric: bool,
+    pub boomerang: bool,
+    pub magnitude: f32,
+    pub effects: Vec<(u8, u64)>,
+}
+impl Projectile {
+    pub fn offset(&self, id: u8, angle: f32, elapsed: f32) -> (f32, f32) {
+        let parity = if id.is_multiple_of(2) {
+            0.
+        } else {
+            std::f32::consts::PI
+        };
+        let mut distance = elapsed * self.speed / 10000.;
+        if self.wavy {
+            let direction = angle
+                + std::f32::consts::PI / 64.
+                    * (parity + 6. * std::f32::consts::PI * elapsed / 1000.).sin();
+            return (distance * direction.cos(), distance * direction.sin());
+        }
+        if self.parametric {
+            let phase = elapsed / self.lifetime * std::f32::consts::TAU;
+            let a = phase.sin() * if id.is_multiple_of(2) { -1. } else { 1. };
+            let b = (phase * 2.).sin() * if id % 4 < 2 { -1. } else { 1. };
+            return (
+                (a * angle.cos() - b * angle.sin()) * self.magnitude,
+                (a * angle.sin() + b * angle.cos()) * self.magnitude,
+            );
+        }
+        if self.boomerang && elapsed > self.lifetime / 2. {
+            distance = (self.lifetime - elapsed) * self.speed / 10000.;
+        }
+        let wave = self.amplitude
+            * (parity + std::f32::consts::TAU * self.frequency * elapsed / self.lifetime).sin();
+        (
+            distance * angle.cos() - wave * angle.sin(),
+            distance * angle.sin() + wave * angle.cos(),
+        )
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Object {
@@ -68,11 +107,15 @@ pub struct Object {
     pub mana_cost: i32,
     pub activate: String,
     pub heal: i32,
+    pub stat_increase: Option<(u8, i32)>,
+    pub unlock_portal: Option<(String, String)>,
     pub heal_range: f32,
     pub activations: usize,
     pub cooldown_ms: u64,
     pub enemy: bool,
+    pub terrain: u8,
     pub quest: bool,
+    pub quest_level: Option<i32>,
     pub xp_multiplier: f32,
     pub blocks: bool,
     pub occupy_square: bool,
@@ -84,6 +127,7 @@ pub struct Object {
 pub struct Content {
     pub objects: BTreeMap<u16, Object>,
     pub grounds: BTreeMap<u8, f32>,
+    pub pushes: BTreeMap<u8, (f32, f32)>,
     pub classes: BTreeMap<u16, Class>,
 }
 fn child<'a, 'i>(n: Node<'a, 'i>, tag: &str) -> Option<Node<'a, 'i>> {
@@ -154,30 +198,28 @@ impl Content {
                     amplitude: number(p, "Amplitude", 0.)?,
                     frequency: number(p, "Frequency", 1.)?,
                     passes_cover: child(p, "PassesCover").is_some(),
-                    conditions: p
+                    multi_hit: child(p, "MultiHit").is_some(),
+                    armor_piercing: child(p, "ArmorPiercing").is_some(),
+                    wavy: child(p, "Wavy").is_some(),
+                    parametric: child(p, "Parametric").is_some(),
+                    boomerang: child(p, "Boomerang").is_some(),
+                    magnitude: number(p, "Magnitude", 3.)?,
+                    effects: p
                         .children()
-                        .filter(|c| c.has_tag_name("ConditionEffect"))
-                        .filter_map(|c| {
-                            let effect = match c.text()?.trim() {
-                                "Slowed" => SLOWED,
-                                "Dazed" => DAZED,
-                                "Stunned" => STUNNED,
-                                "Paralyzed" => PARALYZED,
-                                "Speedy" => SPEEDY,
-                                _ => return None,
-                            };
-                            Some((|| -> Result<_> {
-                                let duration = c
-                                    .attribute("duration")
+                        .filter(|e| e.has_tag_name("ConditionEffect"))
+                        .map(|e| -> Result<_> {
+                            let index = crate::condition::projectile_effect(
+                                e.text().context("condition name missing")?,
+                            )?;
+                            let duration = std::time::Duration::try_from_secs_f32(
+                                e.attribute("duration")
                                     .context("condition duration missing")?
-                                    .parse()?;
-                                Ok((
-                                    effect,
-                                    std::time::Duration::try_from_secs_f64(duration)?
-                                        .as_millis()
-                                        .try_into()?,
-                                ))
-                            })())
+                                    .parse()?,
+                            )?
+                            .as_millis()
+                            .try_into()?;
+                            ensure!(duration > 0, "non-positive projectile condition duration");
+                            Ok((index, duration))
                         })
                         .collect::<Result<_>>()?,
                 };
@@ -238,6 +280,34 @@ impl Content {
                     .map(str::parse)
                     .transpose()?
                     .unwrap_or(0),
+                stat_increase: n
+                    .children()
+                    .find(|p| p.has_tag_name("Activate") && p.text() == Some("IncrementStat"))
+                    .map(|p| -> Result<(u8, i32)> {
+                        Ok((
+                            p.attribute("stat")
+                                .context("potion stat missing")?
+                                .parse()?,
+                            p.attribute("amount")
+                                .context("potion amount missing")?
+                                .parse()?,
+                        ))
+                    })
+                    .transpose()?,
+                unlock_portal: n
+                    .children()
+                    .find(|p| p.has_tag_name("Activate") && p.text() == Some("UnlockPortal"))
+                    .map(|p| -> Result<(String, String)> {
+                        Ok((
+                            p.attribute("dungeonName")
+                                .context("unlock dungeonName missing")?
+                                .to_owned(),
+                            p.attribute("lockedName")
+                                .context("unlock lockedName missing")?
+                                .to_owned(),
+                        ))
+                    })
+                    .transpose()?,
                 heal_range: child(n, "Activate")
                     .and_then(|p| p.attribute("range"))
                     .map(str::parse)
@@ -248,7 +318,26 @@ impl Content {
                     .as_millis()
                     .try_into()?,
                 enemy: child(n, "Enemy").is_some(),
+                terrain: match text(n, "Terrain").as_str() {
+                    "" => 0,
+                    "Mountains" => 1,
+                    "HighSand" => 2,
+                    "HighPlains" => 3,
+                    "HighForest" => 4,
+                    "MidSand" => 5,
+                    "MidPlains" => 6,
+                    "MidForest" => 7,
+                    "LowSand" => 8,
+                    "LowPlains" => 9,
+                    "LowForest" => 10,
+                    "ShoreSand" => 11,
+                    "ShorePlains" => 12,
+                    terrain => bail!("unknown selected terrain {terrain}"),
+                },
                 quest: child(n, "Quest").is_some(),
+                quest_level: child(n, "Level")
+                    .map(|_| text(n, "Level").parse())
+                    .transpose()?,
                 xp_multiplier: number(n, "XpMult", 1.)?,
                 blocks: child(n, "OccupySquare").is_some() || child(n, "FullOccupy").is_some(),
                 occupy_square: child(n, "OccupySquare").is_some(),
@@ -327,6 +416,7 @@ impl Content {
         let data = std::fs::read_to_string(dir.join("grounds.xml"))?;
         let doc = roxmltree::Document::parse(&data)?;
         let mut grounds = BTreeMap::new();
+        let mut pushes = BTreeMap::new();
         for n in doc.root_element().children().filter(|n| n.is_element()) {
             let id = u8::try_from(kind(n.attribute("type").context("ground type missing")?)?)?;
             let speed = if child(n, "NoWalk").is_some() {
@@ -334,6 +424,22 @@ impl Content {
             } else {
                 number(n, "Speed", 1.)?
             };
+            let push = if child(n, "Push").is_some() {
+                let animation =
+                    child(n, "Animate").context("pushing ground lacks animation vector")?;
+                let mut vector = [0.; 2];
+                for (i, axis) in ["dx", "dy"].iter().enumerate() {
+                    if let Some(value) = animation.attribute(*axis) {
+                        let velocity: f32 = value.parse()?;
+                        ensure!(velocity.is_finite(), "non-finite ground push");
+                        vector[i] = -velocity / 1000.;
+                    }
+                }
+                (vector[0], vector[1])
+            } else {
+                (0., 0.)
+            };
+            pushes.insert(id, push);
             ensure!(
                 grounds.insert(id, speed).is_none(),
                 "duplicate ground type {id:#x}"
@@ -346,6 +452,7 @@ impl Content {
         let out = Self {
             objects,
             grounds,
+            pushes,
             classes,
         };
         let w = out.get(WIZARD)?;

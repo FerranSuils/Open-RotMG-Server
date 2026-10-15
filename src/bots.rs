@@ -955,3 +955,31 @@ mod tests;
 mod runtime;
 pub(crate) const OUTPUT_CAPACITY: usize = 512;
 pub use runtime::start;
+pub fn profiles() -> Vec<&'static str> {
+    PROFILES.iter().map(|p| p.name).collect()
+}
+fn selected_profile(name: &str) -> Result<Profile> {
+    PROFILES
+        .iter()
+        .copied()
+        .find(|p| p.name == name)
+        .context("unknown actual gameplay profile")
+}
+pub fn validate_test_class(class: u16, profile: &str) -> Result<()> {
+    ensure!(
+        matches!(class, crate::content::WIZARD | crate::content::PRIEST),
+        "this source implements only Wizard and Priest gameplay controllers"
+    );
+    selected_profile(profile)?;
+    Ok(())
+}
+pub async fn start_test(
+    app: &crate::server::App,
+    character: crate::store::Character,
+    world: i32,
+    position: Pos,
+    profile: &str,
+) -> Result<()> {
+    validate_test_class(character.class, profile)?;
+    runtime::start_selected(app, selected_profile(profile)?, character, world, position).await
+}

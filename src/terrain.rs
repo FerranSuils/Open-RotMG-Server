@@ -46,7 +46,7 @@ fn biome(depth: f64, moisture: f64, radius: f64) -> (u8, u8) {
     if elevation >= 0.5 {
         (if variant == 2 { 0x6a } else { 0x60 }, 1)
     } else if elevation > 0.35 {
-        ([0xbd, 0x23, 0x47][variant], [2, 4, 3][variant])
+        ([0xbd, 0x23, 0x47][variant], [2, 3, 4][variant])
     } else if elevation > 0.15 {
         ([0xbd, 0x46, 0x56][variant], [5, 6, 7][variant])
     } else {

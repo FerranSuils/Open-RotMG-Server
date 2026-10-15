@@ -42,6 +42,9 @@ pub struct Character {
     pub tiles: u64,
     #[serde(default)]
     pub pirate_caves: u64,
+    // Earlier schema-one writers could not enter these dungeons.
+    #[serde(default)]
+    pub dungeons: [u64; 3],
 }
 pub fn level_start(level: i32) -> Result<i32> {
     ensure!((1..=20).contains(&level), "invalid character level {level}");
@@ -152,6 +155,10 @@ pub struct InventoryWrite {
     pub items: Vec<i32>,
 }
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
+enum Creation {
+    Normal(Vec<(u16, i32)>),
+    Prepared(Option<String>),
+}
 #[derive(Clone)]
 pub struct Store {
     tx: mpsc::Sender<Job>,
@@ -407,13 +414,40 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             matches!(class.kind, WIZARD | PRIEST) && class.class == "Player",
             "playable class is not implemented"
         );
-        let kind = class.kind;
         let requirements = self
             .classes
-            .get(&kind)
+            .get(&class.kind)
             .context("class metadata missing")?
             .requires
             .clone();
+        self.create_character(account, class, Creation::Normal(requirements))
+            .await
+    }
+    pub(crate) async fn create_prepared(
+        &self,
+        account: i32,
+        class: &Object,
+        name: Option<String>,
+    ) -> Result<Character> {
+        tracing::info!(
+            account,
+            class = class.kind,
+            "explicit prepared creation requested; no prerequisite progress granted"
+        );
+        self.create_character(account, class, Creation::Prepared(name))
+            .await
+    }
+    async fn create_character(
+        &self,
+        account: i32,
+        class: &Object,
+        creation: Creation,
+    ) -> Result<Character> {
+        ensure!(
+            matches!(class.kind, WIZARD | PRIEST) && class.class == "Player",
+            "playable class is not implemented"
+        );
+        let kind = class.kind;
         let base = [
             class.hp,
             class.mp,
@@ -429,12 +463,23 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         let items = class.equipment.clone();
         self.call(move |c| {
             let tx = c.transaction()?;
+            let (requirements, prepared_name) = match creation {
+                Creation::Normal(requirements) => (requirements, None),
+                Creation::Prepared(name) => {
+                    let count: i64 = tx.query_row("SELECT count(*) FROM characters WHERE account=?1 AND alive=1", [account], |r| r.get(0))?;
+                    ensure!(count == 0, "prepared creation cannot implicitly replace a living character");
+                    (Vec::new(), name)
+                }
+            };
             for (required_class, required_level) in requirements {
                 let best: Option<i32> = tx.query_row(
                     "SELECT max(json_extract(stats,\'$.level\')) FROM characters WHERE account=?1 AND json_extract(stats,\'$.class\')=?2",
                     params![account, required_class], |r| r.get(0),
                 )?;
                 ensure!(best.is_some_and(|level| level >= required_level), "class {kind:#x} is locked: requires {required_class:#x} level {required_level}");
+            }
+            if let Some(name) = prepared_name {
+                tx.execute("UPDATE accounts SET name=?1 WHERE id=?2", params![name,account])?;
             }
             let name: String =
                 tx.query_row("SELECT name FROM accounts WHERE id=?1", [account], |r| {
@@ -464,6 +509,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 quests: 0,
                 tiles: 0,
                 pirate_caves: 0,
+                dungeons: [0; 3],
             };
             tx.execute(
                 "INSERT INTO characters(account,stats,items) VALUES(?1,?2,?3)",
@@ -478,6 +524,9 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             Ok(ch)
         })
         .await
+    }
+    pub(crate) async fn character_alive(&self, id: i32, guid: String) -> Result<bool> {
+        self.call(move |c| Ok(c.query_row("SELECT c.alive FROM characters c JOIN accounts a ON a.id=c.account WHERE c.id=?1 AND a.guid=?2",params![id,guid],|r|r.get(0))?)).await
     }
     pub async fn load(&self, account: i32, id: i32) -> Result<Character> {
         self.call(move|c|{let(stats,items,revision,name):(String,String,i32,String)=c.query_row("SELECT c.stats,c.items,c.revision,a.name FROM characters c JOIN accounts a ON a.id=c.account WHERE c.id=?1 AND c.account=?2 AND c.alive=1",params![id,account],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).context("character does not belong to this account or is dead")?;let mut ch:Character=serde_json::from_str(&stats)?;ch.id=id;ch.account=account;ch.name=name;ch.items=serde_json::from_str(&items)?;ch.revision=revision;ch.alive=true;Ok(ch)}).await
@@ -570,6 +619,61 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             Ok(revisions)
         }).await
     }
+    pub async fn consume_stat(
+        &self,
+        mut ch: Character,
+        slot: usize,
+        index: usize,
+        amount: i32,
+    ) -> Result<i32> {
+        let kind = match index {
+            2 => 0xa1f,
+            3 => 0xa20,
+            4 => 0xa21,
+            5 => 0xa4c,
+            6 => 0xa34,
+            7 => 0xa35,
+            _ => anyhow::bail!("unsupported permanent potion stat"),
+        };
+        ensure!(
+            amount == 1 && slot < 12 && ch.items.len() == 12 && ch.items[slot] == kind,
+            "permanent potion ownership or activation mismatch"
+        );
+        let cap = self
+            .classes
+            .get(&ch.class)
+            .context("unknown potion class")?
+            .caps[index];
+        ensure!(
+            ch.alive && ch.hp > 0 && ch.base[index] >= 0 && ch.base[index] < cap,
+            "dead character or permanent stat already capped"
+        );
+        ensure!(
+            ch.revision >= 0 && ch.revision < i32::MAX,
+            "invalid potion revision"
+        );
+        self.call(move |db| {
+            let tx = db.transaction()?;
+            let (raw, items): (String, String) = tx.query_row(
+                "SELECT stats,items FROM characters WHERE id=?1 AND account=?2 AND revision=?3 AND alive=1",
+                params![ch.id, ch.account, ch.revision], |r| Ok((r.get(0)?, r.get(1)?)))
+                .context("permanent potion conflict: dead, foreign or stale character")?;
+            let saved: Character = serde_json::from_str(&raw)?;
+            ensure!(saved.schema == ch.schema && saved.class == ch.class && saved.base == ch.base
+                && saved.level == ch.level && saved.exp == ch.exp && saved.fame == ch.fame
+                && saved.pirate_caves == ch.pirate_caves && saved.dungeons == ch.dungeons
+                && serde_json::from_str::<Vec<i32>>(&items)? == ch.items,
+                "permanent potion reservation changed");
+            ch.base[index] += amount;
+            ch.items[slot] = -1;
+            ch.revision += 1;
+            let n = tx.execute("UPDATE characters SET stats=?4,items=?5,revision=revision+1 WHERE id=?1 AND account=?2 AND revision=?3 AND alive=1",
+                params![ch.id, ch.account, ch.revision - 1, serde_json::to_string(&ch)?, serde_json::to_string(&ch.items)?])?;
+            ensure!(n == 1, "permanent potion commit lost its reservation");
+            tx.commit()?;
+            Ok(ch.revision)
+        }).await
+    }
     pub async fn progress(&self, ch: Character) -> Result<()> {
         self.progress_batch(vec![ch]).await
     }
@@ -602,7 +706,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
     }
     pub async fn fame(&self, account: i32, id: i32) -> Result<String> {
         let legacy_base = self.legacy_base;
-        self.call(move|db|{let (snapshot,killer):(String,String)=db.query_row("SELECT snapshot,killed_by FROM deaths JOIN characters ON characters.id=deaths.character WHERE characters.account=?1 AND deaths.character=?2",params![account,id],|r|Ok((r.get(0)?,r.get(1)?)))?;let c = decode_character(&snapshot, legacy_base)?;ensure!(c.created_at>0,"creation time was not recorded by the early development binary for this character");Ok(format!("<Fame><Char id=\"{}\"><Account><Name>{}</Name></Account><ObjectType>{}</ObjectType><Level>{}</Level><Tex1>0</Tex1><Tex2>0</Tex2></Char><CreatedOn>{}</CreatedOn><KilledBy>{}</KilledBy><TotalFame>{}</TotalFame><Shots>{}</Shots><ShotsThatDamage>{}</ShotsThatDamage><TilesUncovered>{}</TilesUncovered><MonsterKills>{}</MonsterKills><GodKills>0</GodKills><OryxKills>0</OryxKills><QuestsCompleted>{}</QuestsCompleted><PirateCavesCompleted>{}</PirateCavesCompleted><UndeadLairsCompleted>0</UndeadLairsCompleted><AbyssOfDemonsCompleted>0</AbyssOfDemonsCompleted><SnakePitsCompleted>0</SnakePitsCompleted><SpiderDensCompleted>0</SpiderDensCompleted><SpriteWorldsCompleted>0</SpriteWorldsCompleted><TombsCompleted>0</TombsCompleted><LevelUpAssists>0</LevelUpAssists><BaseFame>{}</BaseFame></Fame>",c.id,xml_escape(&c.name),c.class,c.level,c.created_at,xml_escape(&killer),c.fame,c.shots,c.hits,c.tiles,c.kills,c.quests,c.pirate_caves,c.fame))}).await
+        self.call(move|db|{let (snapshot,killer):(String,String)=db.query_row("SELECT snapshot,killed_by FROM deaths JOIN characters ON characters.id=deaths.character WHERE characters.account=?1 AND deaths.character=?2",params![account,id],|r|Ok((r.get(0)?,r.get(1)?)))?;let c = decode_character(&snapshot, legacy_base)?;ensure!(c.created_at>0,"creation time was not recorded by the early development binary for this character");Ok(format!("<Fame><Char id=\"{}\"><Account><Name>{}</Name></Account><ObjectType>{}</ObjectType><Level>{}</Level><Tex1>0</Tex1><Tex2>0</Tex2></Char><CreatedOn>{}</CreatedOn><KilledBy>{}</KilledBy><TotalFame>{}</TotalFame><Shots>{}</Shots><ShotsThatDamage>{}</ShotsThatDamage><TilesUncovered>{}</TilesUncovered><MonsterKills>{}</MonsterKills><GodKills>0</GodKills><OryxKills>0</OryxKills><QuestsCompleted>{}</QuestsCompleted><PirateCavesCompleted>{}</PirateCavesCompleted><UndeadLairsCompleted>{}</UndeadLairsCompleted><AbyssOfDemonsCompleted>0</AbyssOfDemonsCompleted><SnakePitsCompleted>{}</SnakePitsCompleted><SpiderDensCompleted>0</SpiderDensCompleted><SpriteWorldsCompleted>{}</SpriteWorldsCompleted><TombsCompleted>0</TombsCompleted><LevelUpAssists>0</LevelUpAssists><BaseFame>{}</BaseFame></Fame>",c.id,xml_escape(&c.name),c.class,c.level,c.created_at,xml_escape(&killer),c.fame,c.shots,c.hits,c.tiles,c.kills,c.quests,c.pirate_caves,c.dungeons[2],c.dungeons[0],c.dungeons[1],c.fame))}).await
     }
     #[cfg(test)]
     pub async fn rename(&self, account: i32, name: String) -> Result<()> {
@@ -679,6 +783,236 @@ impl Account {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn permanent_potions_commit_items_and_base_together_and_reject_replay() {
+        let content = Content::load(Path::new("data")).unwrap();
+        let s = Store::open(Path::new(":memory:"), &content).unwrap();
+        let account = s.list("stat-potions".into()).await.unwrap();
+        let mut ch = s
+            .create(account.id, content.get(WIZARD).unwrap())
+            .await
+            .unwrap();
+        for (slot, index, kind) in [
+            (4, 2, 0xa1f),
+            (5, 3, 0xa20),
+            (6, 4, 0xa21),
+            (7, 5, 0xa4c),
+            (8, 6, 0xa34),
+            (9, 7, 0xa35),
+        ] {
+            ch.items[slot] = kind;
+            ch.revision = s
+                .exchange(
+                    vec![InventoryWrite {
+                        id: ch.id,
+                        account: ch.account,
+                        revision: ch.revision,
+                        items: ch.items.clone(),
+                    }],
+                    None,
+                )
+                .await
+                .unwrap()[0];
+            let before = ch.base;
+            let revision = s.consume_stat(ch.clone(), slot, index, 1).await.unwrap();
+            assert!(s.consume_stat(ch.clone(), slot, index, 1).await.is_err());
+            let mut foreign = ch.clone();
+            foreign.account += 1;
+            assert!(s.consume_stat(foreign, slot, index, 1).await.is_err());
+            ch = s.load(ch.account, ch.id).await.unwrap();
+            assert_eq!(ch.revision, revision);
+            assert_eq!(ch.items[slot], -1);
+            let mut expected = before;
+            expected[index] += 1;
+            assert_eq!(ch.base, expected);
+        }
+        let cap = content.classes[&WIZARD].caps[4];
+        ch.base[4] = cap;
+        s.progress(ch.clone()).await.unwrap();
+        ch.items[4] = 0xa21;
+        ch.revision = s
+            .exchange(
+                vec![InventoryWrite {
+                    id: ch.id,
+                    account: ch.account,
+                    revision: ch.revision,
+                    items: ch.items.clone(),
+                }],
+                None,
+            )
+            .await
+            .unwrap()[0];
+        assert!(s.consume_stat(ch.clone(), 4, 4, 1).await.is_err());
+        assert!(s.consume_stat(ch.clone(), 4, 4, 2).await.is_err());
+        let saved = s.load(ch.account, ch.id).await.unwrap();
+        assert_eq!(
+            (saved.base[4], saved.items[4], saved.revision),
+            (cap, 0xa21, ch.revision)
+        );
+        let mut dead = ch.clone();
+        dead.alive = false;
+        dead.hp = 0;
+        s.death(dead, "potion regression".into()).await.unwrap();
+        assert!(s.consume_stat(ch, 4, 4, 1).await.is_err());
+    }
+    #[tokio::test]
+    async fn permanent_potion_conflicts_with_trade_and_vault_without_duplication() {
+        let content = Content::load(Path::new("data")).unwrap();
+        let s = Store::open(Path::new(":memory:"), &content).unwrap();
+        for (index, kind) in [(4, 0xa21), (5, 0xa4c), (7, 0xa35)] {
+            for vault_exchange in [false, true] {
+                for potion_first in [false, true] {
+                    let guid = format!("potion-race-{index}-{vault_exchange}-{potion_first}");
+                    let owner = s.list(guid.clone()).await.unwrap();
+                    let recipient = s.list(format!("{guid}-recipient")).await.unwrap();
+                    let mut source = s
+                        .create(owner.id, content.get(WIZARD).unwrap())
+                        .await
+                        .unwrap();
+                    let target = s
+                        .create(recipient.id, content.get(WIZARD).unwrap())
+                        .await
+                        .unwrap();
+                    source.items[4] = kind;
+                    source.revision = s
+                        .exchange(
+                            vec![InventoryWrite {
+                                id: source.id,
+                                account: source.account,
+                                revision: source.revision,
+                                items: source.items.clone(),
+                            }],
+                            None,
+                        )
+                        .await
+                        .unwrap()[0];
+                    let mut remaining = source.items.clone();
+                    remaining[4] = -1;
+                    let mut writes = vec![InventoryWrite {
+                        id: source.id,
+                        account: source.account,
+                        revision: source.revision,
+                        items: remaining,
+                    }];
+                    let vault = if vault_exchange {
+                        let mut vault = s.vault(owner.id).await.unwrap();
+                        vault.items[0] = kind;
+                        Some(vault)
+                    } else {
+                        let mut items = target.items.clone();
+                        items[4] = kind;
+                        writes.push(InventoryWrite {
+                            id: target.id,
+                            account: target.account,
+                            revision: target.revision,
+                            items,
+                        });
+                        None
+                    };
+                    if potion_first {
+                        s.consume_stat(source.clone(), 4, index, 1).await.unwrap();
+                        assert!(s.exchange(writes, vault).await.is_err());
+                    } else {
+                        s.exchange(writes, vault).await.unwrap();
+                        assert!(s.consume_stat(source.clone(), 4, index, 1).await.is_err());
+                    }
+                    let saved = s.load(owner.id, source.id).await.unwrap();
+                    let other = s.load(recipient.id, target.id).await.unwrap();
+                    let chest = s.vault(owner.id).await.unwrap();
+                    assert_eq!(
+                        saved.base[index],
+                        source.base[index] + i32::from(potion_first)
+                    );
+                    assert_eq!(saved.items[4], -1);
+                    let count = saved
+                        .items
+                        .iter()
+                        .chain(&other.items)
+                        .chain(&chest.items)
+                        .filter(|&&item| item == kind)
+                        .count();
+                    assert_eq!(count, usize::from(!potion_first));
+                    assert_eq!(
+                        other.items[4],
+                        if !potion_first && !vault_exchange {
+                            kind
+                        } else {
+                            target.items[4]
+                        }
+                    );
+                    assert_eq!(
+                        chest.items[0],
+                        if !potion_first && vault_exchange {
+                            kind
+                        } else {
+                            -1
+                        }
+                    );
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn prepared_priest_does_not_grant_unlocks_or_replace_a_character() {
+        let content = Content::load(Path::new("data")).unwrap();
+        let store = Store::open(Path::new(":memory:"), &content).unwrap();
+        let account = store.list("prepared-priest-only".into()).await.unwrap();
+        assert!(
+            store
+                .create(account.id, content.get(PRIEST).unwrap())
+                .await
+                .is_err()
+        );
+        let priest = store
+            .create_prepared(
+                account.id,
+                content.get(PRIEST).unwrap(),
+                Some("Juniper".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!((priest.class, priest.name.as_str()), (PRIEST, "Juniper"));
+        assert!(
+            store
+                .create(account.id, content.get(PRIEST).unwrap())
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .create_prepared(account.id, content.get(WIZARD).unwrap(), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .list("prepared-priest-only".into())
+                .await
+                .unwrap()
+                .characters
+                .len(),
+            1
+        );
+        let mut dead = priest.clone();
+        dead.hp = 0;
+        dead.alive = false;
+        store
+            .death(dead, "prepared retry regression".into())
+            .await
+            .unwrap();
+        let replacement = store
+            .create_prepared(account.id, content.get(PRIEST).unwrap(), None)
+            .await
+            .unwrap();
+        assert_ne!(replacement.id, priest.id);
+        assert!(
+            !store
+                .character_alive(priest.id, "prepared-priest-only".into())
+                .await
+                .unwrap()
+        );
+        assert!(store.load(account.id, priest.id).await.is_err());
+    }
+    #[tokio::test]
     async fn cooperative_progress_batch_rolls_back_every_stale_participant() {
         let content = Content::load(Path::new("data")).unwrap();
         let s = Store::open(Path::new(":memory:"), &content).unwrap();
@@ -691,6 +1025,7 @@ mod tests {
                 .unwrap();
             ch.exp = 49;
             ch.pirate_caves = 1;
+            ch.dungeons = [1, 2, 3];
             characters.push(ch);
         }
         characters[1].revision = 1;
@@ -699,6 +1034,7 @@ mod tests {
             let saved = s.load(ch.account, ch.id).await.unwrap();
             assert_eq!(saved.exp, 0);
             assert_eq!(saved.pirate_caves, 0);
+            assert_eq!(saved.dungeons, [0; 3]);
         }
         characters[1].revision = 0;
         s.progress_batch(characters.clone()).await.unwrap();
@@ -706,16 +1042,20 @@ mod tests {
             let mut saved = s.load(ch.account, ch.id).await.unwrap();
             assert_eq!(saved.exp, 49);
             assert_eq!(saved.pirate_caves, 1);
+            assert_eq!(saved.dungeons, [1, 2, 3]);
             saved.alive = false;
             saved.hp = 0;
             saved.items.fill(-1);
             s.death(saved, "test clear snapshot".into()).await.unwrap();
-            assert!(
-                s.fame(ch.account, ch.id)
-                    .await
-                    .unwrap()
-                    .contains("<PirateCavesCompleted>1</PirateCavesCompleted>")
-            );
+            let fame = s.fame(ch.account, ch.id).await.unwrap();
+            for counter in [
+                "<PirateCavesCompleted>1</PirateCavesCompleted>",
+                "<SnakePitsCompleted>1</SnakePitsCompleted>",
+                "<SpriteWorldsCompleted>2</SpriteWorldsCompleted>",
+                "<UndeadLairsCompleted>3</UndeadLairsCompleted>",
+            ] {
+                assert!(fame.contains(counter));
+            }
         }
     }
     #[tokio::test]
