@@ -519,6 +519,18 @@ async fn handle(
         expected,
         reconnecting,
     } = session;
+    if *reconnecting
+        && matches!(
+            packet.id,
+            7 | 14 | 16 | 22 | 24 | 38 | 42 | 51 | 59 | 66 | 76
+        )
+    {
+        tracing::debug!(
+            packet = packet.id,
+            "discarded in-flight input after durable departure"
+        );
+        return Ok(());
+    }
     ensure!(!*reconnecting, "session is transferring");
     if let Some(id) = *player
         && matches!(packet.id, 7 | 38 | 30 | 65 | 33 | 42 | 3)
@@ -874,8 +886,10 @@ async fn handle(
             }
         }
         22 => {
-            r.i32()?;
+            let time = r.i32()?;
             r.done()?;
+            let id = player.context("SHOOT ACK before character")?;
+            a.world.call(move |w| w.acknowledge_shoot(id, time)).await?;
         }
         76 => {
             r.i32()?;
@@ -885,9 +899,13 @@ async fn handle(
             r.done()?;
         }
         24 => {
-            r.u8()?;
-            r.i32()?;
+            let bullet = r.u8()?;
+            let owner = r.i32()?;
             r.done()?;
+            let id = player.context("hit report before character")?;
+            a.world
+                .call(move |w| w.native_player_hit(id, owner, bullet))
+                .await?;
         }
         59 => {
             player.context("area acknowledgement before character")?;
@@ -1010,14 +1028,24 @@ async fn handle(
             let portal = if packet.id == 3 { Some(r.i32()?) } else { None };
             r.done()?;
             let id = player.context("transfer before character")?;
-            let (destination, keytime, key, name) = a
+            let transfer = a
                 .world
                 .directory(move |d| {
+                    if portal.is_none() && d.location(id)? == -2 {
+                        tracing::debug!(
+                            player = id,
+                            "redundant Nexus escape acknowledged without transfer"
+                        );
+                        return Ok(None);
+                    }
                     let (account, character, destination) = d.destination(id, portal)?;
                     let (keytime, key, name) = d.issue(account, character, destination)?;
-                    Ok((destination, keytime, key, name))
+                    Ok(Some((destination, keytime, key, name)))
                 })
                 .await?;
+            let Some((destination, keytime, key, name)) = transfer else {
+                return Ok(());
+            };
             depart(a, id).await?;
             *player = None;
             let mut o = Writer::new();
