@@ -32,6 +32,8 @@ mod mechanics_tests;
 mod native_hits;
 #[cfg(test)]
 mod native_hits_tests;
+#[cfg(test)]
+mod quiver_tests;
 mod reconciliation;
 #[cfg(test)]
 mod reconciliation_tests;
@@ -156,6 +158,7 @@ pub struct Player {
     discarded_attack: Option<(i32, i32)>,
     tick: i32,
     last_ability: u64,
+    quiver_shot: Option<(u16, i32, bool)>,
 }
 impl Player {
     pub(crate) fn native_time(&self) -> i32 {
@@ -1313,6 +1316,7 @@ impl World {
                 discarded_attack: None,
                 tick: 0,
                 last_ability: 0,
+                quiver_shot: None,
             },
         );
         let mut o = Writer::new();
@@ -1808,7 +1812,11 @@ impl World {
             angle,
             "native SHOOT ingress"
         );
-        if self.discard_correcting_shot(id, time, bullet, kind, start, angle)? {
+        let quiver = self
+            .players
+            .get(&id)
+            .is_some_and(|p| matches!(p.quiver_shot, Some((k, t, _)) if k == kind && t == time));
+        if !quiver && self.discard_correcting_shot(id, time, bullet, kind, start, angle)? {
             return Ok(NativeInput::DiscardedUntilGotoAck);
         }
         let outcome = self.shoot_timed(id, (time, received, true), bullet, kind, start, angle)?;
@@ -1851,13 +1859,15 @@ impl World {
             "dead, departing or quarantined player cannot shoot"
         );
 
+        let quiver = native && matches!(p.quiver_shot, Some((k, t, _)) if k == kind && t == time);
+        let denied_quiver = quiver && matches!(p.quiver_shot, Some((_, _, false)));
         ensure!(
-            p.character.items[0] == kind as i32,
+            p.character.items[0] == kind as i32 || quiver && p.character.items[1] == kind as i32,
             "weapon does not match equipped item"
         );
         let item = self.content.get(kind)?;
         ensure!(item.shots > 0, "weapon projectile count is zero");
-        let shot_index = if time == p.last_attack {
+        let shot_index = if !quiver && time == p.last_attack {
             p.attack_count
         } else {
             0
@@ -1879,13 +1889,14 @@ impl World {
             Ok(0.)
         };
         // Drop stale predicted shots for one MOVE time-jump window around movement changes.
-        let displaced = origin.is_err()
-            && (condition & PARALYZED != 0
-                || p.statuses.iter().any(|(effect, (since, until))| {
-                    crate::condition::bit(*effect) & (SLOWED | SPEEDY | PARALYZED) != 0
-                        && (self.now - since < 1000
-                            || self.now >= *until && self.now - until < 1000)
-                }));
+        let displaced = quiver && p.correcting()?
+            || origin.is_err()
+                && (condition & PARALYZED != 0
+                    || p.statuses.iter().any(|(effect, (since, until))| {
+                        crate::condition::bit(*effect) & (SLOWED | SPEEDY | PARALYZED) != 0
+                            && (self.now - since < 1000
+                                || self.now >= *until && self.now - until < 1000)
+                    }));
         if !displaced {
             origin.with_context(|| RejectedNativeShot(format!("invalid shot origin: player=({}, {}) origin=({}, {}) angle={} shot_time={} move_time={} server_time={} last_move_at={}", p.pos.x, p.pos.y, start.x, start.y, angle, time, p.last_move, self.now, p.last_move_at)))?;
         }
@@ -1904,7 +1915,7 @@ impl World {
         ensure!(time >= 0, "negative shot time");
         ensure!(shot_index < item.shots, "too many projectiles in attack");
         ensure!(bullet == p.next_bullet, "unexpected player bullet counter");
-        if time != p.last_attack {
+        if !quiver && time != p.last_attack {
             let attack_elapsed = i64::from(time) - i64::from(p.last_attack);
             ensure!(attack_elapsed >= admission as i64 - 2, "attack too fast");
             let elapsed = received
@@ -1940,21 +1951,32 @@ impl World {
             p.attack_count = 0;
         }
         p.next_bullet = (bullet + 1) % 128;
-        p.attack_count += 1;
+        if quiver {
+            p.quiver_shot = None;
+        } else {
+            p.attack_count += 1;
+        }
         let draw = p.roll_damage(&spec);
         // In-flight native SHOOT packets must still consume their counter/RNG draw.
-        if p.paused || condition & STUNNED != 0 || displaced || p.attack_suppressed.is_some() {
+        if p.paused
+            || displaced
+            || denied_quiver
+            || !quiver && (condition & STUNNED != 0 || p.attack_suppressed.is_some())
+        {
             tracing::debug!(
                 player = id,
                 condition,
                 displaced,
+                denied_quiver,
                 suppressed = ?p.attack_suppressed,
                 "condition suppressed shot"
             );
             return Ok(NativeInput::Applied);
         }
         p.character.shots += 1;
-        let multiplier = if condition & crate::condition::bit(crate::condition::WEAK) != 0 {
+        let multiplier = if quiver {
+            1.
+        } else if condition & crate::condition::bit(crate::condition::WEAK) != 0 {
             0.5
         } else {
             0.5 + 1.5 * p.character.effective(&self.content)?[2] as f32 / 75.
@@ -1982,6 +2004,30 @@ impl World {
         }
         tracing::debug!(player = id, bullet, damage, "player shot");
         Ok(NativeInput::Applied)
+    }
+    pub fn native_use_item(
+        &mut self,
+        id: i32,
+        time: i32,
+        slot: Slot,
+        pos: Pos,
+    ) -> Result<Option<InventoryPlan>> {
+        let quiver = slot.kind >= 0
+            && slot.slot == 1
+            && slot.object == id
+            && self
+                .players
+                .get(&id)
+                .is_some_and(|p| p.character.items[1] == slot.kind)
+            && self.content.get(slot.kind as u16)?.activate == "Shoot";
+        ensure!(!quiver || time >= 0, "negative quiver time");
+        let plan = self.use_item(id, slot, pos);
+        if quiver {
+            // Even rejected local predictions consume a native bullet ID and damage RNG draw.
+            self.players.get_mut(&id).unwrap().quiver_shot =
+                Some((slot.kind as u16, time, plan.is_ok()));
+        }
+        plan
     }
     pub fn use_item(&mut self, id: i32, slot: Slot, pos: Pos) -> Result<Option<InventoryPlan>> {
         self.cancel_trade(id, "Trade cancelled by inventory mutation.");
@@ -2065,6 +2111,36 @@ impl World {
                 self.heal_nova(id, slot, &item)?;
                 Ok(None)
             }
+            "Shoot" if item.slot_type == 15 && item.tier.is_some() => {
+                ensure!(
+                    p.controller == Controller::Human,
+                    "quivers require native projectile reports"
+                );
+                ensure!(
+                    item.shots == 1 && item.activations == 1,
+                    "unsupported quiver projectile layout"
+                );
+                ensure!(
+                    slot.slot == 1
+                        && item.slot_type == self.content.get(p.character.class)?.slots[1],
+                    "ability must be equipped by a compatible class"
+                );
+                ensure!(
+                    p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET) == 0,
+                    "cannot cast while Quiet"
+                );
+                ensure!(p.character.mp >= item.mana_cost, "not enough mana");
+                ensure!(
+                    self.now >= p.last_ability + item.cooldown_ms,
+                    "ability cooldown"
+                );
+                ensure!(p.pos.distance(pos) <= 15., "ability target too far");
+                let p = self.players.get_mut(&id).unwrap();
+                p.character.mp -= item.mana_cost;
+                p.last_ability = self.now;
+                tracing::info!(player = id, item = item.kind, "quiver activated");
+                Ok(None)
+            }
             "BulletNova" => {
                 ensure!(
                     slot.slot == 1
@@ -2085,7 +2161,7 @@ impl World {
                     .projectiles
                     .get(&0)
                     .cloned()
-                    .context("spell has no projectile zero")?;
+                    .context("ability has no projectile zero")?;
                 let p = self.players.get_mut(&id).unwrap();
                 p.character.mp -= item.mana_cost;
                 p.last_ability = self.now;

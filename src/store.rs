@@ -1,4 +1,4 @@
-use crate::content::{Class, Content, Object, PRIEST, WIZARD};
+use crate::content::{ARCHER, Class, Content, Object, PRIEST, WIZARD};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -411,7 +411,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
     }
     pub async fn create(&self, account: i32, class: &Object) -> Result<Character> {
         ensure!(
-            matches!(class.kind, WIZARD | PRIEST) && class.class == "Player",
+            matches!(class.kind, WIZARD | PRIEST | ARCHER) && class.class == "Player",
             "playable class is not implemented"
         );
         let requirements = self
@@ -444,7 +444,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         creation: Creation,
     ) -> Result<Character> {
         ensure!(
-            matches!(class.kind, WIZARD | PRIEST) && class.class == "Player",
+            matches!(class.kind, WIZARD | PRIEST | ARCHER) && class.class == "Player",
             "playable class is not implemented"
         );
         let kind = class.kind;
@@ -1253,6 +1253,45 @@ mod tests {
         assert_eq!(
             (loaded.class, loaded.level, loaded.base, loaded.items),
             (PRIEST, next.level, next.base, next.items)
+        );
+        assert!(s.create(a.id, c.get(0x0300).unwrap()).await.is_err());
+    }
+    #[tokio::test]
+    async fn archer_requires_priest_level_five_and_preserves_starter_gear_and_save() {
+        let c = Content::load(Path::new("data")).unwrap();
+        let s = Store::open(Path::new(":memory:"), &c).unwrap();
+        let a = s.list("archer-unlock".into()).await.unwrap();
+        assert!(s.create(a.id, c.get(ARCHER).unwrap()).await.is_err());
+        let mut priest = s
+            .create_prepared(a.id, c.get(PRIEST).unwrap(), None)
+            .await
+            .unwrap();
+        priest.level = 4;
+        priest.exp = level_start(4).unwrap();
+        s.progress(priest.clone()).await.unwrap();
+        assert!(
+            s.create(a.id, c.get(ARCHER).unwrap())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("locked")
+        );
+        priest.level = 5;
+        priest.exp = level_start(5).unwrap();
+        s.progress(priest.clone()).await.unwrap();
+        assert!(s.create(a.id, c.get(ARCHER).unwrap()).await.is_err());
+        priest.hp = 0;
+        priest.alive = false;
+        s.death(priest, "ordinary death fixture".into())
+            .await
+            .unwrap();
+        let archer = s.create(a.id, c.get(ARCHER).unwrap()).await.unwrap();
+        assert_eq!(archer.base, c.classes[&ARCHER].base);
+        assert_eq!(archer.items, c.get(ARCHER).unwrap().equipment);
+        let loaded = s.load(a.id, archer.id).await.unwrap();
+        assert_eq!(
+            (loaded.class, loaded.level, loaded.mp, loaded.items),
+            (ARCHER, 1, archer.mp, archer.items)
         );
         assert!(s.create(a.id, c.get(0x0300).unwrap()).await.is_err());
     }
