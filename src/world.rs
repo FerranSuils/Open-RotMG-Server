@@ -15,6 +15,7 @@ use std::{
     time::Instant,
 };
 use tokio::sync::{mpsc, oneshot, watch};
+mod abilities;
 mod chat;
 mod endgame;
 mod endgame_ai;
@@ -23,6 +24,8 @@ pub(crate) use chat::{chat_error, chat_info, chat_private, validate as validate_
 pub use endgame::ForcedTransfer;
 #[cfg(test)]
 mod bot_tests;
+#[cfg(test)]
+mod class_tests;
 mod cooperative;
 #[cfg(test)]
 mod cooperative_tests;
@@ -157,8 +160,8 @@ pub struct Player {
     goto_acks: VecDeque<(bool, Instant)>,
     discarded_attack: Option<(i32, i32)>,
     tick: i32,
-    last_ability: u64,
-    quiver_shot: Option<(u16, i32, bool)>,
+    last_ability: Option<u64>,
+    ability_shot: Option<(u16, i32, bool, i32)>,
 }
 impl Player {
     pub(crate) fn native_time(&self) -> i32 {
@@ -1315,8 +1318,8 @@ impl World {
                 goto_acks: VecDeque::new(),
                 discarded_attack: None,
                 tick: 0,
-                last_ability: 0,
-                quiver_shot: None,
+                last_ability: None,
+                ability_shot: None,
             },
         );
         let mut o = Writer::new();
@@ -1812,11 +1815,10 @@ impl World {
             angle,
             "native SHOOT ingress"
         );
-        let quiver = self
-            .players
-            .get(&id)
-            .is_some_and(|p| matches!(p.quiver_shot, Some((k, t, _)) if k == kind && t == time));
-        if !quiver && self.discard_correcting_shot(id, time, bullet, kind, start, angle)? {
+        let ability = self.players.get(&id).is_some_and(
+            |p| matches!(p.ability_shot, Some((k, t, _, _)) if k == kind && t == time),
+        );
+        if !ability && self.discard_correcting_shot(id, time, bullet, kind, start, angle)? {
             return Ok(NativeInput::DiscardedUntilGotoAck);
         }
         let outcome = self.shoot_timed(id, (time, received, true), bullet, kind, start, angle)?;
@@ -1859,15 +1861,18 @@ impl World {
             "dead, departing or quarantined player cannot shoot"
         );
 
-        let quiver = native && matches!(p.quiver_shot, Some((k, t, _)) if k == kind && t == time);
-        let denied_quiver = quiver && matches!(p.quiver_shot, Some((_, _, false)));
+        let ability =
+            native && matches!(p.ability_shot, Some((k, t, _, _)) if k == kind && t == time);
+        let denied_ability = ability && matches!(p.ability_shot, Some((_, _, false, _)));
         ensure!(
-            p.character.items[0] == kind as i32 || quiver && p.character.items[1] == kind as i32,
+            p.character.items[0] == kind as i32 || ability && p.character.items[1] == kind as i32,
             "weapon does not match equipped item"
         );
         let item = self.content.get(kind)?;
         ensure!(item.shots > 0, "weapon projectile count is zero");
-        let shot_index = if !quiver && time == p.last_attack {
+        let shot_index = if ability {
+            p.ability_shot.unwrap().3
+        } else if time == p.last_attack {
             p.attack_count
         } else {
             0
@@ -1889,7 +1894,7 @@ impl World {
             Ok(0.)
         };
         // Drop stale predicted shots for one MOVE time-jump window around movement changes.
-        let displaced = quiver && p.correcting()?
+        let displaced = ability && p.correcting()?
             || origin.is_err()
                 && (condition & PARALYZED != 0
                     || p.statuses.iter().any(|(effect, (since, until))| {
@@ -1908,14 +1913,29 @@ impl World {
         // The selected client's integer attack period cannot fund a fractional charge indefinitely.
         let frequency =
             0.0015 + (0.008 - 0.0015) * p.character.effective(&self.content)?[5] as f64 / 75.;
-        let normal_cooldown = (1. / frequency / f64::from(item.rate)).floor() as f32;
-        let cooldown = reconciliation::attack_cooldown(p, &self.content, self.now, item.rate)?;
+        // Expired buffs remain for the existing one-second native transition window.
+        let late_berserk = native
+            && p.statuses
+                .get(&crate::condition::BERSERK)
+                .is_some_and(|(_, until)| self.now >= *until && self.now - until < 1000);
+        let berserk =
+            condition & crate::condition::bit(crate::condition::BERSERK) != 0 || late_berserk;
+        let normal_cooldown =
+            (1. / frequency / f64::from(item.rate) / if berserk { 1.5 } else { 1. }).floor() as f32;
+        let effective_cooldown =
+            reconciliation::attack_cooldown(p, &self.content, self.now, item.rate)?;
+        let cooldown =
+            if late_berserk && condition & crate::condition::bit(crate::condition::DAZED) == 0 {
+                normal_cooldown
+            } else {
+                effective_cooldown
+            };
         let admission = if native { normal_cooldown } else { cooldown };
         let p = self.players.get_mut(&id).unwrap();
         ensure!(time >= 0, "negative shot time");
         ensure!(shot_index < item.shots, "too many projectiles in attack");
         ensure!(bullet == p.next_bullet, "unexpected player bullet counter");
-        if !quiver && time != p.last_attack {
+        if !ability && time != p.last_attack {
             let attack_elapsed = i64::from(time) - i64::from(p.last_attack);
             ensure!(attack_elapsed >= admission as i64 - 2, "attack too fast");
             let elapsed = received
@@ -1951,8 +1971,12 @@ impl World {
             p.attack_count = 0;
         }
         p.next_bullet = (bullet + 1) % 128;
-        if quiver {
-            p.quiver_shot = None;
+        if ability {
+            if shot_index + 1 == item.shots {
+                p.ability_shot = None;
+            } else {
+                p.ability_shot.as_mut().unwrap().3 += 1;
+            }
         } else {
             p.attack_count += 1;
         }
@@ -1960,26 +1984,31 @@ impl World {
         // In-flight native SHOOT packets must still consume their counter/RNG draw.
         if p.paused
             || displaced
-            || denied_quiver
-            || !quiver && (condition & STUNNED != 0 || p.attack_suppressed.is_some())
+            || denied_ability
+            || !ability && (condition & STUNNED != 0 || p.attack_suppressed.is_some())
         {
             tracing::debug!(
                 player = id,
                 condition,
                 displaced,
-                denied_quiver,
+                denied_ability,
                 suppressed = ?p.attack_suppressed,
                 "condition suppressed shot"
             );
             return Ok(NativeInput::Applied);
         }
         p.character.shots += 1;
-        let multiplier = if quiver {
+        let multiplier = if ability {
             1.
         } else if condition & crate::condition::bit(crate::condition::WEAK) != 0 {
             0.5
         } else {
-            0.5 + 1.5 * p.character.effective(&self.content)?[2] as f32 / 75.
+            (0.5 + 1.5 * p.character.effective(&self.content)?[2] as f32 / 75.)
+                * if condition & crate::condition::bit(crate::condition::DAMAGING) != 0 {
+                    1.5
+                } else {
+                    1.
+                }
         };
         let damage = (draw as f32 * multiplier) as i32;
         self.bullets.push(Bullet {
@@ -2012,7 +2041,7 @@ impl World {
         slot: Slot,
         pos: Pos,
     ) -> Result<Option<InventoryPlan>> {
-        let quiver = slot.kind >= 0
+        let ability = slot.kind >= 0
             && slot.slot == 1
             && slot.object == id
             && self
@@ -2020,12 +2049,16 @@ impl World {
                 .get(&id)
                 .is_some_and(|p| p.character.items[1] == slot.kind)
             && self.content.get(slot.kind as u16)?.activate == "Shoot";
-        ensure!(!quiver || time >= 0, "negative quiver time");
+        ensure!(!ability || time >= 0, "negative ability time");
+        ensure!(
+            !ability || (1..=5).contains(&self.content.get(slot.kind as u16)?.shots),
+            "unsupported native ability projectile count"
+        );
         let plan = self.use_item(id, slot, pos);
-        if quiver {
+        if ability {
             // Even rejected local predictions consume a native bullet ID and damage RNG draw.
-            self.players.get_mut(&id).unwrap().quiver_shot =
-                Some((slot.kind as u16, time, plan.is_ok()));
+            self.players.get_mut(&id).unwrap().ability_shot =
+                Some((slot.kind as u16, time, plan.is_ok(), 0));
         }
         plan
     }
@@ -2111,60 +2144,30 @@ impl World {
                 self.heal_nova(id, slot, &item)?;
                 Ok(None)
             }
-            "Shoot" if item.slot_type == 15 && item.tier.is_some() => {
+            "ConditionEffectSelf" | "ConditionEffectAura" => {
+                self.condition_ability(id, slot, &item, pos)?;
+                Ok(None)
+            }
+            "Shoot" if matches!(item.slot_type, 5 | 15) && item.tier.is_some() => {
                 ensure!(
                     p.controller == Controller::Human,
-                    "quivers require native projectile reports"
+                    "projectile abilities require native reports"
                 );
                 ensure!(
-                    item.shots == 1 && item.activations == 1,
-                    "unsupported quiver projectile layout"
+                    (1..=5).contains(&item.shots) && item.activations == 1,
+                    "unsupported ability projectile layout"
                 );
-                ensure!(
-                    slot.slot == 1
-                        && item.slot_type == self.content.get(p.character.class)?.slots[1],
-                    "ability must be equipped by a compatible class"
-                );
-                ensure!(
-                    p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET) == 0,
-                    "cannot cast while Quiet"
-                );
-                ensure!(p.character.mp >= item.mana_cost, "not enough mana");
-                ensure!(
-                    self.now >= p.last_ability + item.cooldown_ms,
-                    "ability cooldown"
-                );
-                ensure!(p.pos.distance(pos) <= 15., "ability target too far");
-                let p = self.players.get_mut(&id).unwrap();
-                p.character.mp -= item.mana_cost;
-                p.last_ability = self.now;
-                tracing::info!(player = id, item = item.kind, "quiver activated");
+                self.spend_ability(id, slot, &item, pos)?;
                 Ok(None)
             }
             "BulletNova" => {
-                ensure!(
-                    slot.slot == 1
-                        && item.slot_type == self.content.get(p.character.class)?.slots[1],
-                    "ability must be equipped by a compatible class"
-                );
-                ensure!(
-                    p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET) == 0,
-                    "cannot cast while Quiet"
-                );
-                ensure!(p.character.mp >= item.mana_cost, "not enough mana");
-                ensure!(
-                    self.now >= p.last_ability + item.cooldown_ms,
-                    "ability cooldown"
-                );
-                ensure!(p.pos.distance(pos) <= 15., "ability target too far");
                 let spec = item
                     .projectiles
                     .get(&0)
                     .cloned()
                     .context("ability has no projectile zero")?;
+                self.spend_ability(id, slot, &item, pos)?;
                 let p = self.players.get_mut(&id).unwrap();
-                p.character.mp -= item.mana_cost;
-                p.last_ability = self.now;
                 p.character.shots += 20;
                 let mut messages = Vec::new();
                 for i in 0..20 {
@@ -3040,7 +3043,15 @@ impl World {
             let nearest = self
                 .players
                 .values()
-                .filter(|p| p.character.alive && !p.death_pending && !p.departing && !p.paused)
+                .filter(|p| {
+                    p.character.alive
+                        && !p.death_pending
+                        && !p.departing
+                        && !p.paused
+                        && p.conditions(self.now)
+                            & crate::condition::bit(crate::condition::INVISIBLE)
+                            == 0
+                })
                 .min_by(|a, b| pos.distance(a.pos).total_cmp(&pos.distance(b.pos)))
                 .map(|p| p.pos);
             let wake = match kind {
@@ -3299,13 +3310,21 @@ impl World {
             let flags = p.conditions(self.now);
             p.statuses
                 .retain(|_, (_, deadline)| deadline.saturating_add(1000) > self.now);
-            if p.character.hp < values[0]
-                && flags
-                    & (crate::condition::bit(crate::condition::SICK)
-                        | crate::condition::bit(crate::condition::BLEEDING))
-                    == 0
+            let regeneration = if flags & crate::condition::bit(crate::condition::BLEEDING) != 0 {
+                0.
+            } else {
+                1. + values[6] as f32 / 8.
+            } + if flags & crate::condition::bit(crate::condition::HEALING) != 0
             {
-                p.hp_fraction += (1. + values[6] as f32 / 8.) * 0.05;
+                20.
+            } else {
+                0.
+            };
+            if p.character.hp < values[0]
+                && regeneration > 0.
+                && flags & crate::condition::bit(crate::condition::SICK) == 0
+            {
+                p.hp_fraction += regeneration * 0.05;
                 let n = p.hp_fraction as i32;
                 p.character.hp = (p.character.hp + n).min(values[0]);
                 p.hp_fraction -= n as f32;

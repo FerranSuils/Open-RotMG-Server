@@ -27,7 +27,12 @@ pub(super) fn attack_cooldown(
     let rate = if p.conditions(now) & crate::condition::bit(crate::condition::DAZED) != 0 {
         0.0015
     } else {
-        0.0015 + (0.008 - 0.0015) * p.character.effective(content)?[5] as f64 / 75.
+        let base = 0.0015 + (0.008 - 0.0015) * p.character.effective(content)?[5] as f64 / 75.;
+        base * if p.conditions(now) & crate::condition::bit(crate::condition::BERSERK) != 0 {
+            1.5
+        } else {
+            1.
+        }
     };
     // Ruffle's integer attack period must not accumulate fractional server charges.
     Ok((1. / (rate * f64::from(item_rate))).floor() as f32)

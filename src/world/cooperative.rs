@@ -211,7 +211,8 @@ impl World {
         );
         ensure!(p.character.mp >= item.mana_cost, "Not enough mana to heal.");
         ensure!(
-            self.now >= p.last_ability + item.cooldown_ms,
+            p.last_ability
+                .is_none_or(|last| self.now >= last + item.cooldown_ms),
             "Healing ability cooldown."
         );
         let position = p.pos;
@@ -243,7 +244,7 @@ impl World {
         });
         let p = self.players.get_mut(&id).unwrap();
         p.character.mp -= item.mana_cost;
-        p.last_ability = self.now;
+        p.last_ability = Some(self.now);
         for (target, amount) in &healing {
             self.players.get_mut(target).unwrap().character.hp += amount;
             if *amount > 0 {

@@ -1,4 +1,6 @@
-use crate::content::{ARCHER, Class, Content, Object, PRIEST, WIZARD};
+use crate::content::{
+    ARCHER, Class, Content, KNIGHT, Object, PALADIN, PRIEST, ROGUE, WARRIOR, WIZARD,
+};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -411,7 +413,10 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
     }
     pub async fn create(&self, account: i32, class: &Object) -> Result<Character> {
         ensure!(
-            matches!(class.kind, WIZARD | PRIEST | ARCHER) && class.class == "Player",
+            matches!(
+                class.kind,
+                WIZARD | PRIEST | ARCHER | ROGUE | WARRIOR | KNIGHT | PALADIN
+            ) && class.class == "Player",
             "playable class is not implemented"
         );
         let requirements = self
@@ -444,7 +449,10 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         creation: Creation,
     ) -> Result<Character> {
         ensure!(
-            matches!(class.kind, WIZARD | PRIEST | ARCHER) && class.class == "Player",
+            matches!(
+                class.kind,
+                WIZARD | PRIEST | ARCHER | ROGUE | WARRIOR | KNIGHT | PALADIN
+            ) && class.class == "Player",
             "playable class is not implemented"
         );
         let kind = class.kind;
@@ -1254,7 +1262,7 @@ mod tests {
             (loaded.class, loaded.level, loaded.base, loaded.items),
             (PRIEST, next.level, next.base, next.items)
         );
-        assert!(s.create(a.id, c.get(0x0300).unwrap()).await.is_err());
+        assert!(s.create(a.id, c.get(0x0320).unwrap()).await.is_err());
     }
     #[tokio::test]
     async fn archer_requires_priest_level_five_and_preserves_starter_gear_and_save() {
@@ -1293,7 +1301,64 @@ mod tests {
             (loaded.class, loaded.level, loaded.mp, loaded.items),
             (ARCHER, 1, archer.mp, archer.items)
         );
-        assert!(s.create(a.id, c.get(0x0300).unwrap()).await.is_err());
+        assert!(s.create(a.id, c.get(0x0320).unwrap()).await.is_err());
+    }
+    #[tokio::test]
+    async fn four_classes_preserve_normal_unlock_death_starter_and_save_rules() {
+        let c = Content::load(Path::new("data")).unwrap();
+        let s = Store::open(Path::new(":memory:"), &c).unwrap();
+        for (class, requirements) in [
+            (ROGUE, vec![(ARCHER, 5)]),
+            (WARRIOR, vec![(ROGUE, 5)]),
+            (KNIGHT, vec![(WARRIOR, 20)]),
+            (PALADIN, vec![(KNIGHT, 20), (PRIEST, 20)]),
+        ] {
+            assert_eq!(c.classes[&class].requires, requirements);
+            let a = s.list(format!("class-unlock-{class}")).await.unwrap();
+            assert!(
+                s.create(a.id, c.get(class).unwrap())
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("locked")
+            );
+            for (prior, level) in requirements {
+                let mut previous = s
+                    .create_prepared(a.id, c.get(prior).unwrap(), None)
+                    .await
+                    .unwrap();
+                previous.level = level - 1;
+                previous.exp = level_start(level - 1).unwrap();
+                s.progress(previous.clone()).await.unwrap();
+                assert!(
+                    s.create(a.id, c.get(class).unwrap())
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("locked")
+                );
+                previous.level = level;
+                previous.exp = level_start(level).unwrap();
+                s.progress(previous.clone()).await.unwrap();
+                assert!(s.create(a.id, c.get(class).unwrap()).await.is_err());
+                previous.alive = false;
+                previous.hp = 0;
+                s.death(previous, "ordinary death fixture".into())
+                    .await
+                    .unwrap();
+            }
+            let created = s.create(a.id, c.get(class).unwrap()).await.unwrap();
+            let loaded = s.load(a.id, created.id).await.unwrap();
+            assert_eq!(
+                (loaded.class, loaded.level, loaded.base, loaded.items),
+                (
+                    class,
+                    1,
+                    c.classes[&class].base,
+                    c.get(class).unwrap().equipment.clone()
+                )
+            );
+        }
     }
     #[tokio::test]
     async fn equipment_derives_stats_without_stacking_or_backpack_bonuses() {
