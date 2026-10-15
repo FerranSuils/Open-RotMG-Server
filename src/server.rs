@@ -916,7 +916,7 @@ async fn handle(
         }
         66 | 51 => collision_report(packet.id == 66, &mut r)?,
         30 => {
-            r.i32()?;
+            let time = r.i32()?;
             let s = slot(&mut r)?;
             let pos = Pos {
                 x: r.f32()?,
@@ -924,7 +924,11 @@ async fn handle(
             };
             r.done()?;
             let id = player.context("item use before character")?;
-            match a.world.call(move |w| w.use_item(id, s, pos)).await {
+            match a
+                .world
+                .call(move |w| w.native_use_item(id, time, s, pos))
+                .await
+            {
                 Ok(Some(plan)) => persist(a, plan).await?,
                 Ok(None) => {}
                 Err(error) => {
