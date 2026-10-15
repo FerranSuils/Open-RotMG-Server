@@ -120,6 +120,8 @@ class UpdateTest(unittest.TestCase):
             root = Path(tmp)
             stage = root / 'stage'
             (stage / 'scripts/backups').mkdir(parents=True)
+            (stage / 'data').mkdir()
+            (stage / 'data/objects.xml').write_text('matching release data')
             for name in ['backup.py', 'openrotmg-backup.sh']:
                 (stage / 'scripts/backups' / name).write_text(name)
             tools = root / 'tools'
@@ -131,6 +133,7 @@ class UpdateTest(unittest.TestCase):
                     update.install_backups(stage)
                     self.assertEqual((tools / 'current').resolve(), tools / 'releases' / revision)
                 self.assertEqual((tools / 'releases' / ('a' * 40) / 'openrotmg').read_text(), 'a' * 40)
+                self.assertEqual((tools / 'current/data/objects.xml').read_text(), 'matching release data')
                 (tools / 'current/openrotmg').write_text('tampered')
                 with self.assertRaisesRegex(RuntimeError, 'differs from release'):
                     update.install_backups(stage)
