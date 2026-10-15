@@ -146,11 +146,13 @@ def install_backups(stage):
     bundle = releases / revision
     sources = {'backup.py': stage / 'scripts/backups/backup.py', 'openrotmg': stage / 'openrotmg',
                'REVISION': stage / 'REVISION', 'openrotmg-backup.sh': stage / 'scripts/backups/openrotmg-backup.sh'}
+    sources.update({str(path.relative_to(stage)): path for path in (stage / 'data').rglob('*') if path.is_file()})
     if not bundle.exists():
         temporary = releases / (revision + '.new')
         temporary.mkdir()
         for name, source in sources.items():
             target = temporary / name
+            target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(source.read_bytes())
             target.chmod(0o755 if name in {'openrotmg', 'openrotmg-backup.sh'} else 0o644)
         temporary.rename(bundle)
@@ -198,7 +200,8 @@ def rehearse(stage, work, config):
                            stage / 'REVISION', '/opt/openrotmg-discord-bot/REVISION', stage / 'REVISION')
     restored = work / 'restored'
     module.restore(archive, restored)
-    require(module.snapshot(restored / 'game.db', module.GAME_SCHEMAS[bundle['schema']]) == bundle['game']
+    run(str(stage / 'openrotmg'), '--backup-load', str(restored / 'game.db'), str(stage / 'data'))
+    require(module.snapshot(restored / 'game.db', [*module.GAME_SCHEMAS.values(), module.AUTH_SOCIAL_GAME]) == bundle['game']
             and module.snapshot(restored / 'levels.sqlite', module.DISCORD) == bundle['discord'], 'Credential-free restore mismatch')
 
 
