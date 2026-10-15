@@ -85,7 +85,9 @@ def main():
     parser = argparse.ArgumentParser(prog="run.sh", description="Download the client and start your local OpenRotMG game.")
     parser.add_argument("port", type=port_number, help="Local server port")
     parser.add_argument("--client", "--local-client", dest="local_client", type=Path, metavar="DIR", help="Use your own client checkout instead of downloading the pinned client")
-    parser.add_argument("--state", type=Path, default=ROOT / ".local", metavar="DIR", help="Isolate saves, keys, client cache and logs in this directory")
+    states = parser.add_mutually_exclusive_group()
+    states.add_argument("--state", type=Path, default=ROOT / ".local", metavar="DIR", help="Isolate saves, keys, client cache and logs in this directory")
+    states.add_argument("--test-state", type=Path, metavar="DIR", help="Create new PREPARED test state with local controls; refuses an existing game database")
     parser.add_argument("--dev-control", action="store_true", help="Enable loopback-only QA control")
     bots = parser.add_mutually_exclusive_group()
     bots.add_argument("--shore-bots", action="store_true", help="Enable the three default autonomous Wizards explicitly")
@@ -95,7 +97,7 @@ def main():
     if shutil.which("cargo") is None:
         parser.error("Cargo not found. Install Rust/Cargo from https://rustup.rs/ and rerun.")
     global LOG
-    state = args.state.resolve()
+    state = (args.test_state if args.test_state is not None else args.state).resolve()
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     LOG = state / "server.log"
     with LOG.open("a") as log:
@@ -123,7 +125,7 @@ def main():
             command = ["cargo", "run", "--locked"]
             if args.release:
                 command.append("--release")
-            command += ["--", "--client", str(client), "--port", str(args.port), "--state", str(state)]
+            command += ["--", "--client", str(client), "--port", str(args.port), "--test-state" if args.test_state is not None else "--state", str(state)]
             if args.dev_control:
                 command.append("--dev-control")
             if args.shore_bots:

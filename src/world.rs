@@ -117,7 +117,8 @@ pub struct Player {
     pub departing: bool,
     account_lists: AccountLists,
     paused: bool,
-    controller: Controller,
+    pub(crate) controller: Controller,
+    pub(crate) native_update_acked: bool,
     pub known: BTreeSet<i32>,
     quest: Option<i32>,
     statuses: BTreeMap<u8, (u64, u64)>,
@@ -132,7 +133,7 @@ pub struct Player {
     pub pending: bool,
     pub experience_queued: i32,
     clears_queued: [u64; 4],
-    progress_started: bool,
+    pub(crate) progress_started: bool,
     pub death_pending: bool,
     persistence_failure: Option<String>,
     pub bot_goal: Option<Pos>,
@@ -153,6 +154,12 @@ pub struct Player {
     last_ability: u64,
 }
 impl Player {
+    pub(crate) fn native_time(&self) -> i32 {
+        self.last_move
+    }
+    pub(crate) fn native_ready(&self, clock_paused: bool) -> bool {
+        self.native_update_acked && (clock_paused || self.last_move > 0)
+    }
     fn roll_damage(&mut self, spec: &Projectile) -> i32 {
         if spec.min == spec.max {
             spec.min
@@ -256,6 +263,8 @@ pub struct World {
     rng: rand::rngs::StdRng,
     pub now: u64,
     attack_epoch: Instant,
+    clock: crate::clock::Clock,
+    pub(crate) prepared_seed: Option<u64>,
     pub tick: u64,
     ids: Arc<AtomicI32>,
     pub name: String,
@@ -304,6 +313,7 @@ struct Portal {
     expires: u64,
 }
 pub struct Directory {
+    pub clock: crate::clock::Clock,
     pub worlds: BTreeMap<i32, World>,
     templates: BTreeMap<String, Arc<Map>>,
     content: Arc<Content>,
@@ -318,6 +328,7 @@ pub struct Directory {
     pub tick: u64,
     pub max_tick_us: u64,
     max_players: usize,
+    prepared_seed: Option<u64>,
 }
 impl Directory {
     pub fn competitive_characters(&self) -> Vec<Character> {
@@ -360,6 +371,23 @@ impl Directory {
         max_players: usize,
         seed: u64,
     ) -> Result<Self> {
+        Self::configured(path, content, max_players, seed, None)
+    }
+    pub(crate) fn prepared(
+        path: &std::path::Path,
+        content: Arc<Content>,
+        max_players: usize,
+        seed: u64,
+    ) -> Result<Self> {
+        Self::configured(path, content, max_players, seed, Some(seed))
+    }
+    fn configured(
+        path: &std::path::Path,
+        content: Arc<Content>,
+        max_players: usize,
+        seed: u64,
+        prepared_seed: Option<u64>,
+    ) -> Result<Self> {
         crate::endgame::validate(&content)?;
         let mut templates = BTreeMap::new();
         for name in [
@@ -384,6 +412,7 @@ impl Directory {
             Arc::new(crate::terrain::generate(&content, seed, 512)?),
         );
         let mut d = Self {
+            clock: crate::clock::Clock::default(),
             worlds: BTreeMap::new(),
             templates,
             content,
@@ -398,6 +427,7 @@ impl Directory {
             tick: 0,
             max_tick_us: 0,
             max_players,
+            prepared_seed,
         };
         for (id, template, name, safe) in [
             (-1, "tutorial", "Tutorial", false),
@@ -439,6 +469,13 @@ impl Directory {
             },
             self.ids.clone(),
         )?;
+        world.clock = self.clock.clone();
+        world.attack_epoch = self.clock.now();
+        if let Some(seed) = self.prepared_seed {
+            let seed = seed ^ self.next_world as u64;
+            world.rng = rand::rngs::StdRng::seed_from_u64(seed);
+            world.prepared_seed = Some(seed);
+        }
         world.name = name.into();
         world.safe = safe;
         world.owner = owner;
@@ -500,6 +537,9 @@ impl Directory {
                 .context("player missing from world directory"),
         }
     }
+    pub(crate) fn character_transferring(&self, character: i32) -> bool {
+        self.grants.values().any(|g| g.character == character)
+    }
     pub fn location(&self, player: i32) -> Result<i32> {
         self.worlds
             .iter()
@@ -521,6 +561,24 @@ impl Directory {
         );
         ensure!(self.worlds[&destination].admission_open, "Realm is closed");
         Ok(destination)
+    }
+    pub(crate) fn prepared_instance(&mut self, template: &str) -> Result<i32> {
+        ensure!(
+            self.prepared_seed.is_some(),
+            "prepared encounter requires isolated test state"
+        );
+        if template != crate::endgame::CASTLE {
+            return self.instance(template, None);
+        }
+        ensure!(self.worlds.len() < 12, "world instance limit reached");
+        let world = self.make(template, "Oryx's Castle", false, None)?;
+        let id = self.next_world;
+        self.next_world = id
+            .checked_add(1)
+            .context("world identity space exhausted")?;
+        self.worlds.insert(id, world);
+        self.idle.insert(id, self.tick);
+        Ok(id)
     }
     pub fn instance(&mut self, template: &str, account: Option<i32>) -> Result<i32> {
         ensure!(
@@ -787,10 +845,12 @@ type Job = Box<dyn FnOnce(&mut Directory) + Send>;
 pub struct Handle {
     tx: mpsc::Sender<Job>,
     target: Target,
+    pub clock: crate::clock::Clock,
 }
 impl Handle {
     pub fn spawn(directory: Directory) -> Self {
         let (tx, mut rx) = mpsc::channel::<Job>(256);
+        let clock = directory.clock.clone();
         tokio::spawn(async move {
             let mut directory = directory;
             let mut timer = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -798,6 +858,7 @@ impl Handle {
             loop {
                 tokio::select! {
                     _ = timer.tick() => {
+                        if directory.clock.paused() { continue; }
                         let start=Instant::now(); directory.step();
                         let us=start.elapsed().as_micros() as u64;
                         directory.max_tick_us=directory.max_tick_us.max(us);
@@ -817,18 +878,21 @@ impl Handle {
         Self {
             tx,
             target: Target::World(-1),
+            clock,
         }
     }
     pub fn in_world(&self, id: i32) -> Self {
         Self {
             tx: self.tx.clone(),
             target: Target::World(id),
+            clock: self.clock.clone(),
         }
     }
     pub fn for_player(&self, id: i32) -> Self {
         Self {
             tx: self.tx.clone(),
             target: Target::Player(id),
+            clock: self.clock.clone(),
         }
     }
     pub async fn directory<T: Send + 'static>(
@@ -865,7 +929,7 @@ impl Handle {
         self.directory(move |d| f(d.resolve(target)?)).await
     }
 }
-fn send(p: &Player, id: u8, body: Vec<u8>) {
+pub(crate) fn send(p: &Player, id: u8, body: Vec<u8>) {
     if let Some(tx) = &p.tx
         && tx.packets.try_send(Packet { id, body }).is_err()
     {
@@ -902,7 +966,11 @@ impl World {
                     let mut e = Entity {
                         id,
                         kind,
-                        name: String::new(),
+                        name: if o.class == "Portal" {
+                            o.name.clone()
+                        } else {
+                            String::new()
+                        },
                         pos,
                         home: pos,
                         goal: None,
@@ -973,6 +1041,8 @@ impl World {
             rng: rand::rngs::StdRng::from_entropy(),
             now: 0,
             attack_epoch: Instant::now(),
+            clock: crate::clock::Clock::default(),
+            prepared_seed: None,
             tick: 0,
             ids,
             name: "Development tutorial".into(),
@@ -991,6 +1061,23 @@ impl World {
             trades: BTreeMap::new(),
             trade_requests: BTreeMap::new(),
         })
+    }
+    pub fn settled(&self) -> Result<bool> {
+        for p in self.players.values() {
+            ensure!(
+                p.persistence_failure.is_none(),
+                "character {} is quarantined",
+                p.character.id
+            );
+        }
+        Ok(self.players.values().all(|p| {
+            !p.pending
+                && p.experience_queued == 0
+                && p.clears_queued.iter().all(|count| *count == 0)
+                && !p.progress_started
+                && !p.death_pending
+                && !p.departing
+        }))
     }
     pub fn load_vault(&mut self, vault: Vault) -> Result<()> {
         ensure!(
@@ -1052,7 +1139,11 @@ impl World {
             Entity {
                 id,
                 kind,
-                name: String::new(),
+                name: if definition.class == "Portal" {
+                    definition.name.clone()
+                } else {
+                    String::new()
+                },
                 pos,
                 home: pos,
                 goal: None,
@@ -1079,6 +1170,32 @@ impl World {
         self.cells[cell].insert(id);
         Ok(id)
     }
+    fn spawn_exit(&mut self, kind: u16, loot: Pos) -> Result<i32> {
+        // Native interaction picks one nearest object; an exit on a bag makes that loot unreachable.
+        let pos = (0..8)
+            .map(|i| {
+                let angle = i as f32 * std::f32::consts::TAU / 8.;
+                Pos {
+                    x: loot.x + 2. * angle.cos(),
+                    y: loot.y + 2. * angle.sin(),
+                }
+            })
+            .find(|pos| {
+                self.walkable(*pos)
+                    && self
+                        .entities
+                        .values()
+                        .filter(|e| {
+                            matches!(
+                                self.content.objects[&e.kind].class.as_str(),
+                                "Portal" | "Container"
+                            )
+                        })
+                        .all(|e| e.pos.distance(*pos) > 1.5)
+            })
+            .context("boss exit has no walkable position clear of loot and interactions")?;
+        self.spawn_entity(kind, pos, vec![])
+    }
     fn remove_entity(&mut self, id: i32) -> Entity {
         let entity = self.entities.remove(&id).expect("indexed entity missing");
         assert!(!entity.reserved, "cannot remove a reserved container");
@@ -1104,6 +1221,20 @@ impl World {
         o.0
     }
     pub fn enter(&mut self, ch: Character, tx: Option<Output>) -> Result<i32> {
+        self.enter_at(ch, tx, None)
+    }
+    pub fn enter_at(
+        &mut self,
+        ch: Character,
+        tx: Option<Output>,
+        position: Option<Pos>,
+    ) -> Result<i32> {
+        if let Some(pos) = position {
+            ensure!(
+                pos.x.is_finite() && pos.y.is_finite() && self.walkable(pos),
+                "prepared position is blocked or outside the world"
+            );
+        }
         ensure!(self.admission_open, "Realm is closed");
         ensure!(ch.alive && ch.hp > 0, "dead character");
         ch.effective(&self.content)?;
@@ -1129,10 +1260,11 @@ impl World {
             id,
             Player {
                 character: ch,
-                pos: Pos { x, y },
+                pos: position.unwrap_or(Pos { x, y }),
                 departing: false,
                 account_lists: AccountLists::default(),
                 paused: false,
+                native_update_acked: false,
                 controller: if tx.is_none() {
                     Controller::Qa
                 } else {
@@ -1542,7 +1674,7 @@ impl World {
     #[cfg(test)]
     pub fn native_move_to(&mut self, id: i32, pos: Pos, time: i32) -> Result<()> {
         // Skipped simulation ticks must not reduce real movement funding or desynchronize SHOOT prediction.
-        self.native_move_received(id, pos, (time, Instant::now()))
+        self.native_move_received(id, pos, (time, self.clock.now()))
             .map(|_| ())
     }
     pub fn native_move_received(
@@ -1641,7 +1773,7 @@ impl World {
         angle: f32,
     ) -> Result<()> {
         // Skipped actor ticks must not charge real client attacks against a slower simulation clock.
-        self.native_shoot_received(id, (time, Instant::now()), bullet, kind, start, angle)
+        self.native_shoot_received(id, (time, self.clock.now()), bullet, kind, start, angle)
             .map(|_| ())
     }
     pub fn native_shoot_received(
@@ -2275,6 +2407,16 @@ impl World {
                 {
                     p.character.mp = (p.character.mp + plan.mana).min(values[1]);
                 }
+                if self.prepared_seed.is_some()
+                    && let Some((bag, slot)) = plan.loot_slot
+                {
+                    let item = self
+                        .entities
+                        .get(&bag)
+                        .and_then(|bag| bag.items.get(slot))
+                        .context("committed loot identity missing")?;
+                    tracing::info!(player=plan.player,character=p.character.id,bag,slot,item=*item,world=%self.name,"loot slot committed");
+                }
                 if let Some((id, items)) = plan.bag {
                     self.entities.get_mut(&id).unwrap().items = items;
                 }
@@ -2654,7 +2796,7 @@ impl World {
                 );
             }
             if self.clear_exit.is_none() {
-                let exit = self.spawn_entity(0x71d, defeated.pos, vec![])?;
+                let exit = self.spawn_exit(0x71d, defeated.pos)?;
                 self.entities.get_mut(&exit).unwrap().published = false;
                 self.clear_exit = Some(exit);
             }
@@ -3549,8 +3691,60 @@ mod timing_example;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prepared_worlds_share_explicit_seed_without_changing_normal_creation() {
+        let content = Arc::new(Content::load(std::path::Path::new("data")).unwrap());
+        let first =
+            Directory::prepared(std::path::Path::new("data"), content.clone(), 4, 12351).unwrap();
+        let second =
+            Directory::prepared(std::path::Path::new("data"), content.clone(), 4, 12351).unwrap();
+        for id in [-1, -2, -3, -4] {
+            let mut a = first.worlds[&id].rng.clone();
+            let mut b = second.worlds[&id].rng.clone();
+            assert_eq!(
+                rand::RngCore::next_u64(&mut a),
+                rand::RngCore::next_u64(&mut b)
+            );
+            assert!(first.worlds[&id].prepared_seed.is_some());
+        }
+        let ordinary =
+            Directory::with_seed(std::path::Path::new("data"), content, 4, 12351).unwrap();
+        assert!(ordinary.worlds.values().all(|w| w.prepared_seed.is_none()));
+    }
     use crate::content::WIZARD;
     use std::path::Path;
+    #[test]
+    fn spawned_nexus_exit_publishes_the_name_required_by_native_portal_draw() {
+        let mut w = world();
+        let id = w
+            .spawn_entity(
+                0x712,
+                Pos {
+                    x: w.map.spawns[0].0,
+                    y: w.map.spawns[0].1,
+                },
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(w.entities[&id].name, "Nexus Portal");
+        let bytes = w.stats(id).unwrap();
+        let mut r = crate::wire::Reader::new(&bytes);
+        assert_eq!(r.i32().unwrap(), id);
+        r.f32().unwrap();
+        r.f32().unwrap();
+        let count = r.i16().unwrap();
+        let mut names = Vec::new();
+        for _ in 0..count {
+            let stat = r.u8().unwrap();
+            if stat == 31 {
+                names.push(r.utf().unwrap());
+            } else {
+                r.i32().unwrap();
+            }
+        }
+        r.done().unwrap();
+        assert_eq!(names, ["Nexus Portal"]);
+    }
     pub(super) fn world() -> World {
         let c = Arc::new(Content::load(Path::new("data")).unwrap());
         let m = Arc::new(Map::load(Path::new("data/tutorial.wmap"), &c).unwrap());
@@ -5169,6 +5363,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(w.players[&player].last_move_at, 1100);
+    }
+    #[test]
+    fn queued_progress_must_settle_before_pause_is_confirmed() {
+        let mut w = world();
+        let character = ch(&w);
+        let player = w.enter(character, None).unwrap();
+        w.players.get_mut(&player).unwrap().experience_queued = 20;
+        assert!(!w.settled().unwrap());
+        let (id, progress) = w.pending_progress().unwrap().pop().unwrap();
+        assert!(!w.settled().unwrap());
+        w.finish_progress(id, progress).unwrap();
+        assert!(w.settled().unwrap());
+    }
+    #[test]
+    fn paused_wall_time_cannot_fund_native_attack_credit() {
+        let mut w = world();
+        let mut character = ch(&w);
+        character.base[5] = 26;
+        let player = w.enter(character, None).unwrap();
+        let pos = w.players[&player].pos;
+        let start = Pos {
+            x: pos.x + 0.3,
+            y: pos.y,
+        };
+        let p = w.players.get_mut(&player).unwrap();
+        p.last_attack = 1000;
+        p.last_attack_at = 1000;
+        p.attack_credit = 0.;
+        w.attack_epoch = w.clock.now() - std::time::Duration::from_millis(1000);
+        w.clock.set_paused(true);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(
+            w.native_shoot_received(player, (1298, w.clock.now()), 1, 0xa97, start, 0.)
+                .unwrap(),
+            NativeInput::DeniedAttackBudget
+        );
+        w.clock.set_paused(false);
+        assert_eq!(
+            w.native_shoot_received(player, (1596, w.clock.now()), 2, 0xa97, start, 0.)
+                .unwrap(),
+            NativeInput::DeniedAttackBudget
+        );
+        assert_eq!(w.players[&player].character.shots, 0);
+        assert!(w.bullets.is_empty());
     }
     #[test]
     fn native_attack_credit_uses_receive_time_not_skipped_simulation_ticks() {

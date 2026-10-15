@@ -272,10 +272,10 @@ impl World {
             ensure!(!self.cleared, "Oryx completion replayed");
             self.cleared = true;
             if defeated.kind == ORYX {
-                let locked = self.spawn_entity(finale::LOCKED_CELLAR, defeated.pos, vec![])?;
+                let locked = self.spawn_exit(finale::LOCKED_CELLAR, defeated.pos)?;
                 self.bag_expiry.insert(locked, self.now + 120_000);
             } else {
-                self.spawn_entity(0x712, defeated.pos, vec![])?;
+                self.spawn_exit(0x712, defeated.pos)?;
             }
             for e in self.entities.values_mut().filter(|e| e.kind == 0x71d) {
                 e.published = true;
@@ -564,7 +564,14 @@ mod tests {
         assert_eq!(w.finale.bosses[&boss].phase(), Some(OryxPhase::Rage));
         assert_eq!(w.finale_movement(boss, 10_000).unwrap().1, 8.);
         kill(&mut w, boss);
-        assert_eq!(w.entities.values().filter(|e| e.kind == 0x712).count(), 1);
+        let exits = w
+            .entities
+            .values()
+            .filter(|e| e.kind == 0x712)
+            .collect::<Vec<_>>();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].name, "Nexus Portal");
+        assert!(exits[0].pos.distance(pos) > 1.9);
     }
     #[test]
     fn oryx_dance_preserves_all_ring_shots_without_overflowing_native_output() {
