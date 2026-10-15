@@ -185,7 +185,7 @@ fn priest_heals_own_and_nearby_hp_caps_and_spends_xml_mana_with_native_effects()
     w.players.get_mut(&a).unwrap().character.hp = 17;
     w.players.get_mut(&b).unwrap().character.hp = 35;
     let item = w.content.get(0xa31).unwrap().clone();
-    w.heal_nova(
+    w.activate_ability(
         b,
         Slot {
             object: b,
@@ -193,6 +193,7 @@ fn priest_heals_own_and_nearby_hp_caps_and_spends_xml_mana_with_native_effects()
             kind: 0xa31,
         },
         &item,
+        w.players[&b].pos,
     )
     .unwrap();
     assert_eq!(
@@ -229,7 +230,7 @@ fn priest_heals_own_and_nearby_hp_caps_and_spends_xml_mana_with_native_effects()
     }
 }
 #[test]
-fn priest_range_world_lifecycle_mana_equipment_and_unsupported_tomes_are_strict() {
+fn priest_range_world_lifecycle_mana_equipment_and_invalid_activations_are_strict() {
     let (mut d, a, b, _ar, _br) = setup();
     let (other, _rx) = receive(&mut d, -3, 3, WIZARD);
     d.worlds
@@ -254,12 +255,12 @@ fn priest_range_world_lifecycle_mana_equipment_and_unsupported_tomes_are_strict(
         y: position.y,
     };
     p.character.hp = 20;
-    w.heal_nova(b, slot, &item).unwrap();
+    w.activate_ability(b, slot, &item, position).unwrap();
     assert_eq!(w.players[&a].character.hp, 20);
     assert_eq!(d.worlds[&-3].players[&other].character.hp, 20);
     let w = d.worlds.get_mut(&-2).unwrap();
     w.players.get_mut(&b).unwrap().character.mp = 100;
-    assert!(w.heal_nova(b, slot, &item).is_err());
+    assert!(w.activate_ability(b, slot, &item, position).is_err());
     w.now += 500;
     for mode in 0..4 {
         let p = w.players.get_mut(&a).unwrap();
@@ -268,21 +269,24 @@ fn priest_range_world_lifecycle_mana_equipment_and_unsupported_tomes_are_strict(
         p.departing = mode == 1;
         p.pending = mode == 2;
         p.persistence_failure = (mode == 3).then(|| "failed".into());
-        w.heal_nova(b, slot, &item).unwrap();
+        w.activate_ability(b, slot, &item, position).unwrap();
         assert_eq!(w.players[&a].character.hp, 20);
         w.now += 500;
         w.players.get_mut(&b).unwrap().character.mp = 100;
     }
     w.players.get_mut(&b).unwrap().character.mp = 59;
-    assert!(w.heal_nova(b, slot, &item).is_err());
+    assert!(w.activate_ability(b, slot, &item, position).is_err());
     w.players.get_mut(&b).unwrap().character.mp = 100;
-    assert!(w.heal_nova(a, slot, &item).is_err());
-    assert!(w.heal_nova(b, Slot { slot: 4, ..slot }, &item).is_err());
+    assert!(w.activate_ability(a, slot, &item, position).is_err());
+    assert!(
+        w.activate_ability(b, Slot { slot: 4, ..slot }, &item, position)
+            .is_err()
+    );
     let mut invalid = item.clone();
     invalid.activations = 2;
-    assert!(w.heal_nova(b, slot, &invalid).is_err());
+    assert!(w.activate_ability(b, slot, &invalid, position).is_err());
     invalid = item;
-    invalid.tier = None;
-    assert!(w.heal_nova(b, slot, &invalid).is_err());
+    invalid.abilities.clear();
+    assert!(w.activate_ability(b, slot, &invalid, position).is_err());
     assert_eq!(w.players[&b].character.mp, 100);
 }

@@ -263,7 +263,15 @@ fn every_tiered_cloak_helm_and_seal_charges_once_and_uses_xml_effects() {
         let mp = w.players[&id].character.mp;
         cast(&mut w, id).unwrap();
         assert_eq!(w.players[&id].character.mp, mp - item.mana_cost);
-        for (effect, duration, range) in &item.condition_activations {
+        for ability in &item.abilities {
+            let crate::content::Ability::Condition {
+                effect,
+                duration,
+                range,
+            } = ability
+            else {
+                panic!("tiered buff has a non-condition activation")
+            };
             assert_eq!(w.players[&id].statuses[effect], (20000, 20000 + duration));
             assert_eq!(
                 w.players[&friend].statuses.contains_key(effect),
