@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, io::Read, path::Path};
 
 pub const WIZARD: u16 = 0x030e;
 pub const PRIEST: u16 = 0x0310;
+pub const ARCHER: u16 = 0x0307;
 pub const SLOWED: i32 = 1 << 3;
 pub const STUNNED: i32 = 1 << 6;
 pub const PARALYZED: i32 = 1 << 13;
