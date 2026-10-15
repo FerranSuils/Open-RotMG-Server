@@ -102,9 +102,12 @@ class UpdateTest(unittest.TestCase):
                 update.start_backup()
             run.assert_not_called()
 
-    def test_save_failure_prevents_source_exchange(self):
+    def test_readonly_backup_lock_still_reaches_save_failure_before_exchange(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            lock = root / 'backup.lock'
+            lock.touch()
+            lock.chmod(0o444)
             with patch.object(update, 'LAST_BACKUP', root / 'receipt.json'), patch.object(update, 'run'), patch.object(update, 'install_backups'), \
                     patch.object(update, 'rehearse'), patch.object(update, 'files', return_value={}), \
                     patch.object(update.subprocess, 'check_output', return_value='failed'), \

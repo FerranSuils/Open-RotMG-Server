@@ -211,7 +211,7 @@ def deploy(stage, work, metadata, config):
     install_backups(stage)
     require(files(stage) == metadata['manifest'], 'Rehearsal changed release files')
     require(main_revision() == metadata['revision'], 'Main advanced during rehearsal; no cutover performed')
-    with LAST_BACKUP.with_name('backup.lock').open('a') as lock:
+    with LAST_BACKUP.with_name('backup.lock').open('rb') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         run('systemctl', 'stop', 'openrotmg.service')
         require(subprocess.check_output(['systemctl', 'show', 'openrotmg', '-p', 'Result', '--value'], text=True).strip() == 'success', 'Shutdown save failed; no source exchange performed')
