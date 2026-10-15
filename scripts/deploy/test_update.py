@@ -89,11 +89,12 @@ class UpdateTest(unittest.TestCase):
                 self.assertFalse((root / 'state/status.json').exists())
 
     def test_successful_backup_starts_reset_the_retry_counter(self):
-        with patch.object(update.subprocess, 'check_output', return_value='success'), patch.object(update, 'run') as run:
+        with patch.object(update.subprocess, 'check_output', return_value='success'), patch.object(update, 'run') as run, patch.object(update, 'verify_backup') as verify:
             update.start_backup()
             self.assertEqual([call.args for call in run.call_args_list],
                              [('systemctl', 'reset-failed', 'openrotmg-backup.service'),
                               ('systemctl', 'start', 'openrotmg-backup.service')])
+            verify.assert_called_once()
 
     def test_failed_backups_never_bypass_the_retry_limit(self):
         with patch.object(update.subprocess, 'check_output', return_value='exit-code'), patch.object(update, 'run') as run:
@@ -104,7 +105,7 @@ class UpdateTest(unittest.TestCase):
     def test_save_failure_prevents_source_exchange(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with patch.object(update, 'run'), patch.object(update, 'install_backups'), \
+            with patch.object(update, 'LAST_BACKUP', root / 'receipt.json'), patch.object(update, 'run'), patch.object(update, 'install_backups'), \
                     patch.object(update, 'rehearse'), patch.object(update, 'files', return_value={}), \
                     patch.object(update.subprocess, 'check_output', return_value='failed'), \
                     patch.object(update, 'main_revision', return_value='a' * 40), \
@@ -113,6 +114,66 @@ class UpdateTest(unittest.TestCase):
                     update.deploy(root, root, {'manifest': {}, 'revision': 'a' * 40}, {'state': str(root)})
                 exchange.assert_not_called()
 
+
+    def test_backup_tools_are_immutable_bundles_with_atomic_promotion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / 'stage'
+            (stage / 'scripts/backups').mkdir(parents=True)
+            for name in ['backup.py', 'openrotmg-backup.sh']:
+                (stage / 'scripts/backups' / name).write_text(name)
+            tools = root / 'tools'
+            tools.mkdir()
+            with patch.object(update, 'BACKUPS', tools), patch.object(update.subprocess, 'check_output', return_value='inactive'), patch.object(update, 'run'), patch.object(update, 'start_backup'):
+                for revision in ['a' * 40, 'b' * 40]:
+                    (stage / 'REVISION').write_text(revision)
+                    (stage / 'openrotmg').write_text(revision)
+                    update.install_backups(stage)
+                    self.assertEqual((tools / 'current').resolve(), tools / 'releases' / revision)
+                self.assertEqual((tools / 'releases' / ('a' * 40) / 'openrotmg').read_text(), 'a' * 40)
+                (tools / 'current/openrotmg').write_text('tampered')
+                with self.assertRaisesRegex(RuntimeError, 'differs from release'):
+                    update.install_backups(stage)
+
+    def test_failed_backup_is_not_reported_as_running(self):
+        with patch.object(update.subprocess, 'check_output', return_value='failed'), patch.object(update, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'Backup service is failed'):
+                update.install_backups(Path('/unused'))
+            run.assert_not_called()
+
+    def test_failed_write_rehearsal_cannot_install_tools_or_stop_production(self):
+        with patch.object(update, 'run') as run, patch.object(update, 'rehearse', side_effect=RuntimeError('write contract failed')), patch.object(update, 'install_backups') as install:
+            with self.assertRaisesRegex(RuntimeError, 'write contract failed'):
+                update.deploy(Path('/stage'), Path('/work'), {}, {})
+            install.assert_not_called()
+            self.assertEqual(len(run.call_args_list), 1)
+
+    def test_uploaded_backup_requires_fresh_restore_and_actual_running_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'REVISION').write_text('a' * 40)
+            receipt = root / 'receipt.json'
+            proof = {'uploaded_at': '2026-10-15T12:00:00+00:00', 'restored': True, 'revisions': {'server': 'a' * 40}}
+            with patch.object(update, 'LIVE', root), patch.object(update, 'LAST_BACKUP', receipt):
+                receipt.write_text(json.dumps(proof))
+                stamp = update.datetime.datetime.fromisoformat(proof['uploaded_at']).timestamp()
+                update.verify_backup(stamp - 1)
+                with self.assertRaisesRegex(RuntimeError, 'Fresh uploaded backup'):
+                    update.verify_backup(stamp + 1)
+                for change in [{'restored': False}, {'revisions': {'server': 'b' * 40}}]:
+                    receipt.write_text(json.dumps({**proof, **change}))
+                    with self.assertRaisesRegex(RuntimeError, 'Fresh uploaded backup'):
+                        update.verify_backup(stamp - 1)
+
+    def test_blocked_revision_waits_without_allocating_another_recovery_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proof = {'state': 'blocked', 'desired': 'a' * 40, 'running': 'b' * 40, 'error': 'contract failed'}
+            (root / 'status.json').write_text(json.dumps(proof))
+            with patch.object(update, 'ROOT', root), patch.object(update, 'main_revision', return_value='a' * 40), patch.object(update, 'download') as download:
+                update.main()
+                download.assert_not_called()
+                self.assertEqual([p.name for p in root.iterdir()], ['status.json'])
 
 if __name__ == '__main__':
     unittest.main()

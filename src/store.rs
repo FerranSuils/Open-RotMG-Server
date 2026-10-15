@@ -167,7 +167,7 @@ pub struct Store {
     hashes: std::sync::Arc<tokio::sync::Semaphore>,
     dummy_hash: String,
 }
-fn decode_character(raw: &str, legacy_base: [i32; 8]) -> Result<Character> {
+pub(crate) fn decode_character(raw: &str, legacy_base: [i32; 8]) -> Result<Character> {
     let mut value: serde_json::Value = serde_json::from_str(raw)?;
     match value.get("schema") {
         None => {
