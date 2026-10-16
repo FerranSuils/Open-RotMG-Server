@@ -27,6 +27,8 @@ mod families;
 mod gods;
 #[cfg(test)]
 mod gods_tests;
+#[cfg(test)]
+mod player_position_tests;
 mod population;
 #[cfg(test)]
 mod population_tests;
@@ -1791,10 +1793,13 @@ impl World {
         ensure!(
             (1..=samples).all(|i| {
                 let f = i as f32 / samples as f32;
-                self.walkable(Pos {
-                    x: p.pos.x + (pos.x - p.pos.x) * f,
-                    y: p.pos.y + (pos.y - p.pos.y) * f,
-                })
+                self.player_step_valid(
+                    p.pos,
+                    Pos {
+                        x: p.pos.x + (pos.x - p.pos.x) * f,
+                        y: p.pos.y + (pos.y - p.pos.y) * f,
+                    },
+                )
             }),
             "movement across a blocked tile"
         );
@@ -1881,6 +1886,60 @@ impl World {
             self.correct_position(id, time, "immobilized movement")?;
         }
         Ok(())
+    }
+    fn player_step_valid(&self, from: Pos, to: Pos) -> bool {
+        let crosses =
+            |a: f32, b: f32| (a % 0.5 == 0. && a != b) || (a * 2.).floor() != (b * 2.).floor();
+        // The client only revalidates when departing a half-cell boundary or crossing one.
+        (!crosses(from.x, to.x) && !crosses(from.y, to.y))
+            || self.player_position_valid(Some(from), to)
+    }
+    fn player_position_valid(&self, from: Option<Pos>, pos: Pos) -> bool {
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return false;
+        }
+        let Some(cell) = self.map.cell(pos.x, pos.y) else {
+            return false;
+        };
+        let own = (pos.x.floor() as i32, pos.y.floor() as i32);
+        let check_own = from.is_none_or(|p| (p.x.floor() as i32, p.y.floor() as i32) != own);
+        if check_own && self.content.grounds[&cell.ground] <= 0. {
+            return false;
+        }
+        let side = |n: f32| {
+            if n.fract() < 0.5 {
+                -1
+            } else if n.fract() > 0.5 {
+                1
+            } else {
+                0
+            }
+        };
+        let (dx, dy) = (side(pos.x), side(pos.y));
+        let neighbors = [
+            (own.0 + dx, own.1),
+            (own.0, own.1 + dy),
+            (own.0 + dx, own.1 + dy),
+        ];
+        if neighbors.iter().any(|&(x, y)| {
+            (x, y) != own
+                && self
+                    .map
+                    .cell(x as f32, y as f32)
+                    .is_none_or(|c| c.ground == 255)
+        }) {
+            return false;
+        }
+        self.entities.values().all(|e| {
+            let cell = (e.pos.x.floor() as i32, e.pos.y.floor() as i32);
+            if check_own && cell == own {
+                !self.content.objects[&e.kind].blocks
+            } else if cell != own && neighbors.contains(&cell) {
+                !self.content.objects[&e.kind].full_occupy
+            } else {
+                true
+            }
+        })
     }
     pub fn walkable(&self, pos: Pos) -> bool {
         let Some(c) = self.map.cell(pos.x, pos.y) else {
@@ -2590,7 +2649,10 @@ impl World {
         );
         match a {
             Action::Move { x, y } => {
-                ensure!(self.walkable(Pos { x, y }), "goal outside map or blocked");
+                ensure!(
+                    self.player_position_valid(Some(p.pos), Pos { x, y }),
+                    "goal outside map or blocked"
+                );
                 self.players
                     .get_mut(&id)
                     .context("player missing")?
@@ -4949,7 +5011,29 @@ mod tests {
                 },
                 1091
             )
-            .is_err()
+            .is_ok()
+        );
+        w.spawn_entity(
+            blocker,
+            Pos {
+                x: pos.x + 1.,
+                y: pos.y,
+            },
+            vec![],
+        )
+        .unwrap();
+        assert!(
+            w.validate_move(
+                id,
+                Pos {
+                    x: pos.x + 0.6,
+                    y: pos.y
+                },
+                1200
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("blocked tile")
         );
     }
     #[test]

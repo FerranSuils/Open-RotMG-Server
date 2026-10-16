@@ -131,7 +131,7 @@ impl World {
             "Teleport target has not been observed."
         );
         ensure!(
-            self.walkable(q.pos),
+            self.player_position_valid(None, q.pos),
             "Teleport target's position is blocked."
         );
         Ok(q.pos)
