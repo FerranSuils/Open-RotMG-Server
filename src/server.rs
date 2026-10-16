@@ -4,7 +4,7 @@ use crate::{
     crypto::Keys,
     store::{InventoryWrite, Store, xml_escape},
     wire::{self, Codec, Packet, Reader, Writer},
-    world::{Action, Handle, InventoryPlan, Pos, Slot, TradeAction, TradePlan},
+    world::{Action, Handle, InventoryPlan, Pos, Slot, TradeAction, TradePlan, World},
 };
 use anyhow::{Context, Result, bail, ensure};
 use axum::{
@@ -1527,64 +1527,57 @@ async fn bot_leave(
 pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
     let deaths = a.clone();
     tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let progress = match deaths.world.collect(|w| w.pending_progress()).await {
-                Ok(plans) => plans,
-                Err(e) => {
-                    tracing::error!(error=%e, "progress coordinator stopped");
-                    break;
+        let result: Result<()> = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let progress = deaths.world.collect(World::pending_progress).await?;
+                if !progress.is_empty() {
+                    let result = deaths
+                        .store
+                        .progress_batch(progress.iter().map(|(_, ch)| ch.clone()).collect())
+                        .await
+                        .context("progress persistence failed");
+                    for (id, snapshot) in progress {
+                        let result = result
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|error| anyhow::anyhow!("{error:#}"));
+                        if let Err(error) = deaths
+                            .world
+                            .for_player(id)
+                            .call(move |w| {
+                                w.committed(id, result)?;
+                                w.finish_progress(id, snapshot)
+                            })
+                            .await
+                        {
+                            tracing::error!(player=id, error=%format_args!("{error:#}"), "progress completion failed");
+                        }
+                    }
                 }
-            };
-            if !progress.is_empty() {
-                let result = deaths
-                    .store
-                    .progress_batch(progress.iter().map(|(_, ch)| ch.clone()).collect())
-                    .await
-                    .context("progress persistence failed");
-                for (id, snapshot) in progress {
-                    let result = result
-                        .as_ref()
-                        .map(|_| ())
-                        .map_err(|error| anyhow::anyhow!("{error:#}"));
+                let pending = deaths.world.collect(World::pending_deaths).await?;
+                for (id, ch, killer) in pending {
+                    let result = deaths
+                        .store
+                        .death(ch, killer)
+                        .await
+                        .context("death persistence failed");
                     if let Err(error) = deaths
                         .world
                         .for_player(id)
                         .call(move |w| {
                             w.committed(id, result)?;
-                            w.finish_progress(id, snapshot)
+                            w.finish_death(id)
                         })
                         .await
                     {
-                        tracing::error!(player=id, error=%format_args!("{error:#}"), "progress completion failed");
+                        tracing::error!(player=id,error=%format_args!("{error:#}"),"death completion failed");
                     }
                 }
             }
-            let pending = match deaths.world.collect(|w| Ok(w.pending_deaths())).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!(error=%e,"death coordinator stopped");
-                    break;
-                }
-            };
-            for (id, ch, killer) in pending {
-                let result = deaths
-                    .store
-                    .death(ch, killer)
-                    .await
-                    .context("death persistence failed");
-                if let Err(error) = deaths
-                    .world
-                    .for_player(id)
-                    .call(move |w| {
-                        w.committed(id, result)?;
-                        w.finish_death(id)
-                    })
-                    .await
-                {
-                    tracing::error!(player=id,error=%format_args!("{error:#}"),"death completion failed");
-                }
-            }
+        }.await;
+        if let Err(error) = result {
+            tracing::error!(error=%format_args!("{error:#}"), "persistence coordinator stopped");
         }
     });
     let listener = tokio::net::TcpListener::bind(bind).await.with_context(|| {

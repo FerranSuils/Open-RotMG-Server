@@ -170,8 +170,17 @@ fn selected_dungeons_credit_character_identity_once_and_publish_exits_after_comm
         let mut second = first.clone();
         second.account = 302;
         second.id = 402;
-        let a = w.enter(first, None).unwrap();
-        let b = w.enter(second, None).unwrap();
+        second.exp = i32::MAX;
+        let (a, b) = if index % 2 == 0 {
+            let b = w.enter(second, None).unwrap();
+            (w.enter(first, None).unwrap(), b)
+        } else {
+            (
+                w.enter(first, None).unwrap(),
+                w.enter(second, None).unwrap(),
+            )
+        };
+        w.players.get_mut(&b).unwrap().experience_queued = 1;
         w.players.get_mut(&a).unwrap().pos = position;
         w.players.get_mut(&b).unwrap().pos = position;
         w.entities.get_mut(&boss).unwrap().damage.insert(401, 2000);
@@ -179,16 +188,18 @@ fn selected_dungeons_credit_character_identity_once_and_publish_exits_after_comm
         w.drop_loot(&defeated).unwrap();
         let exit = w.clear_exit.unwrap();
         assert!(!w.entities[&exit].published);
-        let plans = w.pending_progress().unwrap();
+        let plans = w.pending_progress();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].0, a);
+        assert_eq!(w.players[&b].experience_queued, 1);
+        assert!(w.begin_departure(b).is_err());
         assert_eq!(plans[0].1.dungeons[index - 1], 1);
         assert_eq!(w.players[&a].character.dungeons, [0; 3]);
         assert_eq!(w.players[&b].character.dungeons, [0; 3]);
         w.finish_progress(a, plans[0].1.clone()).unwrap();
         assert!(w.entities[&exit].published);
         assert_eq!(w.players[&a].character.dungeons[index - 1], 1);
-        assert!(w.pending_progress().unwrap().is_empty());
+        assert!(w.pending_progress().is_empty());
         assert!(w.drop_loot(&defeated).is_err());
     }
 }
@@ -242,7 +253,7 @@ fn selected_private_boss_rewards_reach_every_eligible_player_including_the_ninth
                 .values()
                 .any(|e| e.extra_stats.contains(&(54, 809)))
         );
-        let plans = w.pending_progress().unwrap();
+        let plans = w.pending_progress();
         assert_eq!(plans.len(), 9);
         let exit = w.clear_exit.unwrap();
         assert!(!w.entities[&exit].published);
