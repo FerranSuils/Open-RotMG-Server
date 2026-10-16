@@ -847,7 +847,7 @@ async fn handle(
                         format!("Could not confirm bug report: {error}")
                     }
                 };
-                tx.send(crate::world::chat_info(&reply)).await?;
+                enqueue_reply(tx, crate::world::chat_info(&reply))?;
             } else if matches!(
                 text.trim(),
                 "/discord" | "/discord recovery" | "/discord norecovery"

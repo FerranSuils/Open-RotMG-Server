@@ -62,6 +62,7 @@ async fn rejected_replies(closed: bool) {
     for case in [
         "bootstrap",
         "discord",
+        "bug",
         "ignore",
         "chat",
         "teleport",
@@ -82,6 +83,7 @@ async fn rejected_replies(closed: bool) {
         let packet = match case {
             "bootstrap" => hello(&dir, &guid),
             "discord" => text("/discord"),
+            "bug" => text("/bug"),
             "ignore" => text("/ignore"),
             "chat" => text(""),
             "teleport" => Packet {
