@@ -9,6 +9,8 @@ use tokio::sync::oneshot;
 
 mod account_actions;
 mod accounts;
+#[cfg(test)]
+mod death_date_tests;
 mod hiscores;
 mod legends;
 #[cfg(test)]

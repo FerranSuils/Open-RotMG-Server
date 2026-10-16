@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod client_contract_tests;
 mod input;
 #[cfg(test)]
 mod queue_tests;
