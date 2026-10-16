@@ -90,6 +90,7 @@ pub async fn run(args: &[String]) -> Result<bool> {
                 character.gain_experience(&content, 400, &mut rand::thread_rng())?;
                 character.dungeons = [1, 2, 3];
                 character.pirate_caves = 4;
+                character.abysses = 5;
                 store.progress(character.clone()).await?;
                 let mut items = character.items.clone();
                 items[4] = 0xa22;
@@ -122,6 +123,7 @@ pub async fn run(args: &[String]) -> Result<bool> {
                         content: "Backup update\nPersisted public text".into(),
                         published_at: 1700000000,
                         edited_at: None,
+                        attachments: vec![],
                     }],
                 })
                 .await?;

@@ -18,14 +18,22 @@ impl World {
             .map
             .cell(pos.x, pos.y)
             .context("ground damage outside map")?;
-        let ground = c.ground;
+        let i = pos.y as usize * self.map.width as usize + pos.x as usize;
+        // A native report can precede receipt of a restored-floor UPDATE; its RNG draw still occurred.
+        let ground = if p.controller == Controller::Human
+            && !self.content.hazards.contains_key(&c.ground)
+            && self.lava_patches.contains_key(&i)
+        {
+            crate::dungeon::abyss::LAVA
+        } else {
+            c.ground
+        };
         let hazard = self
             .content
             .hazards
             .get(&ground)
-            .context("ground report has no hazard")?
+            .context("ground report has no current or prior hazard")?
             .clone();
-        let i = pos.y as usize * self.map.width as usize + pos.x as usize;
         let protected = self.cells[i]
             .iter()
             .any(|id| self.content.objects[&self.entities[id].kind].protects_ground);
@@ -42,7 +50,6 @@ impl World {
         if ignored && p.controller != Controller::Human {
             return Ok(());
         }
-        // A native report means its client already consumed this draw, even if a later state protects it.
         let damage = p.roll_between(hazard.min, hazard.max);
         if ignored {
             return Ok(());
@@ -67,6 +74,7 @@ impl World {
         );
         Ok(())
     }
+
     pub(super) fn ground_step(&mut self) {
         let actors: Vec<_> = self
             .players
