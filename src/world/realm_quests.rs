@@ -508,9 +508,19 @@ impl World {
         }
         Ok(())
     }
-    pub(super) fn quest_movement(&self, id: i32, elapsed: u64) -> (Motion, f32) {
+    pub(super) fn quest_movement(&self, id: i32, target: Pos, elapsed: u64) -> (Motion, f32) {
         let e = &self.entities[&id];
-        if e.pos.distance(e.home) > 16. {
+        let leash = match e.kind {
+            0x91f | 0x920 => 6.,
+            0x91b | 0x91c | 0x91d | 0x6c1 => 5.,
+            0x923 | 0x924 | 0x91e => 11.,
+            0x929..=0x92c => 7.,
+            0x675 => 2.,
+            0x928 if e.stage.unwrap_or(0) >= 7 => 8.,
+            0x928 => 3.,
+            _ => 16.,
+        };
+        if e.pos.distance(e.home) > leash {
             return (
                 Motion::Protect {
                     anchor: Anchor::Home,
@@ -521,7 +531,11 @@ impl World {
         }
         match e.kind {
             0x6c2 => (Motion::Stationary, 0.),
-            0x92d => (Motion::Wiggle, 5.),
+            0x92d => (Motion::Pace { distance: 3. }, 5.),
+            0x928 if e.stage == Some(0) => (Motion::Pace { distance: 3. }, 3.),
+            0x928 if e.stage.unwrap_or(0) >= 7 && elapsed % 4000 >= 2000 => {
+                (Motion::Stationary, 0.)
+            }
             0x928 if e.stage.unwrap_or(0) >= 7 => (
                 Motion::Chase {
                     sight: 10.,
@@ -563,36 +577,77 @@ impl World {
                     )
                 }
             }
-            0x921 => (
-                Motion::Chase {
-                    sight: 9.,
-                    stop: 1.,
-                },
-                2.5,
-            ),
-            0x923 | 0x924 => (
+            0x921 | 0x922 => {
+                let (distance, speed) = if e.kind == 0x921 {
+                    (7., 2.5)
+                } else {
+                    (4., 5.5)
+                };
+                if let Some(leader) = self.quest_leader(id)
+                    && e.pos.distance(self.entities[&leader].pos) > distance
+                {
+                    (
+                        Motion::Protect {
+                            anchor: Anchor::QuestMember(self.entities[&leader].kind),
+                            distance,
+                        },
+                        speed,
+                    )
+                } else if e.kind == 0x921 {
+                    (
+                        Motion::Chase {
+                            sight: 9.,
+                            stop: 1.,
+                        },
+                        speed,
+                    )
+                } else {
+                    (Motion::Wander, speed)
+                }
+            }
+            0x923 | 0x924 if e.pos.distance(target) < 7. => (
                 Motion::Orbit {
-                    anchor: Anchor::Home,
+                    anchor: Anchor::Player,
                     radius: 4.,
                 },
-                10.,
+                15.,
             ),
-            0x91d if elapsed % 3000 < 1500 => (
-                Motion::Orbit {
-                    anchor: Anchor::Home,
-                    radius: 4.,
-                },
-                6.5,
+            0x923 | 0x924 => (Motion::Stationary, 0.),
+            0x91d if e.hp < 1800 => (
+                Motion::Wander,
+                if elapsed % 5000 < 2500 { 13. } else { 10. },
             ),
-            0x91d => (Motion::Retreat { distance: 2. }, 6.5),
+            0x91d if elapsed % 3000 < 1500 => {
+                let (speed, sight) = if e.hp >= 3900 { (5.5, 5.) } else { (6.5, 10.) };
+                if e.pos.distance(target) < sight {
+                    (
+                        Motion::Orbit {
+                            anchor: Anchor::Player,
+                            radius: 4.,
+                        },
+                        speed,
+                    )
+                } else {
+                    (Motion::Stationary, 0.)
+                }
+            }
+            0x91d if e.pos.distance(target) < 2. => (
+                Motion::Retreat { distance: 2. },
+                if e.hp >= 3900 { 5.5 } else { 6.5 },
+            ),
+            0x91d => (Motion::Wander, if e.hp >= 3900 { 5.5 } else { 6.5 }),
+            0x91e if elapsed % 10000 >= 7000 => (Motion::Stationary, 0.),
+            0x91e => (Motion::Wander, 10.),
             0x929..=0x92c
                 if self.entities[&id].condition & condition::bit(condition::INVULNERABLE) == 0 =>
             {
                 (Motion::Stationary, 0.)
             }
-            0x929..=0x92c => (Motion::Wander, 12.),
+            0x929..=0x92c => (Motion::Wander, 20.),
             0x920 => (Motion::Wander, 2.),
             0x6c1 => (Motion::Wander, 9.),
+            0x675 => (Motion::Wander, 4.),
+            0x91f if e.stage == Some(0) => (Motion::Wander, 1.),
             _ => (Motion::Wander, 4.),
         }
     }
