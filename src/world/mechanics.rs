@@ -11,6 +11,26 @@ pub(super) struct Grenade {
 }
 
 impl World {
+    pub(super) fn heal_enemy(&mut self, healer: i32, target: i32, amount: i32) -> Result<i32> {
+        ensure!(amount > 0, "nonpositive enemy healing amount");
+        let kind = self
+            .entities
+            .get(&target)
+            .context("enemy heal target missing")?
+            .kind;
+        let maximum = self.content.get(kind)?.hp;
+        ensure!(maximum > 0, "enemy heal target has no selected HP");
+        let e = self.entities.get_mut(&target).unwrap();
+        let before = e.hp;
+        if e.conditions(self.now) & condition::bit(condition::SICK) == 0 {
+            e.hp = (e.hp + amount).min(maximum);
+        }
+        let gained = e.hp - before;
+        if gained > 0 {
+            tracing::debug!(healer, target, amount = gained, "ordinary enemy healed");
+        }
+        Ok(gained)
+    }
     pub(super) fn orbit_anchor(
         &self,
         id: i32,
@@ -35,6 +55,10 @@ impl World {
                     .context("family leader is no longer alive")?
                     .pos)
             }
+            encounter::Anchor::CampMember(kind) => Ok(self.entities[&self
+                .camp_member(id, kind)?
+                .context("own-camp orbit member absent")?]
+                .pos),
             encounter::Anchor::Parent => Ok(self
                 .entities
                 .get(&e.parent.context("entity has no explicit parent")?)
@@ -114,6 +138,9 @@ impl World {
             return self.finale_mechanics(id, target, elapsed);
         }
         let kind = self.entities[&id].kind;
+        if matches!(kind, 0x62b | 0x900..=0x902) {
+            return self.midland_mechanics(id);
+        }
         if kind == 0x91a || super::gods::CONSTRUCTS.contains(&kind) {
             return self.god_mechanics(id, elapsed);
         }
@@ -368,13 +395,13 @@ impl World {
             .map(|e| e.id)
             .collect();
         for id in expired {
-            if self.entities[&id].kind == 0x91a
+            if matches!(self.entities[&id].kind, 0x91a | 0x900)
                 && self.entities[&id]
                     .expires
                     .is_some_and(|deadline| deadline <= self.now)
             {
-                if let Err(error) = self.finish_djinn(id) {
-                    tracing::error!(entity=id,%error,"Djinn defeat failed");
+                if let Err(error) = self.finish_timed_defeat(id) {
+                    tracing::error!(entity=id,%error,"timed enemy defeat failed");
                 }
             } else {
                 self.remove_entity(id);

@@ -8,6 +8,7 @@ pub enum Anchor {
     Kind(u16),
     Home,
     CampLeader,
+    CampMember(u16),
 }
 #[derive(Clone, Copy)]
 pub enum Motion {
@@ -140,18 +141,26 @@ pub fn profile(kind: u16) -> Option<Profile> {
         0x617 => (chase(6.), 7.5, 400, 12.),
         0x61c | 0x61e | 0x61f | 0x63a | 0x63b | 0x63e => (chase(1.), 10., 1000, 3.),
         0x61d | 0x63c => (chase(7.), 10., 1000, 10.),
+        0x629 | 0x62c => (chase(1.), 12., 1000, 3.),
+        0x62a => (Wander, 12., 1000, 10.),
+        0x62b => (chase(7.), 12., 0, 0.),
+        0x6c6 => (chase(2.), 4., 200, 10.),
+        0x647 | 0x648 => (chase(7.), 12., 1000, 10.),
+        0x649 => (chase(7.), 10., 1000, 10.),
+        0x900..=0x902 => (Wander, 1., 500, 8.),
         0x63f => (Wander, 4., 1000, 10.),
         0x624 | 0xd00 => (Wander, 15., 300, 10.),
         0x625 | 0x626 | 0xd01..=0xd04 => (Wander, 15., 1000, 10.),
         0x632 => (chase(1.), 10., 1000, 10.),
         0x633 => (chase(1.), 10., 250, 10.),
         0x640 => (chase(1.), 10., 500, 10.),
-        0x642 | 0x645 => (chase(8.), 4., 500, 10.),
-        0x643 => (chase(1.), 6., 1000, 3.),
-        0x644 => (chase(8.), 4., 200, 10.),
+        0x642 | 0x644 => (chase(7.), 12., 1000, 10.),
+        0x643 | 0x645 => (chase(1.), 12., 1000, 3.),
         0x646 => (chase(1.), 10., 500, 10.),
-        0x64a..=0x64d | 0x64f => (chase(7.), 12., 500, 10.),
-        0x650 => (chase(1.), 10., 500, 10.),
+        0x64a | 0x64c | 0x64d => (chase(7.), 12., 500, 10.),
+        0x64b => (chase(1.), 12., 500, 3.),
+        0x64f => (chase(7.), 15., 1000, 10.),
+        0x650 => (chase(7.), 10., 1000, 10.),
         0x651 | 0x654 => (chase(4.), 6., 1000, 12.),
         0x652 | 0xd05 => (Wander, 2., 1000, 12.),
         0x653 => (
@@ -236,6 +245,9 @@ pub fn stage(kind: u16, hp: i32, elapsed: u64) -> u64 {
         0x609 => elapsed / 2000,
         0x614 => u64::from(hp <= 182),
         0x953 => u64::from(hp <= 80),
+        0x61f => (elapsed / 2500) % 2,
+        0x6c6 => (elapsed / 1000) % 2,
+        0x649 => (elapsed / 1000) % 2,
         0x91a if hp < 400 => 2,
         0x91a => u64::from(elapsed % 3750 >= 2500),
         0x6d8 => (elapsed / 1500) % 3 + 3 * ((elapsed / 2000) % 3),
@@ -374,7 +386,14 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
         | 0x63a..=0x63c
         | 0x63e
         | 0x63f
-        | 0x642..=0x645
+        | 0x642
+        | 0x643
+        | 0x645
+        | 0x629
+        | 0x62c
+        | 0x647
+        | 0x648
+        | 0x900..=0x902
         | 0x64a..=0x64d
         | 0x64f
         | 0x223
@@ -422,7 +441,22 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
                 vec![(0, heading)]
             }
         }
-        0x650 => spread(0, 3, 7., heading),
+        0x6c6 => {
+            if elapsed % 1000 % 400 < 200 {
+                if (elapsed / 1000).is_multiple_of(2) {
+                    spread(0, 3, 15., heading)
+                } else {
+                    vec![(1, heading)]
+                }
+            } else {
+                vec![]
+            }
+        }
+        0x62a => spread(0, 3, 15., heading),
+        0x62b => vec![],
+        0x644 => spread(0, 3, 7., heading),
+        0x649 => vec![(u8::from(!(elapsed / 1000).is_multiple_of(2)), heading)],
+        0x650 => spread(0, 5, 7., heading),
         0x651 => spread(0, 3, 15., heading),
         0x652 | 0xd05 => {
             let mut shots = spread(0, 4, 10., heading);

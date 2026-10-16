@@ -14,14 +14,12 @@ impl World {
             tracing::debug!(owner, target, "damage target already removed");
             return Ok(0);
         };
-        let damage = crate::condition::damage(
-            raw,
-            self.content.objects[&e.kind].defense,
-            e.conditions(self.now),
-            piercing,
-        );
+        let flags = e.conditions(self.now);
+        let affects = !crate::condition::protected(flags);
+        let damage =
+            crate::condition::damage(raw, self.content.objects[&e.kind].defense, flags, piercing);
         let actual = damage.min(e.hp).max(0);
-        if damage > 0 {
+        if affects {
             for (index, duration) in effects {
                 self.apply_condition(target, *index, *duration)?;
             }
@@ -50,8 +48,8 @@ impl World {
         }
         let mut o = Writer::new();
         o.i32(target)
-            .u8(if damage > 0 { effects.len() as u8 } else { 0 });
-        if damage > 0 {
+            .u8(if affects { effects.len() as u8 } else { 0 });
+        if affects {
             for (index, _) in effects {
                 o.u8(*index);
             }
