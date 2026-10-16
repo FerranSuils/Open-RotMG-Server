@@ -1,4 +1,6 @@
 mod input;
+#[cfg(test)]
+mod queue_tests;
 use crate::{
     content::{Content, WIZARD},
     crypto::Keys,
@@ -505,6 +507,32 @@ fn collision_report(other: bool, r: &mut Reader<'_>) -> Result<()> {
     }
     r.done()
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyQueueError {
+    Full,
+    Closed,
+}
+impl std::fmt::Display for ReplyQueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Full => "connection reply queue is full",
+            Self::Closed => "connection reply queue is closed",
+        })
+    }
+}
+impl std::error::Error for ReplyQueueError {}
+
+fn enqueue_reply(tx: &mpsc::Sender<Packet>, packet: Packet) -> Result<()> {
+    // This handler's caller is also the only consumer, so waiting for capacity deadlocks.
+    tx.try_send(packet).map_err(|error| {
+        match error {
+            mpsc::error::TrySendError::Full(_) => ReplyQueueError::Full,
+            mpsc::error::TrySendError::Closed(_) => ReplyQueueError::Closed,
+        }
+        .into()
+    })
+}
+
 async fn handle(
     a: &mut App,
     packet: Packet,
@@ -606,11 +634,13 @@ async fn handle(
             *expected = character;
             a.world = a.world.in_world(destination);
             let body = a.world.call(|w| Ok(w.map_info())).await?;
-            tx.send(Packet {
-                id: wire::MAP_INFO,
-                body,
-            })
-            .await?;
+            enqueue_reply(
+                tx,
+                Packet {
+                    id: wire::MAP_INFO,
+                    body,
+                },
+            )?;
             tracing::info!(
                 account = id,
                 requested_world = game,
@@ -775,7 +805,7 @@ async fn handle(
                     Ok(text) => text,
                     Err(error) => error.to_string(),
                 };
-                tx.send(crate::world::chat_private(&reply)).await?;
+                enqueue_reply(tx, crate::world::chat_private(&reply))?;
             } else if matches!(
                 text.split_whitespace()
                     .next()
@@ -814,12 +844,11 @@ async fn handle(
                     Ok(text) => crate::world::chat_info(text),
                     Err(error) => crate::world::chat_error(&error.to_string()),
                 };
-                tx.send(reply).await?;
+                enqueue_reply(tx, reply)?;
             } else if let Err(error) = a.world.directory(move |d| d.chat(id, text, received)).await
             {
                 tracing::warn!(player=id, error=%error, "local chat rejected");
-                tx.send(crate::world::chat_error(&error.to_string()))
-                    .await?;
+                enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
             }
         }
         wire::EDIT_ACCOUNT_LIST => {
@@ -859,8 +888,7 @@ async fn handle(
                 a.world
                     .call(move |w| w.sync_account_lists(id, None))
                     .await?;
-                tx.send(crate::world::chat_error(&error.to_string()))
-                    .await?;
+                enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
             }
         }
         wire::TELEPORT => {
@@ -873,8 +901,7 @@ async fn handle(
                 .await
             {
                 tracing::warn!(player=id, target, error=%error, "teleport rejected");
-                tx.send(crate::world::chat_error(&error.to_string()))
-                    .await?;
+                enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
             }
         }
         wire::PONG => {
@@ -933,8 +960,7 @@ async fn handle(
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(player=id, item=s.kind, slot=s.slot, error=%error, "item use rejected");
-                    tx.send(crate::world::chat_error(&error.to_string()))
-                        .await?;
+                    enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
                 }
             }
         }
@@ -1008,7 +1034,7 @@ async fn handle(
                 tracing::warn!(account, error=%e, "name choice rejected");
                 let mut o = Writer::new();
                 o.u8(0).utf(&e.to_string());
-                tx.send(Packet { id: 20, body: o.0 }).await?;
+                enqueue_reply(tx, Packet { id: 20, body: o.0 })?;
                 return Ok(());
             }
             if let Some(id) = player {
@@ -1026,7 +1052,7 @@ async fn handle(
             }
             let mut o = Writer::new();
             o.u8(1).utf("");
-            tx.send(Packet { id: 20, body: o.0 }).await?;
+            enqueue_reply(tx, Packet { id: 20, body: o.0 })?;
         }
         42 | 3 => {
             let portal = if packet.id == 3 { Some(r.i32()?) } else { None };
@@ -1060,7 +1086,7 @@ async fn handle(
                 .i32(keytime)
                 .i16(key.len() as i16);
             o.0.extend(key);
-            tx.send(Packet { id: 39, body: o.0 }).await?;
+            enqueue_reply(tx, Packet { id: 39, body: o.0 })?;
             *reconnecting = true;
             account
                 .take()
@@ -1079,8 +1105,18 @@ async fn handle(
     }
     Ok(())
 }
-async fn connection(socket: WebSocket, mut a: App) {
-    let (mut wsout, wsin) = socket.split();
+async fn connection(socket: WebSocket, a: App) {
+    let (wsout, wsin) = socket.split();
+    connection_io(wsout, wsin, a).await;
+}
+async fn connection_io<S, I>(mut wsout: S, wsin: I, mut a: App)
+where
+    S: futures_util::Sink<Message> + Unpin,
+    I: futures_util::Stream<Item = std::result::Result<Message, axum::Error>>
+        + Send
+        + Unpin
+        + 'static,
+{
     let (tx, mut rx) = mpsc::channel::<Packet>(64);
     let (lost, mut lost_rx) = tokio::sync::watch::channel(false);
     // Actor work and output backpressure must not manufacture late, clustered input receipts.
@@ -1118,6 +1154,7 @@ async fn connection(socket: WebSocket, mut a: App) {
                         let id=packet.id;
                         if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost,received).await {
                             tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,error=%format_args!("{e:#}"),"game command rejected");
+                            if e.is::<ReplyQueueError>() { break 'connection; }
                             if matches!(id,1|21|37|57) && let Some(player) = session.player {
                                 let reason = e.to_string();
                                 let closed = a.world.for_player(player).call(move |w| Ok(w.cancel_trade(player, &reason))).await;
