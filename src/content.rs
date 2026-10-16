@@ -72,7 +72,7 @@ impl Projectile {
         if self.parametric {
             let phase = elapsed / self.lifetime * std::f32::consts::TAU;
             let a = phase.sin() * if id.is_multiple_of(2) { -1. } else { 1. };
-            let b = (phase * 2.).sin() * if id % 4 < 2 { -1. } else { 1. };
+            let b = (phase * 2.).sin() * if id % 4 < 2 { 1. } else { -1. };
             return (
                 (a * angle.cos() - b * angle.sin()) * self.magnitude,
                 (a * angle.sin() + b * angle.cos()) * self.magnitude,

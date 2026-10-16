@@ -25,19 +25,22 @@ async fn enter(
     let (packets, output) = mpsc::channel(OUTPUT_CAPACITY);
     let sender = packets.clone();
     let (lost, _) = watch::channel(false);
+    let presentation = app.store.presentation(character.account).await?;
     let id = app
         .world
         .in_world(world)
-        .call(move |w| match position {
-            None => w.enter_autonomous(character, Output { packets, lost }),
-            Some(position) => {
-                let id = w.enter_at(character, Some(Output { packets, lost }), Some(position))?;
-                w.players
-                    .get_mut(&id)
-                    .context("new selected bot missing")?
-                    .controller = crate::world::Controller::Autonomous;
-                Ok(id)
-            }
+        .call(move |w| {
+            let id = w.enter_at(
+                character,
+                Some(Output { packets, lost }),
+                position,
+                presentation,
+            )?;
+            w.players
+                .get_mut(&id)
+                .context("new autonomous player missing")?
+                .controller = crate::world::Controller::Autonomous;
+            Ok(id)
         })
         .await?;
     let view = app.world.directory(move |d| d.player_view(id)).await?;

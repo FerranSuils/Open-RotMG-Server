@@ -46,11 +46,7 @@ async fn loaded(a: &App, guid: String) -> Session {
         .create(account, a.content.get(WIZARD).unwrap())
         .await
         .unwrap();
-    let player = a
-        .world
-        .call(move |w| w.enter_at(ch, None, None))
-        .await
-        .unwrap();
+    let player = a.world.call(move |w| w.enter(ch, None)).await.unwrap();
     Session {
         account: Some(a.claim_session(account).unwrap()),
         player: Some(player),

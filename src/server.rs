@@ -246,6 +246,29 @@ async fn chars(
     .await;
     match result {
         Ok(xml) => ([("content-type", "application/xml")], xml).into_response(),
+        Err(e) if e.is::<crate::store::InvalidCredentials>() => {
+            tracing::info!("legacy character-list credentials rejected");
+            (
+                [("content-type", "application/xml")],
+                "<Error>Account credentials not valid</Error>",
+            )
+                .into_response()
+        }
+        Err(e) => error(e),
+    }
+}
+async fn delete_character(
+    State(a): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    match admit(&a, &headers, peer) {
+        Ok(true) => (
+            [("content-type", "application/xml")],
+            "<Error>Character deletion is not implemented; no character was deleted.</Error>",
+        )
+            .into_response(),
+        Ok(false) => limited(),
         Err(e) => error(e),
     }
 }
@@ -681,6 +704,7 @@ async fn handle(
                 None
             };
             let lists = a.store.account_lists(account).await?;
+            let presentation = a.store.presentation(account).await?;
             let prepared = a
                 .testing
                 .as_ref()
@@ -693,7 +717,12 @@ async fn handle(
                         if let Some(vault) = vault {
                             w.load_vault(vault)?;
                         }
-                        let id = w.enter_at(ch, Some(output), prepared.map(|(_, pos)| pos))?;
+                        let id = w.enter_at(
+                            ch,
+                            Some(output),
+                            prepared.map(|(_, pos)| pos),
+                            presentation,
+                        )?;
                         w.sync_account_lists(id, Some(lists))?;
                         Ok(id)
                     })
@@ -961,6 +990,9 @@ async fn handle(
                 Err(error) => {
                     tracing::warn!(player=id, item=s.kind, slot=s.slot, error=%error, "item use rejected");
                     enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
+                    let mut out = Writer::new();
+                    out.i32(1);
+                    enqueue_reply(tx, Packet { id: 4, body: out.0 })?;
                 }
             }
         }
@@ -1300,10 +1332,11 @@ async fn bot_create(
             acc.characters[0].clone()
         };
         let destination = a.world.directory(move |d| d.initial(input.world)).await?;
+        let presentation = a.store.presentation(acc.id).await?;
         let id = a
             .world
             .in_world(destination)
-            .call(move |w| w.enter(ch, None))
+            .call(move |w| w.enter_at(ch, None, None, presentation))
             .await?;
         a.bots
             .lock()
@@ -1575,6 +1608,7 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
     let app = Router::new()
         .route("/legacy-api/char/list", post(chars))
         .route("/legacy-api/char/fame", post(fame))
+        .route("/legacy-api/char/delete", post(delete_character))
         .route("/legacy-api/account/{operation}", post(account_request))
         .route("/legacy-api/fame/list", post(legends))
         .nest_service("/sfx", tower_http::services::ServeDir::new(a.sfx.clone()))
