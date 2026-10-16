@@ -3,7 +3,18 @@ www.openrotmg.org {
 }
 
 openrotmg.org {
-    encode zstd gzip
+    encode zstd gzip {
+        match {
+            header Content-Type application/*
+            header Content-Type text/*
+            header Content-Type font/*
+            header Content-Type image/svg+xml*
+            header Content-Type image/x-icon*
+            header Content-Type image/vnd.microsoft.icon*
+            header Content-Type multipart/bag*
+            header Content-Type multipart/mixed*
+        }
+    }
     header {
         X-Content-Type-Options nosniff
         Referrer-Policy strict-origin-when-cross-origin
