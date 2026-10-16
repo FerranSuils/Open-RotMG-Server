@@ -4,15 +4,60 @@ use crate::content::{Class, Content, Object, PRIEST, WIZARD};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, sync::mpsc};
+use std::{collections::BTreeMap, path::Path, sync::mpsc};
 use tokio::sync::oneshot;
 
 mod account_actions;
 mod accounts;
 mod hiscores;
 mod legends;
+#[cfg(test)]
+mod presentation_tests;
 mod social;
 pub use social::AccountLists;
+
+#[derive(Debug)]
+pub struct InvalidCredentials;
+impl std::fmt::Display for InvalidCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid email or password")
+    }
+}
+impl std::error::Error for InvalidCredentials {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountPresentation {
+    pub fame: i32,
+    pub best_fame: BTreeMap<u16, i32>,
+}
+impl AccountPresentation {
+    const THRESHOLDS: [i32; 5] = [20, 150, 400, 800, 2000];
+
+    pub fn stars(&self) -> i32 {
+        self.best_fame
+            .values()
+            .map(|best| {
+                Self::THRESHOLDS
+                    .iter()
+                    .filter(|threshold| best >= *threshold)
+                    .count() as i32
+            })
+            .sum()
+    }
+
+    pub fn next_quest(&self, class: u16, current_fame: i32) -> i32 {
+        let best = self
+            .best_fame
+            .get(&class)
+            .copied()
+            .unwrap_or(0)
+            .max(current_fame);
+        Self::THRESHOLDS
+            .into_iter()
+            .find(|threshold| *threshold > best)
+            .unwrap_or(-1)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Character {
@@ -141,6 +186,7 @@ pub struct Account {
     pub fame: i64,
     pub earned_fame: i64,
     pub best_levels: std::collections::BTreeMap<u16, i32>,
+    pub best_fame: BTreeMap<u16, i32>,
     pub characters: Vec<Character>,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -361,12 +407,25 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         };
         self.list_id(id).await
     }
+    pub async fn presentation(&self, account: i32) -> Result<AccountPresentation> {
+        let legacy_base = self.legacy_base;
+        let classes = self.classes.clone();
+        self.call(move |db| {
+            let tx = db.transaction()?;
+            let (presentation, _) = read_presentation(&tx, account, legacy_base, &classes)?;
+            tx.commit()?;
+            Ok(presentation)
+        })
+        .await
+    }
     async fn list_id(&self, id: i32) -> Result<Account> {
+        let legacy_base = self.legacy_base;
+        let classes = self.classes.clone();
         let account = self.call(move|c|{let tx=c.transaction()?;
             let name:String=tx.query_row("SELECT name FROM accounts WHERE id=?1",[id],|r|r.get(0))?;
             let mut characters=Vec::new();{let mut q=tx.prepare("SELECT id,stats,items,revision,alive FROM characters WHERE account=?1 AND alive=1 ORDER BY id")?;let rows=q.query_map([id],|r|Ok((r.get::<_,i32>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i32>(3)?,r.get::<_,bool>(4)?)))?;
             for row in rows{let(cid,stats,items,rev,alive)=row?;let mut ch:Character=serde_json::from_str(&stats)?;ch.id=cid;ch.account=id;ch.name=name.clone();ch.items=serde_json::from_str(&items)?;ch.revision=rev;ch.alive=alive;characters.push(ch);}}
-            let next_id:i32=tx.query_row("SELECT coalesce(max(id),0)+1 FROM characters WHERE account=?1",[id],|r|r.get(0))?;let best_levels = { let mut q = tx.prepare("SELECT json_extract(stats,'$.class'),max(json_extract(stats,'$.level')) FROM characters WHERE account=?1 GROUP BY json_extract(stats,'$.class')")?; q.query_map([id], |r| Ok((r.get::<_,u16>(0)?, r.get::<_,i32>(1)?)))?.collect::<rusqlite::Result<std::collections::BTreeMap<_,_>>>()? };let (fame,earned_fame) = tx.query_row("SELECT balance,earned FROM account_fame WHERE account=?1",[id],|r|Ok((r.get(0)?,r.get(1)?)))?;tx.commit()?;Ok(Account{id,name,next_id,fame,earned_fame,best_levels,characters})}).await?;
+            let next_id:i32=tx.query_row("SELECT coalesce(max(id),0)+1 FROM characters WHERE account=?1",[id],|r|r.get(0))?;let best_levels = { let mut q = tx.prepare("SELECT json_extract(stats,'$.class'),max(json_extract(stats,'$.level')) FROM characters WHERE account=?1 GROUP BY json_extract(stats,'$.class')")?; q.query_map([id], |r| Ok((r.get::<_,u16>(0)?, r.get::<_,i32>(1)?)))?.collect::<rusqlite::Result<std::collections::BTreeMap<_,_>>>()? };let (presentation,earned_fame) = read_presentation(&tx, id, legacy_base, &classes)?;tx.commit()?;Ok(Account{id,name,next_id,fame:i64::from(presentation.fame),earned_fame,best_levels,best_fame:presentation.best_fame,characters})}).await?;
         self.vault(account.id).await?;
         Ok(account)
     }
@@ -727,6 +786,55 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         .await
     }
 }
+fn read_presentation(
+    db: &Connection,
+    account: i32,
+    legacy_base: [i32; 8],
+    classes: &BTreeMap<u16, Class>,
+) -> Result<(AccountPresentation, i64)> {
+    let (balance, earned): (i64, i64) = db
+        .query_row(
+            "SELECT balance,earned FROM account_fame WHERE account=?1",
+            [account],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .context("read account fame wallet")?;
+    let fame = i32::try_from(balance).context("account fame exceeds wire range")?;
+    ensure!(
+        fame >= 0 && earned >= balance && earned <= i64::from(i32::MAX),
+        "invalid account fame wallet"
+    );
+    let mut best_fame = BTreeMap::<u16, i32>::new();
+    let mut q = db.prepare("SELECT d.character,d.snapshot FROM deaths d JOIN characters c ON c.id=d.character WHERE c.account=?1")?;
+    for row in q.query_map([account], |r| {
+        Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (id, raw) = row?;
+        let ch = decode_character(&raw, legacy_base)
+            .with_context(|| format!("decode committed death {id}"))?;
+        let class = classes
+            .get(&ch.class)
+            .with_context(|| format!("unknown class in committed death {id}"))?;
+        ensure!(
+            ch.id == id
+                && ch.account == account
+                && !ch.alive
+                && ch.hp == 0
+                && ch.fame >= 0
+                && (1..=20).contains(&ch.level)
+                && ch.items.len() == 12
+                && ch
+                    .base
+                    .iter()
+                    .zip(class.caps)
+                    .all(|(value, cap)| *value >= 0 && *value <= cap),
+            "invalid committed death {id}"
+        );
+        let best = best_fame.entry(ch.class).or_default();
+        *best = (*best).max(ch.fame);
+    }
+    Ok((AccountPresentation { fame, best_fame }, earned))
+}
 pub fn name_chosen(account: i32, name: &str) -> bool {
     name != format!("Guest{account}")
 }
@@ -770,7 +878,10 @@ impl Account {
         } else {
             ""
         };
-        let records: String = self.best_levels.iter().map(|(class, level)| format!("<ClassStats objectType=\"{class}\"><BestLevel>{level}</BestLevel><BestFame>0</BestFame></ClassStats>")).collect();
+        let records: String = self.best_levels.iter().map(|(class, level)| {
+            let fame = self.best_fame.get(class).copied().unwrap_or(0);
+            format!("<ClassStats objectType=\"{class}\"><BestLevel>{level}</BestLevel><BestFame>{fame}</BestFame></ClassStats>")
+        }).collect();
         format!(
             "<Chars nextCharId=\"{}\" maxNumChars=\"1\">{chars}<Account><AccountId>{}</AccountId><Name>{}</Name>{chosen}<Stats><Fame>{}</Fame><TotalFame>{}</TotalFame>{records}</Stats><Credits>0</Credits><NextCharSlotPrice>600</NextCharSlotPrice></Account><Servers><Server><Name>Local development</Name><DNS>127.0.0.1</DNS><Lat>0</Lat><Long>0</Long><Usage>0</Usage></Server></Servers><News/></Chars>",
             self.next_id,
