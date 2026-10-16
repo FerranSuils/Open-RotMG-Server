@@ -9,7 +9,17 @@ fn player(w: &mut World, class: u16, account: i32, pos: Pos) -> i32 {
     ch.hp = ch.base[0];
     ch.mp = ch.base[1];
     ch.items = w.content.get(class).unwrap().equipment.clone();
-    let id = w.enter_at(ch, None, Some(pos)).unwrap();
+    let id = w
+        .enter_at(
+            ch,
+            None,
+            Some(pos),
+            AccountPresentation {
+                fame: 0,
+                best_fame: BTreeMap::new(),
+            },
+        )
+        .unwrap();
     w.players.get_mut(&id).unwrap().controller = Controller::Human;
     id
 }

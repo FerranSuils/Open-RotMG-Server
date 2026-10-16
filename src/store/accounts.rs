@@ -44,28 +44,38 @@ pub(super) fn password(value: &str) -> Result<()> {
     );
     Ok(())
 }
-fn guest(db: &Connection, guid: &str, create: bool) -> Result<i32> {
+fn guest(db: &Connection, guid: &str, create: bool, authentication: bool) -> Result<i32> {
+    let rejected = |reason: &'static str| -> anyhow::Error {
+        if authentication {
+            InvalidCredentials.into()
+        } else {
+            anyhow::anyhow!(reason)
+        }
+    };
     // Reserve the email namespace so an empty password can never create a shadow login.
-    ensure!(
-        !guid.is_empty()
-            && guid.len() <= 128
-            && guid
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
-        "invalid guest identity"
-    );
+    if !(!guid.is_empty()
+        && guid.len() <= 128
+        && guid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
+    {
+        return Err(rejected("invalid guest identity"));
+    }
     let found: Option<(i32, bool)> = db.query_row(
         "SELECT id,EXISTS(SELECT 1 FROM credentials WHERE account=accounts.id) FROM accounts WHERE guid=?1",
         [guid], |r| Ok((r.get(0)?,r.get(1)?)),
     ).optional()?;
     if let Some((id, registered)) = found {
-        ensure!(
-            !registered,
-            "guest identity has been converted; sign in with your email and password"
-        );
+        if registered {
+            return Err(rejected(
+                "guest identity has been converted; sign in with your email and password",
+            ));
+        }
         return Ok(id);
     }
-    ensure!(create, "unknown guest; load character list first");
+    if !create {
+        return Err(rejected("unknown guest; load character list first"));
+    }
     db.execute("INSERT INTO accounts(guid,name) VALUES(?1,'Guest')", [guid])?;
     let id = i32::try_from(db.last_insert_rowid())?;
     db.execute(
@@ -102,7 +112,7 @@ impl Store {
     pub(super) async fn guest(&self, guid: String, create: bool) -> Result<i32> {
         self.call(move |db| {
             let tx = db.transaction()?;
-            let id = guest(&tx, &guid, create)?;
+            let id = guest(&tx, &guid, create, true)?;
             tx.commit()?;
             Ok(id)
         })
@@ -129,7 +139,7 @@ impl Store {
         let id = self
             .call(move |db| {
                 let tx = db.transaction()?;
-                let id = guest(&tx, &guid, true)?;
+                let id = guest(&tx, &guid, true, false)?;
                 let exists: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM credentials WHERE email=?1)",
                     [&email],
@@ -154,8 +164,8 @@ impl Store {
         if clear.is_empty() {
             return self.guest(guid, false).await;
         }
-        let email = email(&guid).map_err(|_| anyhow::anyhow!("invalid email or password"))?;
-        password(&clear).map_err(|_| anyhow::anyhow!("invalid email or password"))?;
+        let email = email(&guid).map_err(|_| InvalidCredentials)?;
+        password(&clear).map_err(|_| InvalidCredentials)?;
         let found: Option<(i32, String)> = self
             .call(move |db| {
                 Ok(db
@@ -187,8 +197,8 @@ impl Store {
             }
         })
         .await??;
-        ensure!(valid, "invalid email or password");
-        let (id, _) = found.context("invalid email or password")?;
+        ensure!(valid, InvalidCredentials);
+        let (id, _) = found.ok_or(InvalidCredentials)?;
         Ok(id)
     }
 }
@@ -282,6 +292,81 @@ mod tests {
         assert!(!verifier.contains("native-password"));
     }
     #[tokio::test]
+    async fn invalid_authentication_is_typed_without_reclassifying_policy_or_service_errors() {
+        let (s, _, _) = store("typed-credentials");
+        let fresh = s
+            .characters("new-guest".into(), String::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            s.authenticate("new-guest".into(), String::new())
+                .await
+                .unwrap(),
+            fresh.id
+        );
+        s.register("guest".into(), "x@example.org".into(), "password".into())
+            .await
+            .unwrap();
+        for (guid, password) in [
+            ("bad@email", "password"),
+            ("x@example.org", "tiny"),
+            ("x@example.org", "wrong-password"),
+            ("missing@example.org", "password"),
+            ("guest", ""),
+            ("unknown-guest", ""),
+            ("x@example.org", ""),
+        ] {
+            let error = s
+                .authenticate(guid.into(), password.into())
+                .await
+                .unwrap_err();
+            assert!(error.is::<InvalidCredentials>(), "{error:#}");
+            assert_eq!(error.to_string(), "invalid email or password");
+        }
+        for guid in ["guest", "x@example.org"] {
+            assert!(
+                s.characters(guid.into(), String::new())
+                    .await
+                    .unwrap_err()
+                    .is::<InvalidCredentials>()
+            );
+        }
+        assert!(
+            s.characters("x@example.org".into(), "wrong-password".into())
+                .await
+                .unwrap_err()
+                .is::<InvalidCredentials>()
+        );
+        for guid in ["guest", "invalid@guest"] {
+            assert!(
+                !s.register(guid.into(), "other@example.org".into(), "password".into())
+                    .await
+                    .unwrap_err()
+                    .is::<InvalidCredentials>()
+            );
+        }
+        let permit = s.hashes.clone().acquire_many_owned(2).await.unwrap();
+        let busy = s
+            .authenticate("x@example.org".into(), "password".into())
+            .await
+            .unwrap_err();
+        assert!(!busy.is::<InvalidCredentials>());
+        assert_eq!(busy.to_string(), "account service busy; retry shortly");
+        drop(permit);
+        s.call(|db| {
+            db.execute("DROP TABLE credentials", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let storage = s
+            .characters("x@example.org".into(), "password".into())
+            .await
+            .unwrap_err();
+        assert!(!storage.is::<InvalidCredentials>());
+        assert!(storage.to_string().contains("no such table"));
+    }
+    #[tokio::test]
     async fn native_name_choice_is_registered_unique_and_one_time() {
         let (s, _, _) = store("name-choice");
         let guest = s.list("name-guest".into()).await.unwrap();
@@ -332,13 +417,12 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(
-            s.authenticate("x@example.org".into(), "password".into())
-                .await
-                .unwrap_err()
-                .to_string(),
-            "invalid stored password verifier"
-        );
+        let error = s
+            .authenticate("x@example.org".into(), "password".into())
+            .await
+            .unwrap_err();
+        assert!(!error.is::<InvalidCredentials>());
+        assert_eq!(error.to_string(), "invalid stored password verifier");
     }
     #[tokio::test]
     async fn concurrent_conversion_has_one_winner_and_failed_validation_changes_nothing() {

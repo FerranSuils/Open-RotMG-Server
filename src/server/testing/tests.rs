@@ -491,6 +491,10 @@ async fn committed_native_death_is_not_reconnect_and_halts_the_owned_cohort() {
                 living,
                 Some(crate::world::Output { packets: tx, lost }),
                 Some(pos),
+                crate::store::AccountPresentation {
+                    fame: 0,
+                    best_fame: Default::default(),
+                },
             )?;
             w.players.get_mut(&id).unwrap().native_update_acked = true;
             Ok(id)

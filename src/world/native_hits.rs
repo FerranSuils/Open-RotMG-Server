@@ -160,15 +160,18 @@ impl World {
                     output.lost.send_replace(true);
                 }
                 p.departing = true;
-                let oldest = p.shoot_acks.front().and_then(|(_, shots)| shots.first());
+                let (sent, bullets) = p.shoot_acks.front().expect("expired acknowledgement");
                 tracing::error!(
                     player = id,
-                    owner = oldest.map(|b| b.owner),
-                    source_kind = oldest.map(|b| b.source_kind),
-                    projectile = oldest.map(|b| b.id),
-                    born_ms = oldest.map(|b| b.born),
-                    last_native_move = p.last_move,
                     pending = p.shoot_acks.len(),
+                    oldest_ms = sent.elapsed().as_millis(),
+                    shooter = ?bullets.first().map(|b|b.owner),
+                    volley = bullets.len(),
+                    source_kind = bullets.first().map(|b| b.source_kind),
+                    projectile = bullets.first().map(|b| b.id),
+                    born_ms = bullets.first().map(|b| b.born),
+                    last_native_move = p.last_move,
+
                     "SHOOT acknowledgement timed out; connection closed"
                 );
             }

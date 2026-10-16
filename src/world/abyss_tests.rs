@@ -18,7 +18,15 @@ fn fixture() -> (World, i32) {
     ch.hp = ch.base[0];
     ch.mp = ch.base[1];
     let id = w
-        .enter_at(ch, None, Some(Pos { x: 12.5, y: 12.5 }))
+        .enter_at(
+            ch,
+            None,
+            Some(Pos { x: 12.5, y: 12.5 }),
+            AccountPresentation {
+                fame: 0,
+                best_fame: BTreeMap::new(),
+            },
+        )
         .unwrap();
     (w, id)
 }
@@ -196,7 +204,17 @@ fn an_idol_activates_on_damage_closes_only_its_bridge_and_restores_lava_without_
     let mut ch = tests::ch(&w);
     ch.base = w.content.classes[&ch.class].caps;
     ch.hp = ch.base[0];
-    let player = w.enter_at(ch, None, Some(home)).unwrap();
+    let player = w
+        .enter_at(
+            ch,
+            None,
+            Some(home),
+            AccountPresentation {
+                fame: 0,
+                best_fame: BTreeMap::new(),
+            },
+        )
+        .unwrap();
     w.npc_step();
     assert_eq!(bridges(&w), count);
     w.updates(player, true).unwrap();
