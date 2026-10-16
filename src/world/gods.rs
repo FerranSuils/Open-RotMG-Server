@@ -11,30 +11,14 @@ pub(super) const CONSTRUCTS: &[u16] = &[0x905, 0x906, 0x907];
 impl World {
     pub(super) fn populate_godlands(&mut self, candidates: &[Pos]) -> Result<()> {
         self.populate_families(1, candidates, &[0x652, 0x652, 0x905])?;
-        for kind in [
-            0x651, 0x654, 0x655, 0x656, 0x657, 0x658, 0x659, 0x6d8, 0x651, 0x654, 0x655, 0x656,
-            0x657, 0x658, 0x659, 0x6d8, 0x91a,
-        ] {
-            ensure!(
-                self.content.get(kind)?.terrain == 1,
-                "Godlands solo contradicts XML habitat"
-            );
-            encounter::validate(&self.content, kind)?;
-            crate::loot::validate(&self.content, kind)?;
-            let pos = candidates
-                .iter()
-                .copied()
-                .find(|p| self.population.iter().all(|s| s.pos.distance(*p) >= 8.))
-                .context("Godlands cannot place its bounded complete roster")?;
-            let entity = self.spawn_entity(kind, pos, vec![])?;
-            self.population.push(Spawn {
-                kind,
-                pos,
-                entity: Some(entity),
-                ready: 0,
-                camp: None,
-            });
-        }
+        self.populate_solos(
+            1,
+            candidates,
+            &[
+                0x651, 0x654, 0x655, 0x656, 0x657, 0x658, 0x659, 0x6d8, 0x651, 0x654, 0x655, 0x656,
+                0x657, 0x658, 0x659, 0x6d8, 0x91a,
+            ],
+        )?;
         ensure!(
             self.population_count(1) == 28,
             "Godlands initial body budget changed"
@@ -191,30 +175,11 @@ impl World {
                     0x907 => 0x906,
                     _ => unreachable!(),
                 };
-                let camp = self.entities[&id]
-                    .camp
-                    .context("construct heal lacks trio ownership")?;
-                let target = self
-                    .entities
-                    .values()
-                    .find(|e| {
-                        e.camp == Some(camp) && e.kind == target_kind && e.pos.distance(pos) <= 5.
-                    })
-                    .map(|e| e.id);
-                if let Some(target) = target {
-                    let e = self.entities.get_mut(&target).unwrap();
-                    let before = e.hp;
-                    if e.conditions(self.now) & condition::bit(condition::SICK) == 0 {
-                        e.hp = (e.hp + 2500).min(self.content.objects[&e.kind].hp);
-                    }
-                    if e.hp > before {
-                        tracing::debug!(
-                            entity = id,
-                            target,
-                            amount = e.hp - before,
-                            "construct healed its own trio partner"
-                        );
-                    }
+                if let Some(target) = self
+                    .camp_member(id, target_kind)?
+                    .filter(|target| self.entities[target].pos.distance(pos) <= 5.)
+                {
+                    self.heal_enemy(id, target, 2500)?;
                 }
             }
         }
@@ -255,14 +220,15 @@ impl World {
             ensure!(
                 self.decoy_positions()
                     .any(|p| p.x == target.x && p.y == target.y),
-                "Godlands target is neither a current player nor a live decoy"
+                "predictive target is neither a current player nor a live decoy"
             );
             Pos { x: 0., y: 0. }
         };
         for (index, angle) in &mut shots {
             let factor = match (e.kind, *index) {
-                (0x651 | 0x652 | 0x655 | 0x658, _) | (0x656, 1) | (0x6d8, 1) => 1.,
-                (0x656, 0) => 0.5,
+                (0x651 | 0x652 | 0x655 | 0x658 | 0x650 | 0x64f, _)
+                | (0x656 | 0x6d8 | 0x640 | 0x649, 1) => 1.,
+                (0x656 | 0x649, 0) => 0.5,
                 _ => 0.,
             };
             if factor == 0. {
@@ -279,31 +245,5 @@ impl World {
             *angle += (aim.y - e.pos.y).atan2(aim.x - e.pos.x) - heading;
         }
         Ok(shots)
-    }
-    pub(super) fn finish_djinn(&mut self, id: i32) -> Result<()> {
-        let e = &self.entities[&id];
-        let owner = self
-            .players
-            .iter()
-            .filter(|(_, p)| p.character.alive && !p.death_pending && !p.departing)
-            .filter_map(|(id, p)| {
-                e.damage
-                    .get(&p.character.id)
-                    .filter(|n| **n > 0)
-                    .map(|n| (*id, *n))
-            })
-            .max_by_key(|(_, n)| *n)
-            .map(|(id, _)| id);
-        // Self-destruction has no final player bullet, so the largest eligible contributor owns its kill statistic.
-        if let Some(owner) = owner {
-            self.players.get_mut(&owner).unwrap().character.kills += 1;
-        }
-        self.defeat_entity(id)?;
-        tracing::info!(
-            entity = id,
-            ?owner,
-            "Djinn self-destructed with ordinary defeat rewards"
-        );
-        Ok(())
     }
 }

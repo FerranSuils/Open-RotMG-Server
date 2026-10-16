@@ -58,7 +58,7 @@ fn shot(w: &mut World, id: i32, time: i32, kind: u16, angle: f32, aim: f32) -> R
 fn rogue_cloak_removes_target_without_granting_invulnerability_and_expires() {
     let (mut w, id) = fixture(0x300);
     let enemy = w
-        .spawn_entity(0x650, Pos { x: 24., y: 20. }, vec![])
+        .spawn_entity(0x646, Pos { x: 24., y: 20. }, vec![])
         .unwrap();
     w.npc_step();
     let held = w.entities[&enemy].pos;
@@ -92,7 +92,7 @@ fn invisible_rogue_does_not_hide_visible_teammate_from_enemy() {
     let (mut w, id) = fixture(0x300);
     let friend = player(&mut w, crate::content::WIZARD, 2, Pos { x: 24.9, y: 20. });
     let enemy = w
-        .spawn_entity(0x650, Pos { x: 22., y: 20. }, vec![])
+        .spawn_entity(0x646, Pos { x: 22., y: 20. }, vec![])
         .unwrap();
     cast(&mut w, id).unwrap();
     w.npc_step();

@@ -25,6 +25,9 @@ mod families;
 mod gods;
 #[cfg(test)]
 mod gods_tests;
+mod midlands;
+#[cfg(test)]
+mod midlands_tests;
 mod population;
 #[cfg(test)]
 mod population_tests;
@@ -1249,7 +1252,7 @@ impl World {
                 goal: None,
                 phase: 0.,
                 hp: definition.hp,
-                size: if definition.enemy && matches!(definition.terrain, 1 | 8..=12) {
+                size: if definition.enemy && (1..=12).contains(&definition.terrain) {
                     definition.size
                 } else {
                     100
@@ -2929,6 +2932,29 @@ impl World {
         }
         Ok(())
     }
+    pub(super) fn finish_timed_defeat(&mut self, id: i32) -> Result<()> {
+        let e = &self.entities[&id];
+        let kind = e.kind;
+        let owner = self
+            .players
+            .iter()
+            .filter(|(_, p)| p.character.alive && !p.death_pending && !p.departing)
+            .filter_map(|(id, p)| {
+                e.damage
+                    .get(&p.character.id)
+                    .filter(|n| **n > 0)
+                    .map(|n| (*id, *n))
+            })
+            .max_by_key(|(_, n)| *n)
+            .map(|(id, _)| id);
+        // Self-destruction has no final player bullet, so the largest eligible contributor owns its kill statistic.
+        if let Some(owner) = owner {
+            self.players.get_mut(&owner).unwrap().character.kills += 1;
+        }
+        self.defeat_entity(id)?;
+        tracing::info!(entity = id, kind, ?owner, "timed enemy defeat");
+        Ok(())
+    }
     fn drop_loot(&mut self, defeated: &Entity) -> Result<()> {
         if crate::endgame::HEROES.contains(&defeated.kind) {
             self.critical_deaths.push(defeated.id);
@@ -3091,9 +3117,11 @@ impl World {
             let pos = entity.pos;
             let profile = profile(kind).expect("validated encounter profile");
             // Self-destruction is a deadline, not target acquisition or a weapon cooldown.
-            let burst = kind == 0x91a
-                && entity.expires == Some(self.now + 50)
-                && self.now >= entity.next_shot;
+            let shield_burst = self.shield_burst(id);
+            let burst = shield_burst
+                || (kind == 0x91a
+                    && entity.expires == Some(self.now + 50)
+                    && self.now >= entity.next_shot);
             if !burst
                 && entity.conditions(self.now) & crate::condition::bit(crate::condition::STASIS)
                     != 0
@@ -3160,36 +3188,45 @@ impl World {
                 continue;
             }
             let flags = self.entities[&id].conditions(self.now);
-            let (motion, mut speed) = if gods::GODS.contains(&kind)
-                || gods::CONSTRUCTS.contains(&kind)
-                || (kind == 0x653 && self.entities[&id].camp.is_some())
-            {
-                match self.god_movement(id, target, elapsed) {
-                    Ok(movement) => movement,
-                    Err(error) => {
-                        tracing::error!(entity=id,%error,"Godlands movement refused");
-                        continue;
+            let (motion, mut speed) =
+                if kind == 0x6c6 || (self.entities[&id].camp.is_some() && midlands::member(kind)) {
+                    match self.midland_movement(id, target, elapsed) {
+                        Ok(movement) => movement,
+                        Err(error) => {
+                            tracing::error!(entity=id,%error,"inland family movement refused");
+                            continue;
+                        }
                     }
-                }
-            } else if self.entities[&id].camp.is_some() {
-                match self.family_movement(id, target, elapsed) {
-                    Ok(movement) => movement,
-                    Err(error) => {
-                        tracing::error!(entity=id,%error,"family movement refused");
-                        continue;
+                } else if gods::GODS.contains(&kind)
+                    || gods::CONSTRUCTS.contains(&kind)
+                    || (kind == 0x653 && self.entities[&id].camp.is_some())
+                {
+                    match self.god_movement(id, target, elapsed) {
+                        Ok(movement) => movement,
+                        Err(error) => {
+                            tracing::error!(entity=id,%error,"Godlands movement refused");
+                            continue;
+                        }
                     }
-                }
-            } else if crate::endgame::ROSTER.contains(&kind) {
-                match self.finale_movement(id, elapsed) {
-                    Ok(movement) => movement,
-                    Err(error) => {
-                        tracing::error!(entity=id,%error,"endgame movement refused");
-                        continue;
+                } else if self.entities[&id].camp.is_some() {
+                    match self.family_movement(id, target, elapsed) {
+                        Ok(movement) => movement,
+                        Err(error) => {
+                            tracing::error!(entity=id,%error,"family movement refused");
+                            continue;
+                        }
                     }
-                }
-            } else {
-                crate::encounter::movement(kind, self.entities[&id].hp, elapsed)
-            };
+                } else if crate::endgame::ROSTER.contains(&kind) {
+                    match self.finale_movement(id, elapsed) {
+                        Ok(movement) => movement,
+                        Err(error) => {
+                            tracing::error!(entity=id,%error,"endgame movement refused");
+                            continue;
+                        }
+                    }
+                } else {
+                    crate::encounter::movement(kind, self.entities[&id].hp, elapsed)
+                };
             let goal = match motion {
                 Motion::Stationary => {
                     speed = 0.;
@@ -3328,7 +3365,18 @@ impl World {
                         continue;
                     }
                 }
-            } else if gods::GODS.contains(&kind) || gods::CONSTRUCTS.contains(&kind) {
+            } else if matches!(kind, 0x900..=0x902) {
+                match self.shield_shots(id, heading) {
+                    Ok(shots) => shots,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"Shield Orc commands refused");
+                        continue;
+                    }
+                }
+            } else if gods::GODS.contains(&kind)
+                || gods::CONSTRUCTS.contains(&kind)
+                || midlands::AIMED.contains(&kind)
+            {
                 match self.god_shots(id, target, heading, elapsed) {
                     Ok(shots) => shots,
                     Err(error) => {
@@ -3358,6 +3406,10 @@ impl World {
                 _ => profile.interval,
             };
             self.entities.get_mut(&id).unwrap().next_shot = self.now + interval;
+            if shield_burst {
+                self.entities.get_mut(&id).unwrap().stage = Some(3);
+                tracing::debug!(entity = id, kind, "Shield Orc final command selected");
+            }
             if self.bullets.len() + shots.len() > 2048 {
                 tracing::warn!(
                     entity = id,

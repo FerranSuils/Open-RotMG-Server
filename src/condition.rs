@@ -46,8 +46,11 @@ pub fn projectile_effect(name: &str) -> Result<u8> {
         _ => bail!("unsupported selected projectile condition {name}"),
     })
 }
+pub const fn protected(flags: i32) -> bool {
+    flags & (bit(INVINCIBLE) | bit(INVULNERABLE) | bit(STASIS)) != 0
+}
 pub fn damage(raw: i32, defense: i32, flags: i32, piercing: bool) -> i32 {
-    if flags & (bit(INVINCIBLE) | bit(INVULNERABLE) | bit(STASIS)) != 0 {
+    if protected(flags) || raw == 0 {
         return 0;
     }
     let defense = if piercing || flags & bit(ARMOR_BROKEN) != 0 {
