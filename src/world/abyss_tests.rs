@@ -31,6 +31,37 @@ fn fixture() -> (World, i32) {
     (w, id)
 }
 #[test]
+fn reference_wisdom_regeneration_uses_equipment_and_respects_quiet_and_maximum_mana() {
+    let (mut w, id) = fixture();
+    let caps = w.content.classes[&0x310].caps;
+    let p = w.players.get_mut(&id).unwrap();
+    p.character.class = 0x310;
+    p.character.base = caps;
+    p.character.items = vec![0xaf6, 0xb25, 0xb05, 0xac5, -1, -1, -1, -1, -1, -1, -1, -1];
+    p.character.mp = 0;
+    let values = w.players[&id].character.effective(&w.content).unwrap();
+    assert_eq!(values[7], 83);
+    for _ in 0..200 {
+        w.step();
+    }
+    assert_eq!(w.players[&id].character.mp, 55);
+    w.players.get_mut(&id).unwrap().character.mp = values[1] - 1;
+    for _ in 0..10 {
+        w.step();
+    }
+    assert_eq!(w.players[&id].character.mp, values[1]);
+    w.apply_condition(id, condition::QUIET, 1000).unwrap();
+    for _ in 0..10 {
+        w.step();
+    }
+    assert_eq!(w.players[&id].character.mp, 0);
+    assert_eq!(w.players[&id].mp_fraction, 0.);
+    for _ in 0..20 {
+        w.step();
+    }
+    assert!(w.players[&id].character.mp > 0);
+}
+#[test]
 fn lava_uses_native_damage_rng_ignores_armor_and_preserves_the_next_weapon_roll() {
     let (mut w, id) = fixture();
     w.players.get_mut(&id).unwrap().controller = Controller::Human;

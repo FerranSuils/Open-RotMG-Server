@@ -3692,7 +3692,7 @@ impl World {
             if p.character.mp < values[1]
                 && flags & crate::condition::bit(crate::condition::QUIET) == 0
             {
-                p.mp_fraction += (0.6 + values[7] as f32 / 125.) * 0.05;
+                p.mp_fraction += (0.6 + values[7] as f32 / 16.7) * 0.05;
                 let n = p.mp_fraction as i32;
                 p.character.mp = (p.character.mp + n).min(values[1]);
                 p.mp_fraction -= n as f32;
