@@ -286,12 +286,18 @@ fn realm_quest_motor_and_orbit_clock_use_nr_core_units_including_slowing() {
         (0x92d, 0.5),
         (0x923, 1.5),
         (0x91d, 0.55),
+        (0x65f, 0.4),
+        (0x676, 0.5),
     ] {
         let id = w.spawn_entity(kind, pos, vec![]).unwrap();
         let e = w.entities.get_mut(&id).unwrap();
         e.quest = Some(id);
         e.stage = Some(0);
-        let actual = w.quest_movement(id, pos, 0).1 / 1.5;
+        let (motion, speed) = w.quest_movement(id, pos, 0);
+        if matches!(kind, 0x65f | 0x676) {
+            assert!(matches!(motion, Motion::Wander));
+        }
+        let actual = speed / 1.5;
         assert!((actual - (5.55 * rate + 0.74)).abs() < 0.00001);
         if kind == 0x923 {
             sprite = Some(id);

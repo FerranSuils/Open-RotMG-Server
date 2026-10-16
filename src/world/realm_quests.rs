@@ -571,7 +571,9 @@ impl World {
                         },
                         if birdman { 5. } else { 10. },
                     )
-                } else if e.pos.distance(target) < 10. {
+                } else if e.pos.distance(target) < 10.
+                    && e.pos.distance(target) > if e.kind == 0x676 { 9. } else { 7. }
+                {
                     (
                         Motion::Chase {
                             sight: 10.,
