@@ -1280,20 +1280,21 @@ pub(crate) async fn depart(a: &App, id: i32) -> Result<()> {
             .call(move |w| w.begin_departure(id))
             .await?
         {
-            if ch.alive
-                && let Err(error) = a.store.progress(ch).await
-            {
-                let reason = format!("departure persistence failed: {error:#}");
-                a.world
-                    .for_player(id)
-                    .call(move |w| w.poison(id, reason))
-                    .await?;
-                return Err(error);
-            }
+            let result = if ch.alive {
+                a.store
+                    .progress(ch)
+                    .await
+                    .context("departure persistence failed")
+            } else {
+                Ok(())
+            };
             return a
                 .world
                 .for_player(id)
-                .call(move |w| w.finish_departure(id))
+                .call(move |w| {
+                    w.committed(id, result)?;
+                    w.finish_departure(id)
+                })
                 .await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1536,36 +1537,26 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
                 }
             };
             if !progress.is_empty() {
-                match deaths
+                let result = deaths
                     .store
                     .progress_batch(progress.iter().map(|(_, ch)| ch.clone()).collect())
                     .await
-                {
-                    Ok(()) => {
-                        for (id, snapshot) in progress {
-                            if let Err(e) = deaths
-                                .world
-                                .for_player(id)
-                                .call(move |w| w.finish_progress(id, snapshot))
-                                .await
-                            {
-                                tracing::error!(player=id, error=%e, "committed progress notification failed");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error=%e, "progress persistence failed; characters quarantined");
-                        for (id, _) in progress {
-                            let reason = e.to_string();
-                            if let Err(e) = deaths
-                                .world
-                                .for_player(id)
-                                .call(move |w| w.poison(id, reason))
-                                .await
-                            {
-                                tracing::error!(player=id,error=%e,"progress quarantine notification failed");
-                            }
-                        }
+                    .context("progress persistence failed");
+                for (id, snapshot) in progress {
+                    let result = result
+                        .as_ref()
+                        .map(|_| ())
+                        .map_err(|error| anyhow::anyhow!("{error:#}"));
+                    if let Err(error) = deaths
+                        .world
+                        .for_player(id)
+                        .call(move |w| {
+                            w.committed(id, result)?;
+                            w.finish_progress(id, snapshot)
+                        })
+                        .await
+                    {
+                        tracing::error!(player=id, error=%format_args!("{error:#}"), "progress completion failed");
                     }
                 }
             }
@@ -1577,29 +1568,21 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
                 }
             };
             for (id, ch, killer) in pending {
-                match deaths.store.death(ch, killer).await {
-                    Ok(()) => {
-                        if let Err(e) = deaths
-                            .world
-                            .for_player(id)
-                            .call(move |w| w.finish_death(id))
-                            .await
-                        {
-                            tracing::error!(player=id,error=%e,"committed death notification failed");
-                        }
-                    }
-                    Err(e) => {
-                        let reason = e.to_string();
-                        tracing::error!(player=id,error=%e,"death persistence failed; character quarantined");
-                        if let Err(error) = deaths
-                            .world
-                            .for_player(id)
-                            .call(move |w| w.poison(id, reason))
-                            .await
-                        {
-                            tracing::error!(player=id,%error,"death quarantine notification failed");
-                        }
-                    }
+                let result = deaths
+                    .store
+                    .death(ch, killer)
+                    .await
+                    .context("death persistence failed");
+                if let Err(error) = deaths
+                    .world
+                    .for_player(id)
+                    .call(move |w| {
+                        w.committed(id, result)?;
+                        w.finish_death(id)
+                    })
+                    .await
+                {
+                    tracing::error!(player=id,error=%format_args!("{error:#}"),"death completion failed");
                 }
             }
         }

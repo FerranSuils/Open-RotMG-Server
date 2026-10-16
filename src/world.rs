@@ -206,6 +206,12 @@ impl Player {
             at,
         };
     }
+    fn active(&self) -> bool {
+        self.character.alive
+            && !self.death_pending
+            && !self.departing
+            && self.persistence_failure.is_none()
+    }
     pub(crate) fn native_time(&self) -> i32 {
         self.last_move
     }
@@ -1719,10 +1725,7 @@ impl World {
         );
         let p = self.players.get(&id).context("player missing")?;
         ensure!(
-            p.character.alive
-                && !p.death_pending
-                && !p.departing
-                && p.persistence_failure.is_none(),
+            p.active(),
             "dead, departing or quarantined player cannot move"
         );
         ensure!(time >= 0, "negative movement time");
@@ -1979,10 +1982,7 @@ impl World {
         );
         let p = self.players.get(&id).context("player missing")?;
         ensure!(
-            p.character.alive
-                && !p.death_pending
-                && !p.departing
-                && p.persistence_failure.is_none(),
+            p.active(),
             "dead, departing or quarantined player cannot shoot"
         );
 
@@ -2192,12 +2192,7 @@ impl World {
         let p = self.players.get(&id).context("player missing")?;
         ensure!(!p.paused, "Cannot use items while paused.");
         ensure!(
-            !p.pending
-                && !p.death_pending
-                && !p.departing
-                && p.character.alive
-                && p.character.hp > 0
-                && p.persistence_failure.is_none(),
+            p.active() && !p.pending && p.character.hp > 0,
             "player is busy, departing, quarantined or dead"
         );
         ensure!(
@@ -2458,6 +2453,15 @@ impl World {
         }
         Ok(plan)
     }
+    pub fn committed<T>(&mut self, id: i32, result: Result<T>) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.poison(id, format!("{error:#}"))?;
+                Err(error)
+            }
+        }
+    }
     pub fn poison(&mut self, id: i32, error: String) -> Result<()> {
         let p = self
             .players
@@ -2478,10 +2482,7 @@ impl World {
             plan.unlock.is_none(),
             "portal unlock requires its directory commit"
         );
-        if let Err(error) = result {
-            self.poison(plan.player, error.to_string())?;
-            return Err(error);
-        }
+        let revision = self.committed(plan.player, result)?;
         let p = self
             .players
             .get_mut(&plan.player)
@@ -2501,78 +2502,70 @@ impl World {
                 .remove(&slot);
         }
         let mut o = Writer::new();
-        match result {
-            Ok(revision) => {
-                p.character.items = plan.items;
-                p.character.revision = revision;
-                if let Some((snapshot, _, index, amount)) = plan.stat_growth {
-                    ensure!(
-                        p.character.base == snapshot.base,
-                        "reserved potion base stats changed"
-                    );
-                    let cap = self.content.classes[&p.character.class].caps[index];
-                    ensure!(
-                        snapshot.base[index] + amount <= cap,
-                        "reserved potion exceeds current class cap"
-                    );
-                    p.character.base[index] = snapshot.base[index] + amount;
-                    tracing::info!(
-                        player = plan.player,
-                        stat = crate::content::STATS[index].0,
-                        base = p.character.base[index],
-                        revision,
-                        "permanent stat potion committed"
-                    );
-                }
-                let values = p.character.effective(&self.content)?;
-                p.character.hp = p.character.hp.min(values[0]);
-                p.character.mp = p.character.mp.min(values[1]);
-                if plan.healing > 0
-                    && !p.death_pending
-                    && p.conditions(self.now) & crate::condition::bit(crate::condition::SICK) == 0
-                {
-                    p.character.hp = (p.character.hp + plan.healing).min(values[0]);
-                }
-                if plan.mana > 0
-                    && !p.death_pending
-                    && p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET) == 0
-                {
-                    p.character.mp = (p.character.mp + plan.mana).min(values[1]);
-                }
-                if self.prepared_seed.is_some()
-                    && let Some((bag, slot)) = plan.loot_slot
-                {
-                    let item = self
-                        .entities
-                        .get(&bag)
-                        .and_then(|bag| bag.items.get(slot))
-                        .context("committed loot identity missing")?;
-                    tracing::info!(player=plan.player,character=p.character.id,bag,slot,item=*item,world=%self.name,"loot slot committed");
-                }
-                if let Some((id, items)) = plan.bag {
-                    self.entities.get_mut(&id).unwrap().items = items;
-                }
-                if let Some(dropped) = plan.dropped {
-                    let e = self
-                        .entities
-                        .get_mut(&dropped)
-                        .context("reserved ground drop missing")?;
-                    e.reserved = false;
-                    e.published = true;
-                    self.bag_expiry.insert(dropped, self.now + 60_000);
-                }
-                if let Some(mut vault) = plan.vault {
-                    vault.revision += 1;
-                    self.vault.as_mut().context("committed chest missing")?.1 = vault;
-                }
-                o.i32(0);
-                tracing::info!(player = plan.player, revision, "inventory committed");
-            }
-            Err(e) => {
-                tracing::error!(player=plan.player,error=%e,"inventory transaction rejected");
-                return Err(e);
-            }
+        p.character.items = plan.items;
+        p.character.revision = revision;
+        if let Some((snapshot, _, index, amount)) = plan.stat_growth {
+            ensure!(
+                p.character.base == snapshot.base,
+                "reserved potion base stats changed"
+            );
+            let cap = self.content.classes[&p.character.class].caps[index];
+            ensure!(
+                snapshot.base[index] + amount <= cap,
+                "reserved potion exceeds current class cap"
+            );
+            p.character.base[index] = snapshot.base[index] + amount;
+            tracing::info!(
+                player = plan.player,
+                stat = crate::content::STATS[index].0,
+                base = p.character.base[index],
+                revision,
+                "permanent stat potion committed"
+            );
         }
+        let values = p.character.effective(&self.content)?;
+        p.character.hp = p.character.hp.min(values[0]);
+        p.character.mp = p.character.mp.min(values[1]);
+        if plan.healing > 0
+            && !p.death_pending
+            && p.conditions(self.now) & crate::condition::bit(crate::condition::SICK) == 0
+        {
+            p.character.hp = (p.character.hp + plan.healing).min(values[0]);
+        }
+        if plan.mana > 0
+            && !p.death_pending
+            && p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET) == 0
+        {
+            p.character.mp = (p.character.mp + plan.mana).min(values[1]);
+        }
+        if self.prepared_seed.is_some()
+            && let Some((bag, slot)) = plan.loot_slot
+        {
+            let item = self
+                .entities
+                .get(&bag)
+                .and_then(|bag| bag.items.get(slot))
+                .context("committed loot identity missing")?;
+            tracing::info!(player=plan.player,character=p.character.id,bag,slot,item=*item,world=%self.name,"loot slot committed");
+        }
+        if let Some((id, items)) = plan.bag {
+            self.entities.get_mut(&id).unwrap().items = items;
+        }
+        if let Some(dropped) = plan.dropped {
+            let e = self
+                .entities
+                .get_mut(&dropped)
+                .context("reserved ground drop missing")?;
+            e.reserved = false;
+            e.published = true;
+            self.bag_expiry.insert(dropped, self.now + 60_000);
+        }
+        if let Some(mut vault) = plan.vault {
+            vault.revision += 1;
+            self.vault.as_mut().context("committed chest missing")?.1 = vault;
+        }
+        o.i32(0);
+        tracing::info!(player = plan.player, revision, "inventory committed");
         send(p, 4, o.0);
         if let Some((amount, range)) = plan.healing_nova {
             self.consumable_heal_nova(plan.player, amount, range)?;
@@ -2597,10 +2590,7 @@ impl World {
     fn controlled_action(&mut self, id: i32, a: Action) -> Result<Option<InventoryPlan>> {
         let p = self.players.get(&id).context("player missing")?;
         ensure!(
-            p.character.alive
-                && !p.death_pending
-                && !p.departing
-                && p.persistence_failure.is_none(),
+            p.active(),
             "dead, departing or quarantined player cannot act"
         );
         match a {
@@ -3441,12 +3431,7 @@ impl World {
         let ids: Vec<_> = self.players.keys().copied().collect();
         for id in &ids {
             let p = &self.players[id];
-            if !p.character.alive
-                || p.death_pending
-                || p.departing
-                || p.paused
-                || p.persistence_failure.is_some()
-            {
+            if !p.active() || p.paused {
                 continue;
             }
             let p = self.players.get_mut(id).unwrap();
@@ -3766,13 +3751,7 @@ impl World {
                     }
                 };
                 let restricts_motion = speed(motion_condition) < speed(p.native_motion_condition);
-                if p.controller == Controller::Human
-                    && p.character.alive
-                    && !p.death_pending
-                    && !p.departing
-                    && p.persistence_failure.is_none()
-                    && restricts_motion
-                {
+                if p.controller == Controller::Human && p.active() && restricts_motion {
                     // The client must consume its real stat29 before acknowledging the new motor baseline.
                     let mut out = Writer::new();
                     out.i32(id).f32(p.pos.x).f32(p.pos.y);
@@ -3803,6 +3782,21 @@ mod timing_example;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn active_lifecycle_is_independent_of_pause_and_pending_writes() {
+        let mut w = world();
+        let id = w.enter(ch(&w), None).unwrap();
+        let p = w.players.get_mut(&id).unwrap();
+        p.paused = true;
+        p.pending = true;
+        for flags in 0..16 {
+            p.character.alive = flags & 1 == 0;
+            p.death_pending = flags & 2 != 0;
+            p.departing = flags & 4 != 0;
+            p.persistence_failure = (flags & 8 != 0).then(|| "uncertain commit".into());
+            assert_eq!(p.active(), flags == 0, "lifecycle flags={flags}");
+        }
+    }
     #[test]
     fn prepared_worlds_share_explicit_seed_without_changing_normal_creation() {
         let content = Arc::new(Content::load(std::path::Path::new("data")).unwrap());
@@ -4502,10 +4496,17 @@ mod tests {
             .unwrap();
         assert!(w.entities[&bag.id].reserved);
         assert!(
-            w.finish_inventory(plan, Err(anyhow::anyhow!("synthetic storage failure")))
-                .is_err()
+            w.finish_inventory(
+                plan,
+                Err(anyhow::anyhow!("synthetic storage failure").context("pickup commit")),
+            )
+            .is_err()
         );
         assert!(w.players[&id].pending && w.entities[&bag.id].reserved);
+        assert_eq!(
+            w.players[&id].persistence_failure.as_deref(),
+            Some("pickup commit: synthetic storage failure")
+        );
         assert!(w.begin_departure(id).is_err());
         assert_eq!(w.entities[&bag.id].items[0], 0xa4f);
         assert_eq!(w.players[&id].character.items[3], -1);

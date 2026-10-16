@@ -1,16 +1,19 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+pub(super) fn json_error(status: StatusCode, message: impl ToString) -> Response {
+    (
+        status,
+        Json(serde_json::json!({"error":message.to_string()})),
+    )
+        .into_response()
+}
 pub(super) fn json_result(result: Result<serde_json::Value>) -> Response {
     let body = match result {
         Ok(value) => Json(value).into_response(),
         Err(error) => {
             tracing::warn!(%error, "game API request rejected");
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error":error.to_string()})),
-            )
-                .into_response()
+            json_error(StatusCode::BAD_REQUEST, error)
         }
     };
     let mut response = body;
@@ -80,29 +83,33 @@ pub(super) fn authorize(a: &App, peer: SocketAddr, headers: &HeaderMap) -> Resul
     );
     Ok(())
 }
-pub(super) async fn discord_link(
-    State(a): State<App>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(request): Json<LinkRequest>,
-) -> Response {
-    if authorize(&a, peer, &headers).is_err() {
-        return (
+pub(super) fn private_denial(a: &App, peer: SocketAddr, headers: &HeaderMap) -> Option<Response> {
+    if authorize(a, peer, headers).is_err() {
+        return Some(json_error(
             StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error":"link API authorization denied"})),
-        )
-            .into_response();
+            "account API authorization denied",
+        ));
     }
     if !rate_allow(
         &mut a.requests.lock().expect("request registry poisoned"),
         peer.ip(),
         std::time::Instant::now(),
     ) {
-        return (
+        return Some(json_error(
             StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error":"link attempt limit; wait one minute"})),
-        )
-            .into_response();
+            "account attempt limit; wait one minute",
+        ));
+    }
+    None
+}
+pub(super) async fn discord_link(
+    State(a): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<LinkRequest>,
+) -> Response {
+    if let Some(response) = private_denial(&a, peer, &headers) {
+        return response;
     }
     json_result(
         a.store

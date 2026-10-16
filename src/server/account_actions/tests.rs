@@ -40,6 +40,49 @@ pub(crate) fn fixture() -> (PathBuf, App) {
     (dir, app)
 }
 #[tokio::test]
+async fn private_admission_rejects_forwarding_before_charging_the_shared_limit() {
+    let (dir, a) = fixture();
+    let peer = "127.0.0.1:1234".parse().unwrap();
+    let mut headers = HeaderMap::new();
+    assert_eq!(
+        private_denial(&a, peer, &headers).unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    headers.insert(
+        "authorization",
+        format!("Bearer {}", "a".repeat(64)).parse().unwrap(),
+    );
+    assert_eq!(
+        private_denial(&a, "192.0.2.1:1234".parse().unwrap(), &headers)
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    for name in [
+        "origin",
+        "forwarded",
+        "x-forwarded-for",
+        "x-real-ip",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+    ] {
+        headers.insert(name, "untrusted".parse().unwrap());
+        assert_eq!(
+            private_denial(&a, peer, &headers).unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        headers.remove(name);
+    }
+    for _ in 0..20 {
+        assert!(private_denial(&a, peer, &headers).is_none());
+    }
+    assert_eq!(
+        private_denial(&a, peer, &headers).unwrap().status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
 async fn kick_waits_for_save_acknowledgement_and_failed_saves_keep_ownership() {
     let (dir, a) = fixture();
     let owner = a.claim_session(1).unwrap();
