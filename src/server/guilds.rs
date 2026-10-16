@@ -90,10 +90,10 @@ pub(super) async fn merchant(a: &App, player: i32, body: &[u8]) -> Result<bool> 
     a.world
         .for_player(player)
         .call(move |w| {
-            let target = w
-                .entities
-                .get(&merchant)
-                .context("Purchase target missing")?;
+            // Invalid targets must receive the shop's rejection without disconnecting.
+            let Some(target) = w.entities.get(&merchant) else {
+                return Ok(false);
+            };
             Ok(w.content.get(target.kind)?.class == "GuildMerchant")
         })
         .await

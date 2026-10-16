@@ -36,6 +36,7 @@ mod player_position_tests;
 mod population;
 #[cfg(test)]
 mod population_tests;
+mod realm_portal;
 mod realm_quests;
 #[cfg(test)]
 mod realm_quests_tests;
@@ -73,6 +74,7 @@ pub use reconciliation::{NativeInput, RejectedNativeShot};
 mod progression;
 #[cfg(test)]
 mod progression_tests;
+pub(crate) mod shop;
 mod trade;
 pub(crate) mod view;
 #[cfg(test)]
@@ -332,6 +334,7 @@ pub struct InventoryPlan {
     pub dropped: Option<i32>,
     pub unlock: Option<(i32, i32)>,
     pub collected: Option<u16>,
+    pub purchase: Option<(i32, crate::store::Purchase)>,
     loot_slot: Option<(i32, usize)>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -430,6 +433,8 @@ pub struct Directory {
     chat_budgets: BTreeMap<i32, chat::ChatBudget>,
     guild_invites: BTreeMap<i32, guilds::Invitation>,
     endgame: endgame::RealmDirectory,
+    realm_portal: i32,
+    realm_name: usize,
     teleports: BTreeMap<i32, Instant>,
     idle: BTreeMap<i32, u64>,
     next_world: i32,
@@ -559,6 +564,8 @@ impl Directory {
             chat_budgets: BTreeMap::new(),
             guild_invites: BTreeMap::new(),
             endgame: endgame::RealmDirectory::default(),
+            realm_portal: 0,
+            realm_name: (seed % realm_portal::NAMES.len() as u64) as usize,
             teleports: BTreeMap::new(),
             idle: BTreeMap::new(),
             next_world: 1,
@@ -592,7 +599,8 @@ impl Directory {
                 (c.region == 2 && c.object.is_none() && nexus.walkable(pos)).then_some(pos)
             })
             .context("Nexus has no walkable Realm portal region")?;
-        nexus.spawn_entity(0x704, pos, vec![])?;
+        d.realm_portal = nexus.spawn_entity(0x712, pos, vec![])?;
+        d.sync_realm_portal();
         Ok(d)
     }
     fn make(&self, template: &str, name: &str, safe: bool, owner: Option<i32>) -> Result<World> {
@@ -787,6 +795,7 @@ impl Directory {
             0x712
         };
         let destination = match kind {
+            0x712 if origin == -2 && portal == Some(self.realm_portal) => self.initial(-3)?,
             0x703 | 0x70d | 0x712 | 0x71d => -2,
             0x704 | 0x70e | 0x71c => self.initial(-3)?,
             0x720 => self.instance("vault", Some(account))?,
@@ -936,6 +945,7 @@ impl Directory {
     }
     fn step(&mut self) {
         self.tick += 1;
+        self.sync_realm_portal();
         self.grants.retain(|_, grant| grant.expires > self.tick);
         for (id, world) in &mut self.worlds {
             world.step();
@@ -1184,13 +1194,16 @@ impl World {
                                     "mtype" => 34,
                                     "mcount" => 42,
                                     "mtime" => 43,
-                                    "nstar" => 55,
+                                    "nstar" => 45,
                                     _ => unreachable!(),
                                 };
                                 e.extra_stats.push((stat, value));
                             }
                             _ => bail!("unsupported map setting {k}"),
                         }
+                    }
+                    if o.class == "Merchant" {
+                        shop::configure(&mut e, &content)?;
                     }
                     if o.name == "White Fountain" {
                         fountains.push((id, pos));
@@ -1420,10 +1433,12 @@ impl World {
     }
     #[cfg(test)]
     pub fn enter(&mut self, ch: Character, tx: Option<Output>) -> Result<i32> {
+        // Combat and inventory fixtures need nearby, repeatable starting positions.
+        let (x, y) = self.map.spawns[self.players.len() % self.map.spawns.len()];
         self.enter_at(
             ch,
             tx,
-            None,
+            Some(Pos { x, y }),
             AccountPresentation {
                 guild: None,
                 credits: 100,
@@ -1469,8 +1484,16 @@ impl World {
             "account already in this world"
         );
         let id = allocate_id(&self.ids)?;
-        let (x, y) = self.map.spawns[self.players.len() % self.map.spawns.len()];
-        let pos = position.unwrap_or(Pos { x, y });
+        let pos = if let Some(pos) = position {
+            pos
+        } else {
+            let &(x, y) = self
+                .map
+                .spawns
+                .choose(&mut self.rng)
+                .context("world has no spawn cells")?;
+            Pos { x, y }
+        };
         let char_id = ch.id;
         self.players.insert(
             id,
@@ -1543,6 +1566,8 @@ impl World {
             player = id,
             character = char_id,
             world = %self.name,
+            x = pos.x,
+            y = pos.y,
             "player entered development world"
         );
         Ok(id)
@@ -2489,6 +2514,7 @@ impl World {
             dropped: None,
             unlock: None,
             collected: None,
+            purchase: None,
             loot_slot: None,
         }
     }
@@ -2754,9 +2780,14 @@ impl World {
             vault.revision += 1;
             self.vault.as_mut().context("committed chest missing")?.1 = vault;
         }
-        o.i32(0);
         tracing::info!(player = plan.player, revision, "inventory committed");
-        send(p, 4, o.0);
+        if plan.purchase.is_some() {
+            let packet = shop::reply(true, "Item purchased!");
+            send(p, packet.id, packet.body);
+        } else {
+            o.i32(0);
+            send(p, 4, o.0);
+        }
         if let Some((amount, range)) = plan.healing_nova {
             self.consumable_heal_nova(plan.player, amount, range)?;
         }
@@ -4017,10 +4048,11 @@ impl World {
                     .iter()
                     .filter(|entity| {
                         self.players.contains_key(entity)
-                            || self
-                                .entities
-                                .get(entity)
-                                .is_some_and(|e| e.hp > 0 || !e.items.is_empty())
+                            || self.entities.get(entity).is_some_and(|e| {
+                                e.hp > 0
+                                    || !e.items.is_empty()
+                                    || self.content.objects[&e.kind].class == "Portal"
+                            })
                     })
                     .copied()
                     .collect();
@@ -4233,7 +4265,7 @@ mod tests {
         assert_eq!(d.location(first).unwrap(), -1);
         assert_eq!(d.location(second).unwrap(), -2);
         assert!(d.worlds[&-2].safe && !d.worlds[&-3].safe);
-        assert!(d.worlds[&-2].entities.values().any(|e| e.kind == 0x704));
+        assert!(d.worlds[&-2].entities.values().any(|e| e.kind == 0x712));
     }
     #[test]
     fn transfer_grants_are_bound_one_use_expiring_and_private() {

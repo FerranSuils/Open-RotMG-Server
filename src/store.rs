@@ -19,7 +19,9 @@ mod legends;
 pub use guilds::{Guild, GuildAction, Membership as GuildMembership};
 #[cfg(test)]
 mod presentation_tests;
+mod purchases;
 mod social;
+pub use purchases::Purchase;
 mod updates;
 pub use social::AccountLists;
 pub use updates::{UpdateFeed, UpdatePost, UpdateSnapshot};

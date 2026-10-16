@@ -2,6 +2,8 @@
 mod client_contract_tests;
 mod input;
 #[cfg(test)]
+mod purchase_tests;
+#[cfg(test)]
 mod queue_tests;
 use crate::{
     content::{Content, WIZARD},
@@ -485,6 +487,25 @@ fn slot(r: &mut Reader<'_>) -> Result<Slot> {
     })
 }
 pub(crate) async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
+    if let Some((_, purchase)) = &plan.purchase {
+        let result = a
+            .store
+            .purchase(
+                InventoryWrite {
+                    id: plan.character,
+                    account: plan.account,
+                    revision: plan.revision,
+                    items: plan.items.clone(),
+                },
+                purchase.clone(),
+            )
+            .await;
+        return a
+            .world
+            .for_player(plan.player)
+            .call(move |w| w.finish_purchase(plan, result))
+            .await;
+    }
     let plan = a.world.directory(move |d| d.stage_unlock(plan)).await?;
     let result = if let Some((snapshot, slot, index, amount)) = &plan.stat_growth {
         a.store
@@ -1015,6 +1036,27 @@ async fn handle(
                 enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
             }
         }
+        wire::BUY => {
+            let merchant = r.i32()?;
+            r.done()?;
+            let id = player.context("purchase before character")?;
+            let registered = account
+                .as_ref()
+                .context("purchase before HELLO")?
+                .registered;
+            let plan = if registered {
+                a.world.call(move |w| w.buy(id, merchant)).await
+            } else {
+                Err(anyhow::anyhow!("Register and sign in before buying items."))
+            };
+            match plan {
+                Ok(plan) => persist(a, plan).await?,
+                Err(error) => {
+                    tracing::warn!(player=id, merchant, error=%error, "purchase rejected");
+                    enqueue_reply(tx, crate::world::shop::reply(false, &error.to_string()))?;
+                }
+            }
+        }
         wire::TELEPORT => {
             let target = r.i32()?;
             r.done()?;
@@ -1225,6 +1267,16 @@ async fn handle(
                         return Ok(None);
                     }
                     let (account, character, destination) = d.destination(id, portal)?;
+                    let world = &d.worlds[&destination];
+                    if world.players.len() >= world.max_players {
+                        let message = crate::world::chat_info("Destination is full.");
+                        crate::world::send(
+                            &d.worlds[&d.location(id)?].players[&id],
+                            message.id,
+                            message.body,
+                        );
+                        return Ok(None);
+                    }
                     let (keytime, key, name) = d.issue(account, character, destination)?;
                     Ok(Some((destination, keytime, key, name)))
                 })
