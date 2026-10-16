@@ -839,15 +839,15 @@ async fn handle(
                     .as_ref()
                     .context("authenticated session required")?
                     .id;
-                let result = diagnostics::report(a, owner, id, message.trim(), diagnostics).await;
-                let reply = match result {
-                    Ok(reply) => reply,
-                    Err(error) => {
-                        tracing::error!(account=owner, player=id, error=%error, "bug report failed");
-                        format!("Could not confirm bug report: {error}")
-                    }
-                };
-                enqueue_reply(tx, crate::world::chat_info(&reply))?;
+                if let Err(error) =
+                    diagnostics::report(a, owner, id, message.trim(), diagnostics).await
+                {
+                    tracing::error!(account=owner, player=id, error=%error, "bug report failed");
+                    enqueue_reply(
+                        tx,
+                        crate::world::chat_info(&format!("Could not submit bug report: {error}")),
+                    )?;
+                }
             } else if matches!(
                 text.trim(),
                 "/discord" | "/discord recovery" | "/discord norecovery"
@@ -1676,6 +1676,10 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
         .route(
             "/api/diagnostics/{key}",
             post(diagnostics::browser_sample).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/bug-reports/{id}/diagnostics.json",
+            get(diagnostics::attachment),
         )
         .route("/internal/discord/bugs", get(diagnostics::pending))
         .route("/internal/discord/bugs/{id}", post(diagnostics::receipt))
