@@ -13,6 +13,10 @@ When doing any work, consider - "Can I reduce LoC in mr PR?". Here are some ways
 2/ Before sending the PR, consider - "What tests did I only need to get here, and what can I delete?", or "What documentation did I see that was irrelevant, and can delete?"
 3/ Do not add any documentation unless explcitly asked. When writing documentation, have a subagent delete 75% of it after, and simply confirm if that captures mostly what you wanted to get across.
 
+# Gameplay references
+
+Before researching or implementing gameplay, read `docs/reference-sources.md`. Start from its pinned community implementations; use period documentation and footage to resolve gaps or conflicts, not to reconstruct already-documented behavior from scratch. Check target-version fit and engine semantics per feature; copied forks are not independent evidence, and reference quality is separate from licensing permission. Keep selected client definitions and project safety/durability invariants authoritative. Record unresolved differences instead of claiming 1:1 fidelity.
+
 # Contributions
 
 For gameplay or visual changes, capture the before state before editing, verify the after state through normal client gameplay, and prepare the 15-second demo described in `docs/videos.md`. Use a PR when there is a good demo to show; otherwise maintainers may push validated changes directly to main. Nonvisual changes need test evidence, not a staged gameplay clip.
