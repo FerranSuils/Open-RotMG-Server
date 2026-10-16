@@ -1599,6 +1599,10 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
             "/api/diagnostics/{key}",
             post(diagnostics::browser_sample).layer(DefaultBodyLimit::max(4096)),
         )
+        .route(
+            "/api/bug-reports/{id}/diagnostics.json",
+            get(diagnostics::attachment),
+        )
         .route("/internal/discord/bugs", get(diagnostics::pending))
         .route("/internal/discord/bugs/{id}", post(diagnostics::receipt))
         .route("/api/hiscores", get(hiscores))
