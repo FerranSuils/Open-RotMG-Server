@@ -995,6 +995,18 @@ async fn handle(
                 testing.acknowledge_native(nonce, *player);
             }
         }
+        64 => {
+            let time = r.i32()?;
+            let pos = Pos {
+                x: r.f32()?,
+                y: r.f32()?,
+            };
+            r.done()?;
+            let id = player.context("ground damage before character")?;
+            a.world
+                .call(move |w| w.ground_damage(id, time, pos))
+                .await?;
+        }
         22 => {
             let time = r.i32()?;
             r.done()?;
