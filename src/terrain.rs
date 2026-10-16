@@ -6,7 +6,7 @@ fn mix(mut value: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
     value ^ (value >> 31)
 }
-fn noise(seed: u64, x: f64, y: f64) -> f64 {
+pub(crate) fn noise(seed: u64, x: f64, y: f64) -> f64 {
     let (ix, iy) = (x.floor() as u64, y.floor() as u64);
     let sample = |x: u64, y: u64| {
         (mix(seed ^ x.wrapping_mul(0x9e3779b97f4a7c15) ^ y.wrapping_mul(0xd1b54a32d192ed03)) >> 11)

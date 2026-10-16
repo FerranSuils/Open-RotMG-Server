@@ -247,7 +247,7 @@ impl Directory {
             let hero = world.entities.get(id).context("closure hero missing")?;
             ensure!(
                 (HEROES.contains(&hero.kind)
-                    || crate::quest::ROOTS.contains(&hero.kind) && hero.quest == Some(*id))
+                    || crate::quest::root(hero.kind) && hero.quest == Some(*id))
                     && hero.hp > 0,
                 "closure identity is not a living qualifying hero"
             );
@@ -452,53 +452,12 @@ impl Directory {
 }
 impl World {
     pub(super) fn populate_realm_heroes(&mut self) -> Result<()> {
-        for (kind, terrain) in [(HEROES[0], 5), (HEROES[1], 6)] {
-            let mut candidates: Vec<_> = self
-                .map
-                .cells
-                .iter()
-                .enumerate()
-                .filter_map(|(i, c)| {
-                    let pos = Pos {
-                        x: (i % self.map.width as usize) as f32 + 0.5,
-                        y: (i / self.map.width as usize) as f32 + 0.5,
-                    };
-                    (c.terrain == terrain && c.object.is_none() && self.walkable(pos))
-                        .then_some(pos)
-                })
-                .collect();
-            candidates.shuffle(&mut self.rng);
-            candidates.sort_by_key(|p| self.map.cell(p.x, p.y).unwrap().ground != 0xd0);
-            let mut placed = 0;
-            for pos in candidates {
-                if self
-                    .map
-                    .spawns
-                    .iter()
-                    .any(|(x, y)| pos.distance(Pos { x: *x, y: *y }) < 64.)
-                    || self.entities.values().any(|e| {
-                        self.content.objects[&e.kind].enemy
-                            && pos.distance(e.pos) < if HEROES.contains(&e.kind) { 28. } else { 8. }
-                    })
-                {
-                    continue;
-                }
+        for (kind, terrains) in [(HEROES[0], &[1][..]), (HEROES[1], &[3, 4][..])] {
+            for _ in 0..3 {
+                let pos = self.place_named_setpiece(kind, terrains)?;
                 self.spawn_entity(kind, pos, vec![])?;
-                placed += 1;
-                if placed == 3 {
-                    break;
-                }
             }
-            ensure!(
-                placed == 3,
-                "Realm terrain {terrain} cannot place its finite {kind:#x} hero roster"
-            );
-            tracing::info!(
-                kind,
-                placed,
-                terrain,
-                "finite nonrespawning closure heroes placed"
-            );
+            tracing::info!(kind, "three finite landmark heroes placed");
         }
         Ok(())
     }
@@ -506,8 +465,7 @@ impl World {
         self.entities
             .values()
             .filter(|e| {
-                HEROES.contains(&e.kind)
-                    || (crate::quest::ROOTS.contains(&e.kind) && e.quest == Some(e.id))
+                HEROES.contains(&e.kind) || (crate::quest::root(e.kind) && e.quest == Some(e.id))
             })
             .map(|e| e.id)
             .collect()
@@ -653,7 +611,7 @@ mod tests {
     fn final_named_deaths_remove_only_original_bound_closure_ids_once() {
         let mut d = super::super::tests::directory();
         let originals = d.endgame.cycles[&-3].remaining.clone();
-        assert_eq!(originals.len(), 10);
+        assert_eq!(originals.len(), 13);
         let saved_cycle = d.endgame.cycles.remove(&-3).unwrap();
         let w = d.worlds.get_mut(&-3).unwrap();
         let pos = w.entities[originals.iter().next().unwrap()].pos;
@@ -679,7 +637,7 @@ mod tests {
             assert!(d.worlds[&-3].admission_open);
             assert!(d.worlds[&-3].critical_deaths.is_empty());
         }
-        assert_eq!(d.endgame.cycles[&-3].remaining.len(), 6);
+        assert_eq!(d.endgame.cycles[&-3].remaining.len(), 9);
     }
     #[test]
     fn finite_closure_seals_both_admission_paths_and_replaces_without_erasing_owned_players() {
