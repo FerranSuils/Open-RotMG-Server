@@ -45,7 +45,7 @@ fn player_status_distinguishes_name_boosts_wallet_character_fame_and_history() {
         .bonuses = boosts
         .into_iter()
         .enumerate()
-        .map(|(i, n)| (i as u8, n))
+        .map(|(i, n)| (crate::content::STATS[i].0, n))
         .collect();
     let presentation = AccountPresentation {
         fame: 27,
@@ -75,7 +75,7 @@ fn player_status_distinguishes_name_boosts_wallet_character_fame_and_history() {
     );
     let p = w.players.get_mut(&id).unwrap();
     p.character.name = "Named".into();
-    p.character.items.swap(3, 4);
+    p.character.items.swap(3, 7);
     let removed = numbers(&w, id, id);
     assert_eq!(removed[&56], 1);
     for k in [46, 47, 48, 49, 50, 53, 51, 52] {
@@ -167,14 +167,14 @@ fn projectile_ground_rules_ignore_no_walk_but_stop_void_bounds_and_cover() {
                 pos: start,
                 angle: 0.,
                 born: 0,
-                damage: 10,
+                damage: 1,
                 spec,
                 hit: BTreeSet::new(),
             });
             for _ in 0..5 {
                 w.step();
             }
-            let expected = if ground == 255 { 0 } else { 10 };
+            let expected = if ground == 255 { 0 } else { 1 };
             if friendly {
                 assert_eq!(
                     w.entities[&enemy].hp,
@@ -253,16 +253,21 @@ fn fixed_sizes_reach_map_dynamic_and_wire_but_explicit_overrides_win() {
     let mut w = World::new(content.clone(), Arc::new(map.clone())).unwrap();
     let boss = w.entities.values().find(|e| e.kind == 0x927).unwrap().id;
     assert_eq!(numbers(&w, boss, 0)[&2], 80);
+    let spawn = w
+        .map
+        .spawns
+        .iter()
+        .map(|&(x, y)| Pos { x, y })
+        .find(|p| w.walkable(*p))
+        .unwrap();
     for (kind, size) in [
         (0x927, 80),
         (0x683, 105),
         (0x684, 110),
         (0x686, 120),
-        (0x712, 100),
+        (0x600, 100),
     ] {
-        let id = w
-            .spawn_entity(kind, Pos { x: 10.5, y: 10.5 }, vec![])
-            .unwrap();
+        let id = w.spawn_entity(kind, spawn, vec![]).unwrap();
         assert_eq!(numbers(&w, id, 0)[&2], size, "kind={kind:#x}");
     }
     map.cells[boss_cell].config = "size:91".into();
