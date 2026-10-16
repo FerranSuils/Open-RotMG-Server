@@ -1,6 +1,6 @@
 use crate::{
     content::{Content, Map, PARALYZED, Projectile, SLOWED, SPEEDY, STUNNED},
-    store::{AccountLists, Character, Vault},
+    store::{AccountLists, AccountPresentation, Character, Vault},
     wire::{self, Packet, Writer},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -17,6 +17,8 @@ use std::{
 use tokio::sync::{mpsc, oneshot, watch};
 mod abilities;
 mod chat;
+#[cfg(test)]
+mod client_contract_tests;
 mod endgame;
 mod endgame_ai;
 mod enemy_damage;
@@ -28,6 +30,8 @@ mod gods_tests;
 mod midlands;
 #[cfg(test)]
 mod midlands_tests;
+#[cfg(test)]
+mod player_position_tests;
 mod population;
 #[cfg(test)]
 mod population_tests;
@@ -145,6 +149,7 @@ pub struct Player {
     pub tx: Option<Output>,
     pub departing: bool,
     account_lists: AccountLists,
+    presentation: AccountPresentation,
     paused: bool,
     pub(crate) controller: Controller,
     pub(crate) native_update_acked: bool,
@@ -1084,7 +1089,7 @@ impl World {
                         goal: None,
                         phase: 0.,
                         hp: o.hp,
-                        size: 100,
+                        size: o.size,
                         condition: if o.stasis_immune {
                             crate::condition::bit(crate::condition::STASIS_IMMUNE)
                         } else {
@@ -1268,11 +1273,7 @@ impl World {
                 goal: None,
                 phase: 0.,
                 hp: definition.hp,
-                size: if definition.enemy && (1..=12).contains(&definition.terrain) {
-                    definition.size
-                } else {
-                    100
-                },
+                size: definition.size,
                 condition: (if kind == 0x91a {
                     crate::condition::bit(crate::condition::INVULNERABLE)
                 } else {
@@ -1361,14 +1362,24 @@ impl World {
             .i16(0);
         o.0
     }
+    #[cfg(test)]
     pub fn enter(&mut self, ch: Character, tx: Option<Output>) -> Result<i32> {
-        self.enter_at(ch, tx, None)
+        self.enter_at(
+            ch,
+            tx,
+            None,
+            AccountPresentation {
+                fame: 0,
+                best_fame: BTreeMap::new(),
+            },
+        )
     }
     pub fn enter_at(
         &mut self,
         ch: Character,
         tx: Option<Output>,
         position: Option<Pos>,
+        presentation: AccountPresentation,
     ) -> Result<i32> {
         if let Some(pos) = position {
             ensure!(
@@ -1405,6 +1416,7 @@ impl World {
                 pos,
                 departing: false,
                 account_lists: AccountLists::default(),
+                presentation,
                 paused: false,
                 native_update_acked: false,
                 controller: if tx.is_none() {
@@ -1470,6 +1482,7 @@ impl World {
         );
         Ok(id)
     }
+    #[cfg(test)]
     pub fn enter_autonomous(&mut self, ch: Character, tx: Output) -> Result<i32> {
         let id = self.enter(ch, Some(tx))?;
         self.players
@@ -1491,11 +1504,14 @@ impl World {
         tracing::info!(player = id, character = p.character.id, "player left");
         Ok(p.character)
     }
-    pub fn stats(&self, id: i32) -> Result<Vec<u8>> {
+    pub fn stats(&self, id: i32, recipient: i32) -> Result<Vec<u8>> {
         let mut o = Writer::new();
         if let Some(p) = self.players.get(&id) {
             let values = p.character.effective(&self.content)?;
-            o.i32(id).f32(p.pos.x).f32(p.pos.y).i16(37);
+            o.i32(id)
+                .f32(p.pos.x)
+                .f32(p.pos.y)
+                .i16(45 + i16::from(id == recipient));
             for (k, v) in [
                 (0, values[0]),
                 (1, p.character.hp),
@@ -1525,7 +1541,7 @@ impl World {
                     29,
                     p.conditions(self.now) | if p.paused { 1 << 20 } else { 0 },
                 ),
-                (30, 0),
+                (30, p.presentation.stars()),
             ] {
                 stat(&mut o, k, v);
             }
@@ -1533,9 +1549,15 @@ impl World {
             stat(&mut o, 32, 0);
             stat(&mut o, 33, 0);
             stat(&mut o, 38, p.character.account);
+            if id == recipient {
+                stat(&mut o, 39, p.presentation.fame);
+            }
+            for (i, boost) in [46, 47, 48, 49, 50, 53, 51, 52].into_iter().enumerate() {
+                stat(&mut o, boost, values[i] - p.character.base[i]);
+            }
             stat(
                 &mut o,
-                53,
+                56,
                 i32::from(crate::store::name_chosen(
                     p.character.account,
                     &p.character.name,
@@ -1545,10 +1567,8 @@ impl World {
             stat(
                 &mut o,
                 58,
-                [20, 150, 400, 800, 2000]
-                    .into_iter()
-                    .find(|n| *n > p.character.fame)
-                    .unwrap_or(0),
+                p.presentation
+                    .next_quest(p.character.class, p.character.fame),
             );
             text_stat(&mut o, 62, "");
             stat(&mut o, 63, 0);
@@ -1727,7 +1747,7 @@ impl World {
                     self.entities[&entity].kind
                 };
                 o.i16(kind as i16);
-                o.0.extend(self.stats(entity)?);
+                o.0.extend(self.stats(entity, id)?);
             }
             o.i16(dropped.len() as i16);
             for entity in dropped {
@@ -1834,10 +1854,13 @@ impl World {
         ensure!(
             (1..=samples).all(|i| {
                 let f = i as f32 / samples as f32;
-                self.walkable(Pos {
-                    x: p.pos.x + (pos.x - p.pos.x) * f,
-                    y: p.pos.y + (pos.y - p.pos.y) * f,
-                })
+                self.player_step_valid(
+                    p.pos,
+                    Pos {
+                        x: p.pos.x + (pos.x - p.pos.x) * f,
+                        y: p.pos.y + (pos.y - p.pos.y) * f,
+                    },
+                )
             }),
             "movement across a blocked tile"
         );
@@ -1924,6 +1947,60 @@ impl World {
             self.correct_position(id, time, "immobilized movement")?;
         }
         Ok(())
+    }
+    fn player_step_valid(&self, from: Pos, to: Pos) -> bool {
+        let crosses =
+            |a: f32, b: f32| (a % 0.5 == 0. && a != b) || (a * 2.).floor() != (b * 2.).floor();
+        // The client only revalidates when departing a half-cell boundary or crossing one.
+        (!crosses(from.x, to.x) && !crosses(from.y, to.y))
+            || self.player_position_valid(Some(from), to)
+    }
+    fn player_position_valid(&self, from: Option<Pos>, pos: Pos) -> bool {
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return false;
+        }
+        let Some(cell) = self.map.cell(pos.x, pos.y) else {
+            return false;
+        };
+        let own = (pos.x.floor() as i32, pos.y.floor() as i32);
+        let check_own = from.is_none_or(|p| (p.x.floor() as i32, p.y.floor() as i32) != own);
+        if check_own && self.content.grounds[&cell.ground] <= 0. {
+            return false;
+        }
+        let side = |n: f32| {
+            if n.fract() < 0.5 {
+                -1
+            } else if n.fract() > 0.5 {
+                1
+            } else {
+                0
+            }
+        };
+        let (dx, dy) = (side(pos.x), side(pos.y));
+        let neighbors = [
+            (own.0 + dx, own.1),
+            (own.0, own.1 + dy),
+            (own.0 + dx, own.1 + dy),
+        ];
+        if neighbors.iter().any(|&(x, y)| {
+            (x, y) != own
+                && self
+                    .map
+                    .cell(x as f32, y as f32)
+                    .is_none_or(|c| c.ground == 255)
+        }) {
+            return false;
+        }
+        self.entities.values().all(|e| {
+            let cell = (e.pos.x.floor() as i32, e.pos.y.floor() as i32);
+            if check_own && cell == own {
+                !self.content.objects[&e.kind].blocks
+            } else if cell != own && neighbors.contains(&cell) {
+                !self.content.objects[&e.kind].full_occupy
+            } else {
+                true
+            }
+        })
     }
     pub fn walkable(&self, pos: Pos) -> bool {
         let Some(c) = self.map.cell(pos.x, pos.y) else {
@@ -2166,14 +2243,14 @@ impl World {
         } else if condition & crate::condition::bit(crate::condition::WEAK) != 0 {
             0.5
         } else {
-            (0.5 + 1.5 * p.character.effective(&self.content)?[2] as f32 / 75.)
+            (0.5 + (f64::from(p.character.effective(&self.content)?[2]) / 75.) * (2. - 0.5))
                 * if condition & crate::condition::bit(crate::condition::DAMAGING) != 0 {
                     1.5
                 } else {
                     1.
                 }
         };
-        let damage = (draw as f32 * multiplier) as i32;
+        let damage = (f64::from(draw) * multiplier) as i32;
         self.bullets.push(Bullet {
             owner: id,
             source_kind: p.character.class,
@@ -2624,7 +2701,10 @@ impl World {
         );
         match a {
             Action::Move { x, y } => {
-                ensure!(self.walkable(Pos { x, y }), "goal outside map or blocked");
+                ensure!(
+                    self.player_position_valid(Some(p.pos), Pos { x, y }),
+                    "goal outside map or blocked"
+                );
                 self.players
                     .get_mut(&id)
                     .context("player missing")?
@@ -3698,11 +3778,10 @@ impl World {
                         .max(b.born)
                         .min(b.born + b.spec.lifetime as u64),
                 );
-                if b.friendly
-                    && self
-                        .map
-                        .cell(b.pos.x, b.pos.y)
-                        .is_none_or(|c| self.content.grounds[&c.ground] <= 0.)
+                if self
+                    .map
+                    .cell(b.pos.x, b.pos.y)
+                    .is_none_or(|c| c.ground == 255)
                     || self.entities_at(b.pos).any(|e| {
                         let o = &self.content.objects[&e.kind];
                         o.static_object
@@ -3805,7 +3884,7 @@ impl World {
                 let mut o = Writer::new();
                 o.i32(p.tick).i32(100).i16(dynamic.len() as i16);
                 for entity in dynamic {
-                    o.0.extend(self.stats(entity).expect("visible entity must exist"));
+                    o.0.extend(self.stats(entity, id).expect("visible entity must exist"));
                 }
                 send(p, wire::NEW_TICK, o.0);
                 let p = self.players.get_mut(&id).unwrap();
@@ -3910,7 +3989,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(w.entities[&id].name, "Nexus Portal");
-        let bytes = w.stats(id).unwrap();
+        let bytes = w.stats(id, 0).unwrap();
         let mut r = crate::wire::Reader::new(&bytes);
         assert_eq!(r.i32().unwrap(), id);
         r.f32().unwrap();
@@ -4057,7 +4136,7 @@ mod tests {
             );
             let world = World::new(content.clone(), map).unwrap();
             for e in world.entities.values() {
-                world.stats(e.id).unwrap();
+                world.stats(e.id, 0).unwrap();
             }
             if name == "pirate-cave" {
                 assert!(
@@ -4266,7 +4345,7 @@ mod tests {
         assert!(!w.players[&observer].known.contains(&private));
         w.step();
         w.step();
-        let expected = w.stats(peer).unwrap();
+        let expected = w.stats(peer, observer).unwrap();
         let mut tick = None;
         while let Ok(packet) = rx.try_recv() {
             if packet.id == wire::NEW_TICK {
@@ -4368,7 +4447,7 @@ mod tests {
         let mut expected = Writer::new();
         expected.i32(0).i32(100).i16(dynamic.len() as i16);
         for entity in dynamic {
-            expected.0.extend(w.stats(entity).unwrap());
+            expected.0.extend(w.stats(entity, id).unwrap());
         }
         let mut tick = None;
         while let Ok(packet) = rx.try_recv() {
@@ -5032,7 +5111,29 @@ mod tests {
                 },
                 1091
             )
-            .is_err()
+            .is_ok()
+        );
+        w.spawn_entity(
+            blocker,
+            Pos {
+                x: pos.x + 1.,
+                y: pos.y,
+            },
+            vec![],
+        )
+        .unwrap();
+        assert!(
+            w.validate_move(
+                id,
+                Pos {
+                    x: pos.x + 0.6,
+                    y: pos.y
+                },
+                1200
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("blocked tile")
         );
     }
     #[test]

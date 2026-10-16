@@ -91,7 +91,7 @@ impl World {
             "non-finite native position"
         );
         ensure!(
-            self.walkable(pos),
+            self.player_step_valid(p.pos, pos),
             "native position is outside walkable terrain"
         );
         Ok(())

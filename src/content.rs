@@ -72,7 +72,7 @@ impl Projectile {
         if self.parametric {
             let phase = elapsed / self.lifetime * std::f32::consts::TAU;
             let a = phase.sin() * if id.is_multiple_of(2) { -1. } else { 1. };
-            let b = (phase * 2.).sin() * if id % 4 < 2 { -1. } else { 1. };
+            let b = (phase * 2.).sin() * if id % 4 < 2 { 1. } else { -1. };
             return (
                 (a * angle.cos() - b * angle.sin()) * self.magnitude,
                 (a * angle.sin() + b * angle.cos()) * self.magnitude,
@@ -133,6 +133,7 @@ pub struct Object {
     pub quest_level: Option<i32>,
     pub xp_multiplier: f32,
     pub blocks: bool,
+    pub full_occupy: bool,
     pub occupy_square: bool,
     pub enemy_occupy_square: bool,
     pub static_object: bool,
@@ -358,6 +359,7 @@ impl Content {
                     .transpose()?,
                 xp_multiplier: number(n, "XpMult", 1.)?,
                 blocks: child(n, "OccupySquare").is_some() || child(n, "FullOccupy").is_some(),
+                full_occupy: child(n, "FullOccupy").is_some(),
                 occupy_square: child(n, "OccupySquare").is_some(),
                 enemy_occupy_square: child(n, "EnemyOccupySquare").is_some(),
                 static_object: child(n, "Static").is_some(),

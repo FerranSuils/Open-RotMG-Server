@@ -16,7 +16,17 @@ fn fixture(class: u16, ability: i32) -> (World, i32) {
     ch.mp = ch.base[1];
     ch.items = w.content.get(class).unwrap().equipment.clone();
     ch.items[1] = ability;
-    let id = w.enter_at(ch, None, Some(Pos { x: 12., y: 12. })).unwrap();
+    let id = w
+        .enter_at(
+            ch,
+            None,
+            Some(Pos { x: 12., y: 12. }),
+            AccountPresentation {
+                fame: 0,
+                best_fame: BTreeMap::new(),
+            },
+        )
+        .unwrap();
     w.players.get_mut(&id).unwrap().controller = Controller::Human;
     w.now = 20000;
     (w, id)

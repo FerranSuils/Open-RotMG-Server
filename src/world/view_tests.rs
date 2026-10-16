@@ -96,7 +96,7 @@ fn own_condition_view_matches_native_stat29_without_exposing_other_statuses() {
         w.now = now;
         w.players.get_mut(&a).unwrap().paused = paused;
         let before = w.players[&a].statuses.clone();
-        let bytes = w.stats(a).unwrap();
+        let bytes = w.stats(a, a).unwrap();
         let mut r = Reader::new(&bytes);
         assert_eq!(r.i32().unwrap(), a);
         r.f32().unwrap();
@@ -151,7 +151,7 @@ fn known_visible_npc_condition_view_matches_native29_without_hidden_entities() {
         let w = d.worlds.get_mut(&-2).unwrap();
         w.now = now;
         let before = w.entities[&npc].statuses.clone();
-        let bytes = w.stats(npc).unwrap();
+        let bytes = w.stats(npc, a).unwrap();
         let mut r = Reader::new(&bytes);
         assert_eq!(r.i32().unwrap(), npc);
         r.f32().unwrap();

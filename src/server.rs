@@ -1,4 +1,8 @@
+#[cfg(test)]
+mod client_contract_tests;
 mod input;
+#[cfg(test)]
+mod queue_tests;
 use crate::{
     content::{Content, WIZARD},
     crypto::Keys,
@@ -246,6 +250,29 @@ async fn chars(
     .await;
     match result {
         Ok(xml) => ([("content-type", "application/xml")], xml).into_response(),
+        Err(e) if e.is::<crate::store::InvalidCredentials>() => {
+            tracing::info!("legacy character-list credentials rejected");
+            (
+                [("content-type", "application/xml")],
+                "<Error>Account credentials not valid</Error>",
+            )
+                .into_response()
+        }
+        Err(e) => error(e),
+    }
+}
+async fn delete_character(
+    State(a): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    match admit(&a, &headers, peer) {
+        Ok(true) => (
+            [("content-type", "application/xml")],
+            "<Error>Character deletion is not implemented; no character was deleted.</Error>",
+        )
+            .into_response(),
+        Ok(false) => limited(),
         Err(e) => error(e),
     }
 }
@@ -526,6 +553,32 @@ fn collision_report(other: bool, r: &mut Reader<'_>) -> Result<()> {
     }
     r.done()
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyQueueError {
+    Full,
+    Closed,
+}
+impl std::fmt::Display for ReplyQueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Full => "connection reply queue is full",
+            Self::Closed => "connection reply queue is closed",
+        })
+    }
+}
+impl std::error::Error for ReplyQueueError {}
+
+fn enqueue_reply(tx: &mpsc::Sender<Packet>, packet: Packet) -> Result<()> {
+    // This handler's caller is also the only consumer, so waiting for capacity deadlocks.
+    tx.try_send(packet).map_err(|error| {
+        match error {
+            mpsc::error::TrySendError::Full(_) => ReplyQueueError::Full,
+            mpsc::error::TrySendError::Closed(_) => ReplyQueueError::Closed,
+        }
+        .into()
+    })
+}
+
 async fn handle(
     a: &mut App,
     packet: Packet,
@@ -628,11 +681,13 @@ async fn handle(
             *expected = character;
             a.world = a.world.in_world(destination);
             let body = a.world.call(|w| Ok(w.map_info())).await?;
-            tx.send(Packet {
-                id: wire::MAP_INFO,
-                body,
-            })
-            .await?;
+            enqueue_reply(
+                tx,
+                Packet {
+                    id: wire::MAP_INFO,
+                    body,
+                },
+            )?;
             tracing::info!(
                 account = id,
                 requested_world = game,
@@ -673,6 +728,7 @@ async fn handle(
                 None
             };
             let lists = a.store.account_lists(account).await?;
+            let presentation = a.store.presentation(account).await?;
             let prepared = a
                 .testing
                 .as_ref()
@@ -685,7 +741,12 @@ async fn handle(
                         if let Some(vault) = vault {
                             w.load_vault(vault)?;
                         }
-                        let id = w.enter_at(ch, Some(output), prepared.map(|(_, pos)| pos))?;
+                        let id = w.enter_at(
+                            ch,
+                            Some(output),
+                            prepared.map(|(_, pos)| pos),
+                            presentation,
+                        )?;
                         w.sync_account_lists(id, Some(lists))?;
                         Ok(id)
                     })
@@ -782,10 +843,10 @@ async fn handle(
                     diagnostics::report(a, owner, id, message.trim(), diagnostics).await
                 {
                     tracing::error!(account=owner, player=id, error=%error, "bug report failed");
-                    tx.send(crate::world::chat_info(&format!(
-                        "Could not submit bug report: {error}"
-                    )))
-                    .await?;
+                    enqueue_reply(
+                        tx,
+                        crate::world::chat_info(&format!("Could not submit bug report: {error}")),
+                    )?;
                 }
             } else if matches!(
                 text.trim(),
@@ -816,7 +877,7 @@ async fn handle(
                     Ok(text) => text,
                     Err(error) => error.to_string(),
                 };
-                tx.send(crate::world::chat_private(&reply)).await?;
+                enqueue_reply(tx, crate::world::chat_private(&reply))?;
             } else if matches!(
                 text.split_whitespace()
                     .next()
@@ -855,12 +916,11 @@ async fn handle(
                     Ok(text) => crate::world::chat_info(text),
                     Err(error) => crate::world::chat_error(&error.to_string()),
                 };
-                tx.send(reply).await?;
+                enqueue_reply(tx, reply)?;
             } else if let Err(error) = a.world.directory(move |d| d.chat(id, text, received)).await
             {
                 tracing::warn!(player=id, error=%error, "local chat rejected");
-                tx.send(crate::world::chat_error(&error.to_string()))
-                    .await?;
+                enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
             }
         }
         wire::EDIT_ACCOUNT_LIST => {
@@ -900,8 +960,7 @@ async fn handle(
                 a.world
                     .call(move |w| w.sync_account_lists(id, None))
                     .await?;
-                tx.send(crate::world::chat_error(&error.to_string()))
-                    .await?;
+                enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
             }
         }
         wire::TELEPORT => {
@@ -914,8 +973,7 @@ async fn handle(
                 .await
             {
                 tracing::warn!(player=id, target, error=%error, "teleport rejected");
-                tx.send(crate::world::chat_error(&error.to_string()))
-                    .await?;
+                enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
             }
         }
         wire::PONG => {
@@ -975,8 +1033,10 @@ async fn handle(
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(player=id, item=s.kind, slot=s.slot, error=%error, "item use rejected");
-                    tx.send(crate::world::chat_error(&error.to_string()))
-                        .await?;
+                    enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
+                    let mut out = Writer::new();
+                    out.i32(1);
+                    enqueue_reply(tx, Packet { id: 4, body: out.0 })?;
                 }
             }
         }
@@ -1050,7 +1110,7 @@ async fn handle(
                 tracing::warn!(account, error=%e, "name choice rejected");
                 let mut o = Writer::new();
                 o.u8(0).utf(&e.to_string());
-                tx.send(Packet { id: 20, body: o.0 }).await?;
+                enqueue_reply(tx, Packet { id: 20, body: o.0 })?;
                 return Ok(());
             }
             if let Some(id) = player {
@@ -1068,7 +1128,7 @@ async fn handle(
             }
             let mut o = Writer::new();
             o.u8(1).utf("");
-            tx.send(Packet { id: 20, body: o.0 }).await?;
+            enqueue_reply(tx, Packet { id: 20, body: o.0 })?;
         }
         42 | 3 => {
             let portal = if packet.id == 3 { Some(r.i32()?) } else { None };
@@ -1102,7 +1162,7 @@ async fn handle(
                 .i32(keytime)
                 .i16(key.len() as i16);
             o.0.extend(key);
-            tx.send(Packet { id: 39, body: o.0 }).await?;
+            enqueue_reply(tx, Packet { id: 39, body: o.0 })?;
             *reconnecting = true;
             account
                 .take()
@@ -1123,11 +1183,26 @@ async fn handle(
 }
 async fn connection(
     socket: WebSocket,
-    mut a: App,
+    a: App,
     user_agent: Option<String>,
     browser: Option<Arc<Mutex<diagnostics::Browser>>>,
 ) {
-    let (mut wsout, wsin) = socket.split();
+    let (wsout, wsin) = socket.split();
+    connection_io(wsout, wsin, a, user_agent, browser).await;
+}
+async fn connection_io<S, I>(
+    mut wsout: S,
+    wsin: I,
+    mut a: App,
+    user_agent: Option<String>,
+    browser: Option<Arc<Mutex<diagnostics::Browser>>>,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+    I: futures_util::Stream<Item = std::result::Result<Message, axum::Error>>
+        + Send
+        + Unpin
+        + 'static,
+{
     let (tx, mut rx) = mpsc::channel::<Packet>(64);
     let (lost, mut lost_rx) = tokio::sync::watch::channel(false);
     // Actor work and output backpressure must not manufacture late, clustered input receipts.
@@ -1170,6 +1245,7 @@ async fn connection(
                         session.diagnostics.max_input_queue_ms = session.diagnostics.max_input_queue_ms.max(a.world.clock.now().saturating_duration_since(received).as_secs_f64()*1000.0);
                         if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost,received).await {
                             tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,error=%format_args!("{e:#}"),"game command rejected");
+                            if e.is::<ReplyQueueError>() { break 'connection; }
                             if matches!(id,1|21|37|57) && let Some(player) = session.player {
                                 let reason = e.to_string();
                                 let closed = a.world.for_player(player).call(move |w| Ok(w.cancel_trade(player, &reason))).await;
@@ -1321,10 +1397,11 @@ async fn bot_create(
             acc.characters[0].clone()
         };
         let destination = a.world.directory(move |d| d.initial(input.world)).await?;
+        let presentation = a.store.presentation(acc.id).await?;
         let id = a
             .world
             .in_world(destination)
-            .call(move |w| w.enter(ch, None))
+            .call(move |w| w.enter_at(ch, None, None, presentation))
             .await?;
         a.bots
             .lock()
@@ -1589,6 +1666,7 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
     let app = Router::new()
         .route("/legacy-api/char/list", post(chars))
         .route("/legacy-api/char/fame", post(fame))
+        .route("/legacy-api/char/delete", post(delete_character))
         .route("/legacy-api/account/{operation}", post(account_request))
         .route("/legacy-api/fame/list", post(legends))
         .nest_service("/sfx", tower_http::services::ServeDir::new(a.sfx.clone()))
