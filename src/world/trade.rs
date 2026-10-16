@@ -79,11 +79,7 @@ impl World {
     fn trade_ready(&self, id: i32) -> Result<()> {
         let p = self.players.get(&id).context("trade player missing")?;
         ensure!(
-            p.character.alive
-                && !p.death_pending
-                && !p.departing
-                && !p.pending
-                && p.persistence_failure.is_none(),
+            p.active() && !p.pending,
             "trade player busy, dead, departing or quarantined"
         );
         Ok(())
@@ -357,16 +353,11 @@ impl World {
             .values()
             .filter(|t| {
                 !t.pending
-                    && (t.players.iter().any(|id| {
-                        let p = &self.players[id];
-                        !p.character.alive
-                            || p.death_pending
-                            || p.departing
-                            || p.persistence_failure.is_some()
-                    }) || self.players[&t.players[0]]
-                        .pos
-                        .distance(self.players[&t.players[1]].pos)
-                        >= 2.)
+                    && (t.players.iter().any(|id| !self.players[id].active())
+                        || self.players[&t.players[0]]
+                            .pos
+                            .distance(self.players[&t.players[1]].pos)
+                            >= 2.)
             })
             .map(|t| t.players[0])
             .collect();

@@ -123,6 +123,9 @@ async fn main() -> Result<()> {
     let app = server::App {
         started,
         testing,
+        diagnostics: Arc::new(server::diagnostics::Diagnostics::open(
+            state.join("bug-reports"),
+        )?),
         store,
         world,
         keys,

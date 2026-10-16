@@ -55,13 +55,7 @@ pub(super) fn goto(p: &mut Player, own: bool, body: Vec<u8>) {
 
 impl Player {
     pub(super) fn correcting(&self) -> Result<bool> {
-        ensure!(
-            self.character.alive
-                && !self.death_pending
-                && !self.departing
-                && self.persistence_failure.is_none(),
-            "inactive player cannot reconcile position"
-        );
+        ensure!(self.active(), "inactive player cannot reconcile position");
         if let Some((_, sent)) = self.goto_acks.iter().find(|(own, _)| *own) {
             ensure!(
                 sent.elapsed() <= ACK_TIMEOUT,
@@ -87,13 +81,7 @@ impl Player {
 impl World {
     pub(super) fn validate_native_position(&self, id: i32, pos: Pos, time: i32) -> Result<()> {
         let p = self.players.get(&id).context("native player missing")?;
-        ensure!(
-            p.character.alive
-                && !p.death_pending
-                && !p.departing
-                && p.persistence_failure.is_none(),
-            "inactive native character"
-        );
+        ensure!(p.active(), "inactive native character");
         ensure!(
             time >= 0 && time >= p.last_move,
             "native position clock regressed"
