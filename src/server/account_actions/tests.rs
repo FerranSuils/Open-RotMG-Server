@@ -4,6 +4,9 @@ pub(crate) fn fixture() -> (PathBuf, App) {
     std::fs::create_dir(&dir).unwrap();
     let content = Arc::new(Content::load(std::path::Path::new("data")).unwrap());
     let app = App {
+        diagnostics: Arc::new(
+            super::super::diagnostics::Diagnostics::open(dir.join("bug-reports")).unwrap(),
+        ),
         started: std::time::Instant::now(),
         testing: None,
         store: Store::open(&dir.join("game.db"), &content).unwrap(),

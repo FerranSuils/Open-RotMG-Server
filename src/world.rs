@@ -404,10 +404,29 @@ pub struct Directory {
     next_world: i32,
     pub tick: u64,
     pub max_tick_us: u64,
+    diagnostic_ticks: std::collections::VecDeque<(Instant, u64, u64)>,
     max_players: usize,
     prepared_seed: Option<u64>,
 }
 impl Directory {
+    pub fn bug_context(&self, player: i32) -> Result<serde_json::Value> {
+        let (world_id, world, p) = self
+            .worlds
+            .iter()
+            .find_map(|(id, w)| w.players.get(&player).map(|p| (*id, w, p)))
+            .context("bug player missing")?;
+        let ticks = self.diagnostic_ticks.iter().filter(|(t, _, _)| t.elapsed().as_secs() <= 120).map(|(time, duration, late)| serde_json::json!({"age_ms": time.elapsed().as_millis(), "execution_us": duration, "scheduling_lateness_us": late})).collect::<Vec<_>>();
+        Ok(
+            serde_json::json!({"world_id": world_id, "world_name": world.name, "player_id": player,
+            "character_id": p.character.id, "class": p.character.class, "level": p.character.level,
+            "position": {"x": p.pos.x, "y": p.pos.y}, "visible_entities": p.known.len(),
+            "world_players": world.players.len(), "world_entities": world.entities.len(), "world_projectiles": world.bullets.len(),
+            "tick_interval_ms": 50, "recent_ticks": ticks, "tick": self.tick,
+            "total_worlds": self.worlds.len(), "total_players": self.worlds.values().map(|w| w.players.len()).sum::<usize>(),
+            "total_entities": self.worlds.values().map(|w| w.entities.len()).sum::<usize>(),
+            "total_projectiles": self.worlds.values().map(|w| w.bullets.len()).sum::<usize>()}),
+        )
+    }
     pub fn competitive_characters(&self) -> Vec<Character> {
         self.worlds
             .values()
@@ -503,6 +522,7 @@ impl Directory {
             next_world: 1,
             tick: 0,
             max_tick_us: 0,
+            diagnostic_ticks: std::collections::VecDeque::new(),
             max_players,
             prepared_seed,
         };
@@ -934,11 +954,14 @@ impl Handle {
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = timer.tick() => {
+                    scheduled = timer.tick() => {
                         if directory.clock.paused() { continue; }
+                        let late=scheduled.elapsed().as_micros() as u64;
                         let start=Instant::now(); directory.step();
                         let us=start.elapsed().as_micros() as u64;
                         directory.max_tick_us=directory.max_tick_us.max(us);
+                        directory.diagnostic_ticks.push_back((start, us, late));
+                        while directory.diagnostic_ticks.front().is_some_and(|(t, _, _)| t.elapsed().as_secs() > 120) { directory.diagnostic_ticks.pop_front(); }
                         if us>25_000 {tracing::warn!(tick=directory.tick,elapsed_us=us,"slow aggregate simulation tick");}
                         if directory.tick.is_multiple_of(100) {
                             tracing::info!(tick=directory.tick,worlds=directory.worlds.len(),

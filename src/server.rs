@@ -133,6 +133,7 @@ impl App {
 }
 use tokio::sync::mpsc;
 mod account_actions;
+pub(crate) mod diagnostics;
 mod hiscores;
 pub(crate) mod testing;
 use account_actions::{discord_kick, discord_recover, reset_password};
@@ -141,6 +142,7 @@ use hiscores::{collection, discord_link, hiscores};
 pub struct App {
     pub started: std::time::Instant,
     pub testing: Option<testing::Testing>,
+    pub diagnostics: Arc<diagnostics::Diagnostics>,
     pub store: Store,
     pub world: Handle,
     pub keys: Arc<Keys>,
@@ -385,6 +387,7 @@ async fn websocket(
     State(a): State<App>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<DiagnosticQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let origin = headers.get("origin").and_then(|v| v.to_str().ok());
@@ -408,11 +411,28 @@ async fn websocket(
         )
             .into_response();
     };
+    let browser = match query
+        .diagnostics
+        .as_deref()
+        .map(|key| a.diagnostics.browser(key))
+        .transpose()
+    {
+        Ok(browser) => browser,
+        Err(e) => return error(e),
+    };
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.chars().take(512).collect());
     ws.max_message_size(1_048_576)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            connection(socket, a).await
+            connection(socket, a, user_agent, browser).await
         })
+}
+#[derive(Deserialize)]
+struct DiagnosticQuery {
+    diagnostics: Option<String>,
 }
 fn fail(description: &str) -> Packet {
     let mut o = Writer::new();
@@ -494,6 +514,7 @@ struct Session {
     player: Option<i32>,
     expected: Option<i32>,
     reconnecting: bool,
+    diagnostics: diagnostics::ConnectionDiagnostics,
 }
 fn collision_report(other: bool, r: &mut Reader<'_>) -> Result<()> {
     // Reports cannot grant hits: the actor advances and resolves projectiles itself.
@@ -518,6 +539,7 @@ async fn handle(
         player,
         expected,
         reconnecting,
+        diagnostics,
     } = session;
     if *reconnecting
         && matches!(
@@ -746,7 +768,26 @@ async fn handle(
         wire::PLAYER_TEXT => {
             let text = player_text(&mut r)?;
             let id = player.context("chat before character")?;
-            if matches!(
+
+            if let Some(message) = text
+                .trim()
+                .strip_prefix("/bug")
+                .filter(|s| s.is_empty() || s.starts_with(char::is_whitespace))
+            {
+                let owner = account
+                    .as_ref()
+                    .context("authenticated session required")?
+                    .id;
+                let result = diagnostics::report(a, owner, id, message.trim(), diagnostics).await;
+                let reply = match result {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        tracing::error!(account=owner, player=id, error=%error, "bug report failed");
+                        format!("Could not confirm bug report: {error}")
+                    }
+                };
+                tx.send(crate::world::chat_info(&reply)).await?;
+            } else if matches!(
                 text.trim(),
                 "/discord" | "/discord recovery" | "/discord norecovery"
             ) {
@@ -881,6 +922,7 @@ async fn handle(
             let nonce = r.i32()?;
             r.i32()?;
             r.done()?;
+            diagnostics.pong(nonce);
             if let (Some(testing), Some(player)) = (&a.testing, player) {
                 testing.acknowledge_native(nonce, *player);
             }
@@ -1079,7 +1121,12 @@ async fn handle(
     }
     Ok(())
 }
-async fn connection(socket: WebSocket, mut a: App) {
+async fn connection(
+    socket: WebSocket,
+    mut a: App,
+    user_agent: Option<String>,
+    browser: Option<Arc<Mutex<diagnostics::Browser>>>,
+) {
     let (mut wsout, wsin) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Packet>(64);
     let (lost, mut lost_rx) = tokio::sync::watch::channel(false);
@@ -1090,6 +1137,8 @@ async fn connection(socket: WebSocket, mut a: App) {
     tokio::pin!(deadline);
     let mut codec = Codec::server();
     let mut session = Session::default();
+    session.diagnostics.user_agent = user_agent;
+    session.diagnostics.browser = browser;
     let mut reconnect_sent = false;
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut serial = 0;
@@ -1116,6 +1165,9 @@ async fn connection(socket: WebSocket, mut a: App) {
                     if a.testing.as_ref().is_some_and(|t| t.stopped.borrow().is_some()) { if terminal_drain {continue;} break; }
                     if !session.reconnecting {
                         let id=packet.id;
+                        session.diagnostics.packets_in += 1;
+                        let handling = std::time::Instant::now();
+                        session.diagnostics.max_input_queue_ms = session.diagnostics.max_input_queue_ms.max(a.world.clock.now().saturating_duration_since(received).as_secs_f64()*1000.0);
                         if let Err(e)=handle(&mut a,packet,&mut session,&tx,&lost,received).await {
                             tracing::error!(account=session.account.as_ref().map(|o|o.id),player=session.player,packet=id,error=%format_args!("{e:#}"),"game command rejected");
                             if matches!(id,1|21|37|57) && let Some(player) = session.player {
@@ -1133,6 +1185,7 @@ async fn connection(socket: WebSocket, mut a: App) {
                             let _=wsout.send(Message::Binary(codec.frame(f.id,f.body).into())).await;
                             break 'connection;
                         }
+                        session.diagnostics.max_handler_ms = session.diagnostics.max_handler_ms.max(handling.elapsed().as_secs_f64()*1000.0);
                     }
                 },
                 Some(Incoming::Ping(bytes))=>{if wsout.send(Message::Pong(bytes)).await.is_err(){break}},
@@ -1177,14 +1230,19 @@ async fn connection(socket: WebSocket, mut a: App) {
             outgoing=rx.recv()=>{
                 let Some(packet)=outgoing else {break};
                 let reconnect=packet.id==39;
+                session.diagnostics.queue_high_water = session.diagnostics.queue_high_water.max(rx.len()+1);
                 let nonce = (packet.id==wire::PING && packet.body.len()==4).then(|| i32::from_be_bytes(packet.body[..4].try_into().unwrap()));
                 let frame = codec.frame(packet.id,packet.body);
                 if let (Some(testing),Some(player),Some(nonce)) = (&a.testing,session.player,nonce) { testing.note_native_frame(nonce,player,&frame); }
+                let sending = std::time::Instant::now();
                 if wsout.send(Message::Binary(frame.into())).await.is_err(){break;}
+                session.diagnostics.packets_out += 1;
+                session.diagnostics.max_send_ms = session.diagnostics.max_send_ms.max(sending.elapsed().as_secs_f64()*1000.0);
                 // Ruffle can discard unread TCP bytes when the proxy closes before its next frame.
                 if reconnect {reconnect_sent=true;deadline.as_mut().reset(tokio::time::Instant::now()+std::time::Duration::from_secs(10));}
             },
             _=ping.tick()=>{if session.account.is_some() && !a.world.clock.paused(){serial+=1;let mut o=Writer::new();o.i32(serial);
+                session.diagnostics.sent(serial);
                 if wsout.send(Message::Binary(codec.frame(wire::PING,o.0).into())).await.is_err(){break;}}}
         }
     }
@@ -1537,6 +1595,12 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
         .route("/client.swf", get(swf))
         .route("/game", get(websocket))
         .route("/health", get(health))
+        .route(
+            "/api/diagnostics/{key}",
+            post(diagnostics::browser_sample).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route("/internal/discord/bugs", get(diagnostics::pending))
+        .route("/internal/discord/bugs/{id}", post(diagnostics::receipt))
         .route("/api/hiscores", get(hiscores))
         .route("/api/collection/{account}", get(collection))
         .route("/internal/discord/link", post(discord_link))
