@@ -233,6 +233,77 @@ INSERT INTO account_lists VALUES(1,0,2),(1,1,2),(2,0,1),(1,0,3);''')
             db.execute('UPDATE accounts SET credits=0 WHERE id=1')
             db.execute('UPDATE accounts SET credits=27 WHERE id=2')
 
+    def add_guilds(self):
+        self.add_gold()
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.executescript('''CREATE TABLE guilds(id INTEGER PRIMARY KEY,name TEXT,level INTEGER,fame INTEGER,earned INTEGER,board TEXT);
+CREATE TABLE guild_members(account INTEGER PRIMARY KEY REFERENCES accounts(id),guild INTEGER REFERENCES guilds(id),rank INTEGER,fame INTEGER);''')
+            db.execute('INSERT INTO guilds VALUES(7,?,2,2500,12500,?)', ('Backup Guild', 'Welcome & prepare!\n日本語 🧙'))
+            db.executemany('INSERT INTO guild_members VALUES(?,7,?,?)', [(1, 40, 5000), (2, 10, 7500)])
+
+    def test_guild_roundtrip_preserves_bank_board_ranks_contributions_and_ids(self):
+        self.add_guilds()
+        before = self.export()
+        self.assertEqual(before['schema'], 9)
+        self.assertNotIn(b'NEVER_EXPORT', gzip.decompress(self.output.read_bytes()))
+        directory = self.root / 'guild-restored'
+        backup.restore(self.output, directory)
+        self.assertEqual(backup.snapshot(directory / 'game.db', backup.GUILDS_GAME), before['game'])
+        with closing(sqlite3.connect(directory / 'game.db')) as db, db:
+            db.execute('PRAGMA foreign_keys=ON')
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone(), (9,))
+            self.assertTrue(all(r[0] is None for r in db.execute('SELECT guid FROM accounts')))
+            for row in [(3, 7, 40, 0), (3, 99, 0, 0), (3, 7, 1, 0), (1, 7, 0, 0), (3, 7, 0, -1)]:
+                with self.subTest(row=row), self.assertRaises(sqlite3.IntegrityError):
+                    db.execute('INSERT INTO guild_members VALUES(?,?,?,?)', row)
+            db.execute('DELETE FROM guild_members')
+            db.execute('DELETE FROM guilds')
+            db.execute("INSERT INTO guilds(name) VALUES('New Guild')")
+            self.assertGreater(db.execute('SELECT id FROM guilds').fetchone()[0], 7)
+
+    def test_guild_invalid_data_authority_capacity_and_unknown_fields_fail_closed(self):
+        self.add_guilds()
+        before = self.export()
+        for table, field, values in [
+            ('guilds', 'id', [True, '7', 0, 2147483648]),
+            ('guilds', 'name', ['', 'Guild1', ' Guild', 'Two  Spaces', '日本語']),
+            ('guilds', 'level', [True, '1', 0, 5]),
+            ('guilds', 'fame', [True, -1, 12501]),
+            ('guilds', 'earned', [True, 2499, 2147483648]),
+            ('guilds', 'board', [None, 'x' * 4097, '😀' * 2049, 'bad\0text']),
+            ('guild_members', 'rank', [True, -1, 1, 50]),
+            ('guild_members', 'account', [True, 999]),
+            ('guild_members', 'guild', [True, 999]),
+            ('guild_members', 'fame', [True, -1, 12501]),
+        ]:
+            for value in values:
+                malformed = deepcopy(before)
+                malformed['game'][table][0][field] = value
+                with self.subTest(table=table, field=field, value=value), self.assertRaisesRegex(ValueError, '(?i)guild'):
+                    backup.validate(malformed)
+        for change in ['duplicate', 'founders', 'empty', 'capacity', 'fields']:
+            malformed = deepcopy(before)
+            game = malformed['game']
+            if change == 'duplicate':
+                game['guild_members'].append(game['guild_members'][0])
+            elif change == 'founders':
+                game['guild_members'][1]['rank'] = 40
+            elif change == 'empty':
+                game['guild_members'] = []
+            elif change == 'capacity':
+                for i in range(4, 54):
+                    game['accounts'].append({'id': i, 'name': f'Player{i}', 'credits': 100})
+                    game['account_fame'].append({'account': i, 'balance': 0, 'earned': 0})
+                    game['guild_members'].append({'account': i, 'guild': 7, 'rank': 0, 'fame': 0})
+            else:
+                game['guilds'][0]['token'] = 'MUST_NOT_EXPORT'
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                backup.validate(malformed)
+        with closing(sqlite3.connect(self.game)) as db, db:
+            db.execute('ALTER TABLE guilds ADD COLUMN token TEXT')
+        with self.assertRaisesRegex(ValueError, 'columns'):
+            self.export()
+
     def test_gold_roundtrip_preserves_spent_balances_and_schema_without_credentials(self):
         self.add_gold()
         before = self.export()
@@ -530,7 +601,7 @@ INSERT INTO account_lists VALUES(1,0,2),(1,1,2),(2,0,1),(1,0,3);''')
             del malformed['game'][table]
             with self.subTest(missing=table), self.assertRaisesRegex(ValueError, 'tables'):
                 backup.validate(malformed)
-        for version in [9, True, '3']:
+        for version in [10, True, '3']:
             with self.subTest(version=version), self.assertRaisesRegex(ValueError, 'envelope'):
                 backup.validate(dict(before, schema=version))
 

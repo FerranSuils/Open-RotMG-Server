@@ -389,6 +389,9 @@ impl Directory {
         );
         Ok(())
     }
+    pub(super) fn return_to_nexus(&mut self, player: i32, origin: i32) {
+        self.endgame.forced.insert(player, (origin, -2));
+    }
     #[cfg(test)]
     pub fn forced_transfer_candidates(&self) -> Vec<i32> {
         self.endgame.forced.keys().copied().collect()

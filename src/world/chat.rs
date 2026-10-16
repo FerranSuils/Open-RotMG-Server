@@ -20,14 +20,14 @@ pub(crate) fn chat_info(text: &str) -> Packet {
 }
 
 pub(super) fn text_packet(name: &str, object: i32, bubble: u8, text: &str) -> Packet {
-    text_to(name, object, bubble, "", text)
+    text_to(name, object, bubble, "", text, 0)
 }
 
-fn text_to(name: &str, object: i32, bubble: u8, recipient: &str, text: &str) -> Packet {
+fn text_to(name: &str, object: i32, bubble: u8, recipient: &str, text: &str, stars: i32) -> Packet {
     let mut out = Writer::new();
     out.utf(name)
         .i32(object)
-        .i32(0)
+        .i32(stars)
         .u8(bubble)
         .utf(recipient)
         .utf(text)
@@ -134,8 +134,13 @@ impl Directory {
             .split_once(char::is_whitespace)
             .unwrap_or((trimmed, ""));
         let tell = command.eq_ignore_ascii_case("/tell") || command.eq_ignore_ascii_case("/t");
+        let guild_chat =
+            command.eq_ignore_ascii_case("/g") || command.eq_ignore_ascii_case("/guild");
         ensure!(
-            !trimmed.starts_with('/') || tell || trimmed.eq_ignore_ascii_case("/pause"),
+            !trimmed.starts_with('/')
+                || tell
+                || guild_chat
+                || trimmed.eq_ignore_ascii_case("/pause"),
             "Unknown chat command."
         );
         let world = self.resolve(Target::Player(id))?;
@@ -162,11 +167,45 @@ impl Directory {
         }
         let account = sender.character.account;
         let name = sender.character.name.clone();
+        let guild = sender.presentation.guild.clone();
+        let stars = sender.presentation.stars();
         ensure!(
             !tell || crate::store::name_chosen(account, &name),
             "Choose a name before using /tell."
         );
         self.chat_permit(id, now)?;
+        if guild_chat {
+            let guild = guild.context("You are not in a guild.")?;
+            let message = rest.trim();
+            ensure!(!message.is_empty(), "Usage: /g <message>");
+            let packet = text_to(&name, -1, 0, "*Guild*", message, stars);
+            let mut recipients = 0;
+            for p in self
+                .worlds
+                .values()
+                .flat_map(|w| w.players.values())
+                .filter(|p| {
+                    p.can_chat()
+                        && p.presentation
+                            .guild
+                            .as_ref()
+                            .is_some_and(|g| g.id == guild.id)
+                        && !p.account_lists[1].contains(&account)
+                })
+            {
+                send(p, packet.id, packet.body.clone());
+                recipients += 1;
+            }
+            tracing::info!(
+                player = id,
+                account,
+                guild = guild.id,
+                recipients,
+                bytes = message.len(),
+                "guild chat delivered"
+            );
+            return Ok(());
+        }
         if tell {
             let (recipient, message) = rest
                 .trim_start()
@@ -183,7 +222,7 @@ impl Directory {
                 target.character.account != account,
                 "You cannot tell yourself."
             );
-            let packet = text_to(&name, -1, 0, &target.character.name, message.trim());
+            let packet = text_to(&name, -1, 0, &target.character.name, message.trim(), 0);
             let ignored = target.account_lists[1].contains(&account);
             if !ignored {
                 send(target, packet.id, packet.body.clone());
