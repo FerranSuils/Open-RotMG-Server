@@ -529,7 +529,7 @@ impl World {
                 12.,
             );
         }
-        match e.kind {
+        let (motion, rate_tenths) = match e.kind {
             0x6c2 => (Motion::Stationary, 0.),
             0x92d => (Motion::Pace { distance: 3. }, 5.),
             0x928 if e.stage == Some(0) => (Motion::Pace { distance: 3. }, 3.),
@@ -544,7 +544,9 @@ impl World {
                 6.,
             ),
             0x91c => {
-                if let Some(bearer) = self.quest_members(id, &[0x91d]).first() {
+                if let Some(bearer) = self.quest_members(id, &[0x91d]).first()
+                    && e.pos.distance(self.entities[bearer].pos) > 2.
+                {
                     (
                         Motion::Protect {
                             anchor: Anchor::QuestMember(self.entities[bearer].kind),
@@ -557,24 +559,28 @@ impl World {
                 }
             }
             0x676 | 0x677 | 0x65f..=0x661 => {
+                let protection = if e.kind == 0x677 { 11. } else { 10. };
+                let birdman = matches!(e.kind, 0x676 | 0x677);
                 if let Some(leader) = self.quest_leader(id)
-                    && e.pos.distance(self.entities[&leader].pos) > 12.
+                    && e.pos.distance(self.entities[&leader].pos) > protection
                 {
                     (
                         Motion::Protect {
                             anchor: Anchor::QuestMember(self.entities[&leader].kind),
-                            distance: 10.,
+                            distance: protection,
                         },
-                        10.,
+                        if birdman { 5. } else { 10. },
                     )
-                } else {
+                } else if e.pos.distance(target) < 10. {
                     (
                         Motion::Chase {
                             sight: 10.,
-                            stop: 7.,
+                            stop: if e.kind == 0x676 { 9. } else { 7. },
                         },
-                        10.,
+                        if birdman { 10. } else { 12. },
                     )
+                } else {
+                    (Motion::Wander, if birdman { 5. } else { 4. })
                 }
             }
             0x921 | 0x922 => {
@@ -649,7 +655,16 @@ impl World {
             0x675 => (Motion::Wander, 4.),
             0x91f if e.stage == Some(0) => (Motion::Wander, 1.),
             _ => (Motion::Wander, 4.),
-        }
+        };
+        // NR-Core adds a base motor rate; a linear speed conversion loses it on slow quest bosses.
+        (
+            motion,
+            if rate_tenths == 0. {
+                0.
+            } else {
+                (5.55 * rate_tenths / 10. + 0.74) * 1.5
+            },
+        )
     }
     pub(super) fn quest_shots(&self, id: i32, target: Pos, t: u64) -> Result<Vec<(u8, f32)>> {
         let e = &self.entities[&id];

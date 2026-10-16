@@ -3479,8 +3479,18 @@ impl World {
                     if e.goal.is_none() {
                         e.phase = (pos.y - target.y).atan2(pos.x - target.x);
                     }
+                    let angular_speed = if e.quest.is_some() {
+                        speed / 1.5
+                            * if flags & crate::condition::bit(crate::condition::SLOWED) != 0 {
+                                0.5
+                            } else {
+                                1.
+                            }
+                    } else {
+                        speed
+                    };
                     if flags & crate::condition::bit(crate::condition::PARALYZED) == 0 {
-                        e.phase = (e.phase + speed / radius * 0.05) % std::f32::consts::TAU;
+                        e.phase = (e.phase + angular_speed / radius * 0.05) % std::f32::consts::TAU;
                     }
                     Some(Pos {
                         x: target.x + e.phase.cos() * radius,

@@ -274,3 +274,44 @@ fn realm_ogres_keep_distance_and_warriors_alternate_targets() {
         }
     ));
 }
+
+#[test]
+fn realm_quest_motor_and_orbit_clock_use_nr_core_units_including_slowing() {
+    let mut w = realm();
+    let pos = w.entities[&enemy(&w, 0x905)].home;
+    let mut sprite = None;
+    for (kind, rate) in [
+        (0x91f, 0.1),
+        (0x920, 0.2),
+        (0x92d, 0.5),
+        (0x923, 1.5),
+        (0x91d, 0.55),
+    ] {
+        let id = w.spawn_entity(kind, pos, vec![]).unwrap();
+        let e = w.entities.get_mut(&id).unwrap();
+        e.quest = Some(id);
+        e.stage = Some(0);
+        let actual = w.quest_movement(id, pos, 0).1 / 1.5;
+        assert!((actual - (5.55 * rate + 0.74)).abs() < 0.00001);
+        if kind == 0x923 {
+            sprite = Some(id);
+        }
+    }
+    let id = sprite.unwrap();
+    participant(
+        &mut w,
+        Pos {
+            x: pos.x + 3.,
+            y: pos.y,
+        },
+    );
+    w.now = 50;
+    w.npc_step();
+    let phase = w.entities[&id].phase;
+    w.apply_condition(id, crate::condition::SLOWED, 1000)
+        .unwrap();
+    w.now += 50;
+    w.npc_step();
+    let advance = (w.entities[&id].phase - phase).rem_euclid(std::f32::consts::TAU);
+    assert!((advance - (5.55 * 1.5 + 0.74) / 4. * 0.05 * 0.5).abs() < 0.00001);
+}
