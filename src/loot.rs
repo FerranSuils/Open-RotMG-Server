@@ -17,6 +17,42 @@ fn table(kind: u16) -> &'static [(f64, Pick)] {
         0x601 => &[(0.2, Tier(1, ARMOR)), (0.03, Item(0xa22))],
         0x602 | 0x604 => &[(0.03, Item(0xa22)), (0.02, Item(0xa23))],
         0x603 | 0x954 => &[],
+        0x629 | 0x62b => &[(0.03, Item(0xa22))],
+        0x62a | 0x647 | 0x648 => &[(0.03, Item(0xa23))],
+        0x62c => &[
+            (0.2, Tier(3, WEAPONS)),
+            (0.1, Tier(4, WEAPONS)),
+            (0.05, Tier(5, WEAPONS)),
+            (0.2, Tier(3, ARMOR)),
+            (0.1, Tier(4, ARMOR)),
+            (0.05, Tier(5, ARMOR)),
+            (0.05, Tier(2, ABILITIES)),
+            (0.03, Item(0xa22)),
+            (0.01, Tier(2, RINGS)),
+        ],
+        0x6c6 => &[
+            (0.1, Tier(4, WEAPONS)),
+            (0.05, Tier(3, WEAPONS)),
+            (0.1, Tier(4, ARMOR)),
+            (0.05, Tier(3, ARMOR)),
+            (0.03, Item(0xa22)),
+            (0.02, Item(0xa23)),
+        ],
+        0x900 => &[
+            (0.04, Item(0xa22)),
+            (0.01, Item(0xa23)),
+            (0.01, Tier(3, ARMOR)),
+        ],
+        0x901 => &[
+            (0.04, Item(0xa22)),
+            (0.01, Item(0xa23)),
+            (0.01, Tier(4, ABILITIES)),
+        ],
+        0x902 => &[
+            (0.04, Item(0xa22)),
+            (0.01, Item(0xa23)),
+            (0.01, Tier(2, RINGS)),
+        ],
         0x612 | 0x613 | 0x618 => &[(0.03, Item(0xa22))],
         0x619 => &[(0.03, Item(0xa23))],
         0x953 => &[
@@ -102,7 +138,7 @@ fn table(kind: u16) -> &'static [(f64, Pick)] {
             (0.05, Tier(1, RINGS)),
             (0.05, Tier(1, ABILITIES)),
         ],
-        0x640 | 0x645 | 0x646 | 0x64f | 0x650 | 0x905 => &[
+        0x640 | 0x645 | 0x646 | 0x649 | 0x64f | 0x650 | 0x905 => &[
             (0.16, Tier(5, WEAPONS)),
             (0.08, Tier(6, WEAPONS)),
             (0.16, Tier(4, ARMOR)),
@@ -263,7 +299,7 @@ pub fn rewards(content: &Content, kind: u16, rng: &mut impl Rng) -> Vec<u16> {
     items
 }
 pub fn private(kind: u16) -> bool {
-    matches!(kind, 0x91a | 0x6d8 | 0x905..=0x907 | 0x683..=0x686 | 0x927 | 0x640 | 0x645 | 0x646 | 0x64f | 0x650..=0x659
+    matches!(kind, 0x649 | 0x91a | 0x6d8 | 0x905..=0x907 | 0x683..=0x686 | 0x927 | 0x640 | 0x645 | 0x646 | 0x64f | 0x650..=0x659
         | 0xd05 | 0x917 | 0xd06 | 0xd90 | 0xd95 | 0xd98..=0xd9a
         | 0x668 | 0x67d | 0xd78 | 0xd79 | 0xd7f | crate::endgame::ORYX | crate::endgame::ORYX2)
 }

@@ -27,6 +27,9 @@ mod families;
 mod gods;
 #[cfg(test)]
 mod gods_tests;
+mod midlands;
+#[cfg(test)]
+mod midlands_tests;
 #[cfg(test)]
 mod player_position_tests;
 mod population;
@@ -210,6 +213,19 @@ impl Player {
             velocity,
             at,
         };
+    }
+    fn quarantine(&mut self, id: i32, error: String) {
+        tracing::error!(player=id,account=self.character.account,%error,"character quarantined; avatar and reservations retained");
+        self.persistence_failure = Some(error);
+        self.pending = true;
+        self.bot_goal = None;
+        self.bot_aim = None;
+        if let Some(output) = &self.tx {
+            let _ = output.lost.send(true);
+        }
+    }
+    fn progress_queued(&self) -> bool {
+        self.experience_queued != 0 || self.clears_queued != [0; 4]
     }
     fn active(&self) -> bool {
         self.character.alive
@@ -396,10 +412,29 @@ pub struct Directory {
     next_world: i32,
     pub tick: u64,
     pub max_tick_us: u64,
+    diagnostic_ticks: std::collections::VecDeque<(Instant, u64, u64)>,
     max_players: usize,
     prepared_seed: Option<u64>,
 }
 impl Directory {
+    pub fn bug_context(&self, player: i32) -> Result<serde_json::Value> {
+        let (world_id, world, p) = self
+            .worlds
+            .iter()
+            .find_map(|(id, w)| w.players.get(&player).map(|p| (*id, w, p)))
+            .context("bug player missing")?;
+        let ticks = self.diagnostic_ticks.iter().filter(|(t, _, _)| t.elapsed().as_secs() <= 120).map(|(time, duration, late)| serde_json::json!({"age_ms": time.elapsed().as_millis(), "execution_us": duration, "scheduling_lateness_us": late})).collect::<Vec<_>>();
+        Ok(
+            serde_json::json!({"world_id": world_id, "world_name": world.name, "player_id": player,
+            "character_id": p.character.id, "class": p.character.class, "level": p.character.level,
+            "position": {"x": p.pos.x, "y": p.pos.y}, "visible_entities": p.known.len(),
+            "world_players": world.players.len(), "world_entities": world.entities.len(), "world_projectiles": world.bullets.len(),
+            "tick_interval_ms": 50, "recent_ticks": ticks, "tick": self.tick,
+            "total_worlds": self.worlds.len(), "total_players": self.worlds.values().map(|w| w.players.len()).sum::<usize>(),
+            "total_entities": self.worlds.values().map(|w| w.entities.len()).sum::<usize>(),
+            "total_projectiles": self.worlds.values().map(|w| w.bullets.len()).sum::<usize>()}),
+        )
+    }
     pub fn competitive_characters(&self) -> Vec<Character> {
         self.worlds
             .values()
@@ -495,6 +530,7 @@ impl Directory {
             next_world: 1,
             tick: 0,
             max_tick_us: 0,
+            diagnostic_ticks: std::collections::VecDeque::new(),
             max_players,
             prepared_seed,
         };
@@ -926,11 +962,14 @@ impl Handle {
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
-                    _ = timer.tick() => {
+                    scheduled = timer.tick() => {
                         if directory.clock.paused() { continue; }
+                        let late=scheduled.elapsed().as_micros() as u64;
                         let start=Instant::now(); directory.step();
                         let us=start.elapsed().as_micros() as u64;
                         directory.max_tick_us=directory.max_tick_us.max(us);
+                        directory.diagnostic_ticks.push_back((start, us, late));
+                        while directory.diagnostic_ticks.front().is_some_and(|(t, _, _)| t.elapsed().as_secs() > 120) { directory.diagnostic_ticks.pop_front(); }
                         if us>25_000 {tracing::warn!(tick=directory.tick,elapsed_us=us,"slow aggregate simulation tick");}
                         if directory.tick.is_multiple_of(100) {
                             tracing::info!(tick=directory.tick,worlds=directory.worlds.len(),
@@ -979,16 +1018,10 @@ impl Handle {
     }
     pub async fn collect<T: Send + 'static>(
         &self,
-        mut f: impl FnMut(&mut World) -> Result<Vec<T>> + Send + 'static,
+        mut f: impl FnMut(&mut World) -> Vec<T> + Send + 'static,
     ) -> Result<Vec<T>> {
-        self.directory(move |d| {
-            let mut values = vec![];
-            for world in d.worlds.values_mut() {
-                values.extend(f(world)?);
-            }
-            Ok(values)
-        })
-        .await
+        self.directory(move |d| Ok(d.worlds.values_mut().flat_map(&mut f).collect()))
+            .await
     }
     pub async fn call<T: Send + 'static>(
         &self,
@@ -1148,8 +1181,7 @@ impl World {
         }
         Ok(self.players.values().all(|p| {
             !p.pending
-                && p.experience_queued == 0
-                && p.clears_queued.iter().all(|count| *count == 0)
+                && !p.progress_queued()
                 && !p.progress_started
                 && !p.death_pending
                 && !p.departing
@@ -2517,19 +2549,10 @@ impl World {
         }
     }
     pub fn poison(&mut self, id: i32, error: String) -> Result<()> {
-        let p = self
-            .players
+        self.players
             .get_mut(&id)
-            .context("quarantine owner missing")?;
-        tracing::error!(player=id,account=p.character.account,%error,"uncertain persistence; avatar and reservations quarantined");
-        p.persistence_failure = Some(error);
-        p.pending = true;
-        p.bot_goal = None;
-        p.bot_aim = None;
-        if let Some(output) = &p.tx {
-            let _ = output.lost.send(true);
-        }
-        Ok(())
+            .context("quarantine owner missing")
+            .map(|p| p.quarantine(id, error))
     }
     pub fn finish_inventory(&mut self, plan: InventoryPlan, result: Result<i32>) -> Result<()> {
         ensure!(
@@ -2709,25 +2732,28 @@ impl World {
         );
         Ok(())
     }
-    pub fn pending_progress(&mut self) -> Result<Vec<(i32, Character)>> {
+    pub fn pending_progress(&mut self) -> Vec<(i32, Character)> {
         let mut plans = Vec::new();
         for (id, p) in &mut self.players {
-            if (p.experience_queued == 0 && p.clears_queued == [0; 4])
-                || p.pending
-                || p.death_started
-            {
+            if !p.progress_queued() || p.pending || p.death_started {
                 continue;
             }
             let mut snapshot = p.character.clone();
-            snapshot.gain_experience(&self.content, p.experience_queued, &mut self.rng)?;
-            snapshot.pirate_caves = snapshot
-                .pirate_caves
-                .checked_add(p.clears_queued[0])
-                .context("dungeon clear counter overflow")?;
-            for (count, queued) in snapshot.dungeons.iter_mut().zip(&p.clears_queued[1..]) {
-                *count = count
-                    .checked_add(*queued)
-                    .context("dungeon clear counter overflow")?;
+            let result = (|| -> Result<()> {
+                snapshot.gain_experience(&self.content, p.experience_queued, &mut self.rng)?;
+                for (count, queued) in std::iter::once(&mut snapshot.pirate_caves)
+                    .chain(snapshot.dungeons.iter_mut())
+                    .zip(p.clears_queued)
+                {
+                    *count = count
+                        .checked_add(queued)
+                        .context("dungeon clear counter overflow")?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                p.quarantine(*id, format!("progress preparation failed: {error:#}"));
+                continue;
             }
             snapshot.alive = true;
             p.experience_queued = 0;
@@ -2736,7 +2762,7 @@ impl World {
             p.progress_started = true;
             plans.push((*id, snapshot));
         }
-        Ok(plans)
+        plans
     }
     pub fn finish_progress(&mut self, id: i32, snapshot: Character) -> Result<()> {
         let p = self
@@ -2794,23 +2820,18 @@ impl World {
             .filter(|(_, p)| p.death_pending)
             .map(|(id, _)| *id)
             .collect();
-        for id in dying {
-            self.cancel_trade(id, "Trade cancelled by permanent death.");
-        }
-        self.players
-            .iter_mut()
-            .filter(|(_, p)| {
-                p.death_pending
-                    && !p.pending
-                    && p.experience_queued == 0
-                    && p.clears_queued == [0; 4]
-                    && !p.death_started
-            })
-            .map(|(id, p)| {
+        dying
+            .into_iter()
+            .filter_map(|id| {
+                self.cancel_trade(id, "Trade cancelled by permanent death.");
+                let p = self.players.get_mut(&id).unwrap();
+                if p.pending || p.progress_queued() || p.death_started {
+                    return None;
+                }
                 p.death_started = true;
                 let mut c = p.character.clone();
                 c.alive = false;
-                (*id, c, p.killer.clone())
+                Some((id, c, p.killer.clone()))
             })
             .collect()
     }
@@ -2844,7 +2865,7 @@ impl World {
         p.tx = None;
         p.bot_goal = None;
         p.bot_aim = None;
-        if p.pending || p.death_pending || p.experience_queued > 0 || p.clears_queued != [0; 4] {
+        if p.pending || p.death_pending || p.progress_queued() {
             return Ok(None);
         };
         p.pending = true;
@@ -2989,6 +3010,29 @@ impl World {
         {
             tracing::error!(enemy=e.kind,%error,"earned encounter loot creation failed");
         }
+        Ok(())
+    }
+    pub(super) fn finish_timed_defeat(&mut self, id: i32) -> Result<()> {
+        let e = &self.entities[&id];
+        let kind = e.kind;
+        let owner = self
+            .players
+            .iter()
+            .filter(|(_, p)| p.character.alive && !p.death_pending && !p.departing)
+            .filter_map(|(id, p)| {
+                e.damage
+                    .get(&p.character.id)
+                    .filter(|n| **n > 0)
+                    .map(|n| (*id, *n))
+            })
+            .max_by_key(|(_, n)| *n)
+            .map(|(id, _)| id);
+        // Self-destruction has no final player bullet, so the largest eligible contributor owns its kill statistic.
+        if let Some(owner) = owner {
+            self.players.get_mut(&owner).unwrap().character.kills += 1;
+        }
+        self.defeat_entity(id)?;
+        tracing::info!(entity = id, kind, ?owner, "timed enemy defeat");
         Ok(())
     }
     fn drop_loot(&mut self, defeated: &Entity) -> Result<()> {
@@ -3153,9 +3197,11 @@ impl World {
             let pos = entity.pos;
             let profile = profile(kind).expect("validated encounter profile");
             // Self-destruction is a deadline, not target acquisition or a weapon cooldown.
-            let burst = kind == 0x91a
-                && entity.expires == Some(self.now + 50)
-                && self.now >= entity.next_shot;
+            let shield_burst = self.shield_burst(id);
+            let burst = shield_burst
+                || (kind == 0x91a
+                    && entity.expires == Some(self.now + 50)
+                    && self.now >= entity.next_shot);
             if !burst
                 && entity.conditions(self.now) & crate::condition::bit(crate::condition::STASIS)
                     != 0
@@ -3222,36 +3268,45 @@ impl World {
                 continue;
             }
             let flags = self.entities[&id].conditions(self.now);
-            let (motion, mut speed) = if gods::GODS.contains(&kind)
-                || gods::CONSTRUCTS.contains(&kind)
-                || (kind == 0x653 && self.entities[&id].camp.is_some())
-            {
-                match self.god_movement(id, target, elapsed) {
-                    Ok(movement) => movement,
-                    Err(error) => {
-                        tracing::error!(entity=id,%error,"Godlands movement refused");
-                        continue;
+            let (motion, mut speed) =
+                if kind == 0x6c6 || (self.entities[&id].camp.is_some() && midlands::member(kind)) {
+                    match self.midland_movement(id, target, elapsed) {
+                        Ok(movement) => movement,
+                        Err(error) => {
+                            tracing::error!(entity=id,%error,"inland family movement refused");
+                            continue;
+                        }
                     }
-                }
-            } else if self.entities[&id].camp.is_some() {
-                match self.family_movement(id, target, elapsed) {
-                    Ok(movement) => movement,
-                    Err(error) => {
-                        tracing::error!(entity=id,%error,"family movement refused");
-                        continue;
+                } else if gods::GODS.contains(&kind)
+                    || gods::CONSTRUCTS.contains(&kind)
+                    || (kind == 0x653 && self.entities[&id].camp.is_some())
+                {
+                    match self.god_movement(id, target, elapsed) {
+                        Ok(movement) => movement,
+                        Err(error) => {
+                            tracing::error!(entity=id,%error,"Godlands movement refused");
+                            continue;
+                        }
                     }
-                }
-            } else if crate::endgame::ROSTER.contains(&kind) {
-                match self.finale_movement(id, elapsed) {
-                    Ok(movement) => movement,
-                    Err(error) => {
-                        tracing::error!(entity=id,%error,"endgame movement refused");
-                        continue;
+                } else if self.entities[&id].camp.is_some() {
+                    match self.family_movement(id, target, elapsed) {
+                        Ok(movement) => movement,
+                        Err(error) => {
+                            tracing::error!(entity=id,%error,"family movement refused");
+                            continue;
+                        }
                     }
-                }
-            } else {
-                crate::encounter::movement(kind, self.entities[&id].hp, elapsed)
-            };
+                } else if crate::endgame::ROSTER.contains(&kind) {
+                    match self.finale_movement(id, elapsed) {
+                        Ok(movement) => movement,
+                        Err(error) => {
+                            tracing::error!(entity=id,%error,"endgame movement refused");
+                            continue;
+                        }
+                    }
+                } else {
+                    crate::encounter::movement(kind, self.entities[&id].hp, elapsed)
+                };
             let goal = match motion {
                 Motion::Stationary => {
                     speed = 0.;
@@ -3390,7 +3445,18 @@ impl World {
                         continue;
                     }
                 }
-            } else if gods::GODS.contains(&kind) || gods::CONSTRUCTS.contains(&kind) {
+            } else if matches!(kind, 0x900..=0x902) {
+                match self.shield_shots(id, heading) {
+                    Ok(shots) => shots,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"Shield Orc commands refused");
+                        continue;
+                    }
+                }
+            } else if gods::GODS.contains(&kind)
+                || gods::CONSTRUCTS.contains(&kind)
+                || midlands::AIMED.contains(&kind)
+            {
                 match self.god_shots(id, target, heading, elapsed) {
                     Ok(shots) => shots,
                     Err(error) => {
@@ -3420,6 +3486,10 @@ impl World {
                 _ => profile.interval,
             };
             self.entities.get_mut(&id).unwrap().next_shot = self.now + interval;
+            if shield_burst {
+                self.entities.get_mut(&id).unwrap().stage = Some(3);
+                tracing::debug!(entity = id, kind, "Shield Orc final command selected");
+            }
             if self.bullets.len() + shots.len() > 2048 {
                 tracing::warn!(
                     entity = id,
@@ -4061,11 +4131,11 @@ mod tests {
         let mut w = world();
         let id = w.enter(ch(&w), None).unwrap();
         w.players.get_mut(&id).unwrap().experience_queued = 50;
-        let plans = w.pending_progress().unwrap();
+        let plans = w.pending_progress();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].1.level, 2);
         assert_eq!(w.players[&id].character.level, 1);
-        assert!(w.pending_progress().unwrap().is_empty());
+        assert!(w.pending_progress().is_empty());
         let p = w.players.get_mut(&id).unwrap();
         p.character.hp = 0;
         p.death_pending = true;
@@ -4083,7 +4153,7 @@ mod tests {
         let mut w = world();
         let id = w.enter(ch(&w), None).unwrap();
         w.players.get_mut(&id).unwrap().experience_queued = 1000;
-        let plans = w.pending_progress().unwrap();
+        let plans = w.pending_progress();
         assert_eq!(plans[0].1.fame, 1);
         assert_eq!(w.players[&id].character.fame, 0);
         w.finish_progress(id, plans[0].1.clone()).unwrap();
@@ -4102,7 +4172,7 @@ mod tests {
         let id = w.enter(ch(&w), None).unwrap();
         w.players.get_mut(&id).unwrap().experience_queued = 50;
         assert!(w.begin_departure(id).unwrap().is_none());
-        let plans = w.pending_progress().unwrap();
+        let plans = w.pending_progress();
         w.finish_progress(id, plans[0].1.clone()).unwrap();
         let leaving = w.begin_departure(id).unwrap().unwrap();
         assert_eq!(leaving.exp, 50);
@@ -5156,10 +5226,10 @@ mod tests {
         assert!(w.entities.values().any(|e| e.kind == 0x71d && !e.published));
         assert!(!w.entities.values().any(|e| e.kind == 0x71d && e.published));
         assert!(w.drop_loot(&defeated).is_err());
-        let plans = w.pending_progress().unwrap();
+        let plans = w.pending_progress();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].1.pirate_caves, 1);
-        assert!(w.pending_progress().unwrap().is_empty());
+        assert!(w.pending_progress().is_empty());
         assert!(w.begin_departure(player).unwrap().is_none());
         w.finish_progress(player, plans[0].1.clone()).unwrap();
         assert_eq!(w.players[&player].character.pirate_caves, 1);
@@ -5532,7 +5602,7 @@ mod tests {
         let player = w.enter(character, None).unwrap();
         w.players.get_mut(&player).unwrap().experience_queued = 20;
         assert!(!w.settled().unwrap());
-        let (id, progress) = w.pending_progress().unwrap().pop().unwrap();
+        let (id, progress) = w.pending_progress().pop().unwrap();
         assert!(!w.settled().unwrap());
         w.finish_progress(id, progress).unwrap();
         assert!(w.settled().unwrap());

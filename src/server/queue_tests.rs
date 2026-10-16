@@ -274,7 +274,7 @@ async fn connection_fifo_and_departure(termination: Termination) {
             Ok::<_, mpsc::error::SendError<Message>>(tx)
         }
     }));
-    let connection = tokio::spawn(connection_io(sink, stream, a.clone()));
+    let connection = tokio::spawn(connection_io(sink, stream, a.clone(), None, None));
     let mut codec = Codec::client();
     send_commands(
         &input,

@@ -165,13 +165,11 @@ impl World {
 
     pub(super) fn damage_player(&mut self, id: i32, b: &Bullet, echo: bool) -> Result<()> {
         let p = self.players.get(&id).context("projectile target missing")?;
-        let damage = crate::condition::damage(
-            b.damage,
-            self.defense(id)?,
-            p.conditions(self.now),
-            b.spec.armor_piercing,
-        );
-        if damage > 0 {
+        let flags = p.conditions(self.now);
+        let affects = !crate::condition::protected(flags);
+        let damage =
+            crate::condition::damage(b.damage, self.defense(id)?, flags, b.spec.armor_piercing);
+        if affects {
             for (index, duration) in &b.spec.effects {
                 self.apply_condition(id, *index, *duration)?;
             }
@@ -186,12 +184,12 @@ impl World {
         }
         if echo {
             let mut out = Writer::new();
-            out.i32(id).u8(if damage > 0 {
+            out.i32(id).u8(if affects {
                 b.spec.effects.len() as u8
             } else {
                 0
             });
-            if damage > 0 {
+            if affects {
                 for (index, _) in &b.spec.effects {
                     out.u8(*index);
                 }
