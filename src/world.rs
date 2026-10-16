@@ -206,6 +206,19 @@ impl Player {
             at,
         };
     }
+    fn quarantine(&mut self, id: i32, error: String) {
+        tracing::error!(player=id,account=self.character.account,%error,"character quarantined; avatar and reservations retained");
+        self.persistence_failure = Some(error);
+        self.pending = true;
+        self.bot_goal = None;
+        self.bot_aim = None;
+        if let Some(output) = &self.tx {
+            let _ = output.lost.send(true);
+        }
+    }
+    fn progress_queued(&self) -> bool {
+        self.experience_queued != 0 || self.clears_queued != [0; 4]
+    }
     fn active(&self) -> bool {
         self.character.alive
             && !self.death_pending
@@ -974,16 +987,10 @@ impl Handle {
     }
     pub async fn collect<T: Send + 'static>(
         &self,
-        mut f: impl FnMut(&mut World) -> Result<Vec<T>> + Send + 'static,
+        mut f: impl FnMut(&mut World) -> Vec<T> + Send + 'static,
     ) -> Result<Vec<T>> {
-        self.directory(move |d| {
-            let mut values = vec![];
-            for world in d.worlds.values_mut() {
-                values.extend(f(world)?);
-            }
-            Ok(values)
-        })
-        .await
+        self.directory(move |d| Ok(d.worlds.values_mut().flat_map(&mut f).collect()))
+            .await
     }
     pub async fn call<T: Send + 'static>(
         &self,
@@ -1143,8 +1150,7 @@ impl World {
         }
         Ok(self.players.values().all(|p| {
             !p.pending
-                && p.experience_queued == 0
-                && p.clears_queued.iter().all(|count| *count == 0)
+                && !p.progress_queued()
                 && !p.progress_started
                 && !p.death_pending
                 && !p.departing
@@ -2440,19 +2446,10 @@ impl World {
         }
     }
     pub fn poison(&mut self, id: i32, error: String) -> Result<()> {
-        let p = self
-            .players
+        self.players
             .get_mut(&id)
-            .context("quarantine owner missing")?;
-        tracing::error!(player=id,account=p.character.account,%error,"uncertain persistence; avatar and reservations quarantined");
-        p.persistence_failure = Some(error);
-        p.pending = true;
-        p.bot_goal = None;
-        p.bot_aim = None;
-        if let Some(output) = &p.tx {
-            let _ = output.lost.send(true);
-        }
-        Ok(())
+            .context("quarantine owner missing")
+            .map(|p| p.quarantine(id, error))
     }
     pub fn finish_inventory(&mut self, plan: InventoryPlan, result: Result<i32>) -> Result<()> {
         ensure!(
@@ -2629,25 +2626,28 @@ impl World {
         );
         Ok(())
     }
-    pub fn pending_progress(&mut self) -> Result<Vec<(i32, Character)>> {
+    pub fn pending_progress(&mut self) -> Vec<(i32, Character)> {
         let mut plans = Vec::new();
         for (id, p) in &mut self.players {
-            if (p.experience_queued == 0 && p.clears_queued == [0; 4])
-                || p.pending
-                || p.death_started
-            {
+            if !p.progress_queued() || p.pending || p.death_started {
                 continue;
             }
             let mut snapshot = p.character.clone();
-            snapshot.gain_experience(&self.content, p.experience_queued, &mut self.rng)?;
-            snapshot.pirate_caves = snapshot
-                .pirate_caves
-                .checked_add(p.clears_queued[0])
-                .context("dungeon clear counter overflow")?;
-            for (count, queued) in snapshot.dungeons.iter_mut().zip(&p.clears_queued[1..]) {
-                *count = count
-                    .checked_add(*queued)
-                    .context("dungeon clear counter overflow")?;
+            let result = (|| -> Result<()> {
+                snapshot.gain_experience(&self.content, p.experience_queued, &mut self.rng)?;
+                for (count, queued) in std::iter::once(&mut snapshot.pirate_caves)
+                    .chain(snapshot.dungeons.iter_mut())
+                    .zip(p.clears_queued)
+                {
+                    *count = count
+                        .checked_add(queued)
+                        .context("dungeon clear counter overflow")?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                p.quarantine(*id, format!("progress preparation failed: {error:#}"));
+                continue;
             }
             snapshot.alive = true;
             p.experience_queued = 0;
@@ -2656,7 +2656,7 @@ impl World {
             p.progress_started = true;
             plans.push((*id, snapshot));
         }
-        Ok(plans)
+        plans
     }
     pub fn finish_progress(&mut self, id: i32, snapshot: Character) -> Result<()> {
         let p = self
@@ -2714,23 +2714,18 @@ impl World {
             .filter(|(_, p)| p.death_pending)
             .map(|(id, _)| *id)
             .collect();
-        for id in dying {
-            self.cancel_trade(id, "Trade cancelled by permanent death.");
-        }
-        self.players
-            .iter_mut()
-            .filter(|(_, p)| {
-                p.death_pending
-                    && !p.pending
-                    && p.experience_queued == 0
-                    && p.clears_queued == [0; 4]
-                    && !p.death_started
-            })
-            .map(|(id, p)| {
+        dying
+            .into_iter()
+            .filter_map(|id| {
+                self.cancel_trade(id, "Trade cancelled by permanent death.");
+                let p = self.players.get_mut(&id).unwrap();
+                if p.pending || p.progress_queued() || p.death_started {
+                    return None;
+                }
                 p.death_started = true;
                 let mut c = p.character.clone();
                 c.alive = false;
-                (*id, c, p.killer.clone())
+                Some((id, c, p.killer.clone()))
             })
             .collect()
     }
@@ -2764,7 +2759,7 @@ impl World {
         p.tx = None;
         p.bot_goal = None;
         p.bot_aim = None;
-        if p.pending || p.death_pending || p.experience_queued > 0 || p.clears_queued != [0; 4] {
+        if p.pending || p.death_pending || p.progress_queued() {
             return Ok(None);
         };
         p.pending = true;
@@ -3982,11 +3977,11 @@ mod tests {
         let mut w = world();
         let id = w.enter(ch(&w), None).unwrap();
         w.players.get_mut(&id).unwrap().experience_queued = 50;
-        let plans = w.pending_progress().unwrap();
+        let plans = w.pending_progress();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].1.level, 2);
         assert_eq!(w.players[&id].character.level, 1);
-        assert!(w.pending_progress().unwrap().is_empty());
+        assert!(w.pending_progress().is_empty());
         let p = w.players.get_mut(&id).unwrap();
         p.character.hp = 0;
         p.death_pending = true;
@@ -4004,7 +3999,7 @@ mod tests {
         let mut w = world();
         let id = w.enter(ch(&w), None).unwrap();
         w.players.get_mut(&id).unwrap().experience_queued = 1000;
-        let plans = w.pending_progress().unwrap();
+        let plans = w.pending_progress();
         assert_eq!(plans[0].1.fame, 1);
         assert_eq!(w.players[&id].character.fame, 0);
         w.finish_progress(id, plans[0].1.clone()).unwrap();
@@ -4023,7 +4018,7 @@ mod tests {
         let id = w.enter(ch(&w), None).unwrap();
         w.players.get_mut(&id).unwrap().experience_queued = 50;
         assert!(w.begin_departure(id).unwrap().is_none());
-        let plans = w.pending_progress().unwrap();
+        let plans = w.pending_progress();
         w.finish_progress(id, plans[0].1.clone()).unwrap();
         let leaving = w.begin_departure(id).unwrap().unwrap();
         assert_eq!(leaving.exp, 50);
@@ -5055,10 +5050,10 @@ mod tests {
         assert!(w.entities.values().any(|e| e.kind == 0x71d && !e.published));
         assert!(!w.entities.values().any(|e| e.kind == 0x71d && e.published));
         assert!(w.drop_loot(&defeated).is_err());
-        let plans = w.pending_progress().unwrap();
+        let plans = w.pending_progress();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].1.pirate_caves, 1);
-        assert!(w.pending_progress().unwrap().is_empty());
+        assert!(w.pending_progress().is_empty());
         assert!(w.begin_departure(player).unwrap().is_none());
         w.finish_progress(player, plans[0].1.clone()).unwrap();
         assert_eq!(w.players[&player].character.pirate_caves, 1);
@@ -5431,7 +5426,7 @@ mod tests {
         let player = w.enter(character, None).unwrap();
         w.players.get_mut(&player).unwrap().experience_queued = 20;
         assert!(!w.settled().unwrap());
-        let (id, progress) = w.pending_progress().unwrap().pop().unwrap();
+        let (id, progress) = w.pending_progress().pop().unwrap();
         assert!(!w.settled().unwrap());
         w.finish_progress(id, progress).unwrap();
         assert!(w.settled().unwrap());
