@@ -25,6 +25,7 @@ fn fixture() -> (World, i32) {
             AccountPresentation {
                 fame: 0,
                 best_fame: BTreeMap::new(),
+                credits: 0,
             },
         )
         .unwrap();
@@ -243,6 +244,7 @@ fn an_idol_activates_on_damage_closes_only_its_bridge_and_restores_lava_without_
             AccountPresentation {
                 fame: 0,
                 best_fame: BTreeMap::new(),
+                credits: 0,
             },
         )
         .unwrap();

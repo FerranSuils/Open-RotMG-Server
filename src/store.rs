@@ -10,13 +10,17 @@ use tokio::sync::oneshot;
 mod account_actions;
 mod accounts;
 #[cfg(test)]
+mod credits_tests;
+#[cfg(test)]
 mod death_date_tests;
 mod hiscores;
 mod legends;
 #[cfg(test)]
 mod presentation_tests;
 mod social;
+mod updates;
 pub use social::AccountLists;
+pub use updates::{UpdateFeed, UpdatePost, UpdateSnapshot};
 
 #[derive(Debug)]
 pub struct InvalidCredentials;
@@ -29,6 +33,7 @@ impl std::error::Error for InvalidCredentials {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountPresentation {
+    pub credits: i32,
     pub fame: i32,
     pub best_fame: BTreeMap<u16, i32>,
 }
@@ -187,6 +192,7 @@ pub struct Account {
     pub id: i32,
     pub name: String,
     pub next_id: i32,
+    pub credits: i32,
     pub fame: i64,
     pub earned_fame: i64,
     pub best_levels: std::collections::BTreeMap<u16, i32>,
@@ -250,8 +256,17 @@ impl Store {
         let mut c = Connection::open(path)?;
         let version: i32 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            matches!(version, 0 | 5 | 6),
+            matches!(version, 0 | 5 | 6 | 7 | 8),
             "unsupported game database schema {version}"
+        );
+        let credits_exist: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('accounts') WHERE name='credits')",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            version < 8 || credits_exist,
+            "schema-8 gold balance missing; restore reviewed state instead of recreating balances"
         );
         let wallet_exists: bool = c.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='account_fame')",
@@ -267,8 +282,15 @@ impl Store {
             [], |r| r.get(0),
         )?;
         ensure!(
-            version != 6 || lists_exist,
+            version < 6 || lists_exist,
             "schema-6 account lists missing; restore reviewed state instead of clearing preferences"
+        );
+        let updates_exist: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=\'table\' AND name=\'update_feed\')", [], |r| r.get(0),
+        )?;
+        ensure!(
+            version < 7 || updates_exist,
+            "schema-7 update feed missing; restore reviewed state instead of clearing published news"
         );
         c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS accounts(id INTEGER PRIMARY KEY,guid TEXT NOT NULL UNIQUE,name TEXT NOT NULL);
@@ -287,8 +309,12 @@ CREATE TABLE IF NOT EXISTS discord_recovery(account INTEGER PRIMARY KEY REFERENC
 CREATE TABLE IF NOT EXISTS recovery_codes(account INTEGER PRIMARY KEY REFERENCES accounts(id),hash TEXT NOT NULL UNIQUE,issued_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS password_resets(account INTEGER PRIMARY KEY REFERENCES accounts(id),hash TEXT NOT NULL UNIQUE,issued_at INTEGER NOT NULL,expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS account_lists(account INTEGER NOT NULL REFERENCES accounts(id),list_id INTEGER NOT NULL CHECK(list_id IN (0,1)),target INTEGER NOT NULL REFERENCES accounts(id),PRIMARY KEY(account,list_id,target),CHECK(account<>target));
+CREATE TABLE IF NOT EXISTS update_feed(id INTEGER PRIMARY KEY CHECK(id=1),snapshot TEXT NOT NULL CHECK(json_valid(snapshot)),synced_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         let migration = c.transaction()?;
+        if !credits_exist {
+            migration.execute_batch("ALTER TABLE accounts ADD COLUMN credits INTEGER NOT NULL DEFAULT 100 CHECK(credits BETWEEN 0 AND 2147483647)")?;
+        }
         let records = {
             let mut q = migration.prepare("SELECT id,stats FROM characters ORDER BY id")?;
             q.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))?
@@ -360,7 +386,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 "account fame wallet missing; restore reviewed state instead of recreating balances"
             );
         }
-        migration.pragma_update(None, "user_version", 6)?;
+        migration.pragma_update(None, "user_version", 8)?;
         migration.commit()?;
         if migrated > 0 {
             tracing::info!(
@@ -429,30 +455,36 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             let name:String=tx.query_row("SELECT name FROM accounts WHERE id=?1",[id],|r|r.get(0))?;
             let mut characters=Vec::new();{let mut q=tx.prepare("SELECT id,stats,items,revision,alive FROM characters WHERE account=?1 AND alive=1 ORDER BY id")?;let rows=q.query_map([id],|r|Ok((r.get::<_,i32>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i32>(3)?,r.get::<_,bool>(4)?)))?;
             for row in rows{let(cid,stats,items,rev,alive)=row?;let mut ch:Character=serde_json::from_str(&stats)?;ch.id=cid;ch.account=id;ch.name=name.clone();ch.items=serde_json::from_str(&items)?;ch.revision=rev;ch.alive=alive;characters.push(ch);}}
-            let next_id:i32=tx.query_row("SELECT coalesce(max(id),0)+1 FROM characters WHERE account=?1",[id],|r|r.get(0))?;let best_levels = { let mut q = tx.prepare("SELECT json_extract(stats,'$.class'),max(json_extract(stats,'$.level')) FROM characters WHERE account=?1 GROUP BY json_extract(stats,'$.class')")?; q.query_map([id], |r| Ok((r.get::<_,u16>(0)?, r.get::<_,i32>(1)?)))?.collect::<rusqlite::Result<std::collections::BTreeMap<_,_>>>()? };let (presentation,earned_fame) = read_presentation(&tx, id, legacy_base, &classes)?;tx.commit()?;Ok(Account{id,name,next_id,fame:i64::from(presentation.fame),earned_fame,best_levels,best_fame:presentation.best_fame,characters})}).await?;
+            let next_id:i32=tx.query_row("SELECT coalesce(max(id),0)+1 FROM characters WHERE account=?1",[id],|r|r.get(0))?;let best_levels = { let mut q = tx.prepare("SELECT json_extract(stats,'$.class'),max(json_extract(stats,'$.level')) FROM characters WHERE account=?1 GROUP BY json_extract(stats,'$.class')")?; q.query_map([id], |r| Ok((r.get::<_,u16>(0)?, r.get::<_,i32>(1)?)))?.collect::<rusqlite::Result<std::collections::BTreeMap<_,_>>>()? };let (presentation,earned_fame) = read_presentation(&tx, id, legacy_base, &classes)?;tx.commit()?;Ok(Account{id,name,next_id,credits:presentation.credits,fame:i64::from(presentation.fame),earned_fame,best_levels,best_fame:presentation.best_fame,characters})}).await?;
         self.vault(account.id).await?;
         Ok(account)
     }
     pub async fn shore_character(
         &self,
+        identity: String,
         name: String,
         content: &Content,
         prefer_priest: bool,
     ) -> Result<Character> {
         let guid = self.call(move |db| {
             let tx = db.transaction()?;
-            let existing: Option<String> = tx.query_row(
-                "SELECT guid FROM accounts JOIN shore_bots ON accounts.id=shore_bots.account WHERE shore_bots.name=?1",
-                [&name], |r| r.get(0)).optional()
+            let existing: Option<(String, i32)> = tx.query_row(
+                "SELECT guid,accounts.id FROM accounts JOIN shore_bots ON accounts.id=shore_bots.account WHERE shore_bots.name=?1",
+                [&identity], |r| Ok((r.get(0)?, r.get(1)?))).optional()
                 .context("read shore bot identity; credential-free restores require operator recovery")?;
             let guid = match existing {
-                Some(guid) => guid,
+                Some((guid, account)) => {
+                    if tx.execute("UPDATE accounts SET name=?1 WHERE id=?2 AND name<>?1", params![name,account])? > 0 {
+                        tracing::info!(account, identity, name, "autonomous account renamed");
+                    }
+                    guid
+                },
                 None => {
                     let guid = format!("shore-{:032x}", rand::random::<u128>());
                     tx.execute("INSERT INTO accounts(guid,name) VALUES(?1,?2)", params![guid,name])?;
                     let account = tx.last_insert_rowid();
                     tx.execute("INSERT INTO account_fame(account,balance,earned) VALUES(?1,0,0)", [account])?;
-                    tx.execute("INSERT INTO shore_bots(name,account) VALUES(?1,?2)", params![name,account])?;
+                    tx.execute("INSERT INTO shore_bots(name,account) VALUES(?1,?2)", params![identity,account])?;
                     guid
                 }
             };
@@ -798,13 +830,14 @@ fn read_presentation(
     legacy_base: [i32; 8],
     classes: &BTreeMap<u16, Class>,
 ) -> Result<(AccountPresentation, i64)> {
-    let (balance, earned): (i64, i64) = db
+    let (balance, earned, credits): (i64, i64, i32) = db
         .query_row(
-            "SELECT balance,earned FROM account_fame WHERE account=?1",
+            "SELECT balance,earned,credits FROM account_fame JOIN accounts ON accounts.id=account_fame.account WHERE account=?1",
             [account],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .context("read account fame wallet")?;
+    ensure!(credits >= 0, "invalid account gold balance");
     let fame = i32::try_from(balance).context("account fame exceeds wire range")?;
     ensure!(
         fame >= 0 && earned >= balance && earned <= i64::from(i32::MAX),
@@ -839,7 +872,14 @@ fn read_presentation(
         let best = best_fame.entry(ch.class).or_default();
         *best = (*best).max(ch.fame);
     }
-    Ok((AccountPresentation { fame, best_fame }, earned))
+    Ok((
+        AccountPresentation {
+            credits,
+            fame,
+            best_fame,
+        },
+        earned,
+    ))
 }
 pub fn name_chosen(account: i32, name: &str) -> bool {
     name != format!("Guest{account}")
@@ -852,7 +892,7 @@ pub fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 impl Account {
-    pub fn xml(&self) -> String {
+    pub fn xml(&self, news: &str) -> String {
         let mut chars = String::new();
         for c in &self.characters {
             chars += &format!(
@@ -889,12 +929,13 @@ impl Account {
             format!("<ClassStats objectType=\"{class}\"><BestLevel>{level}</BestLevel><BestFame>{fame}</BestFame></ClassStats>")
         }).collect();
         format!(
-            "<Chars nextCharId=\"{}\" maxNumChars=\"1\">{chars}<Account><AccountId>{}</AccountId><Name>{}</Name>{chosen}<Stats><Fame>{}</Fame><TotalFame>{}</TotalFame>{records}</Stats><Credits>0</Credits><NextCharSlotPrice>600</NextCharSlotPrice></Account><Servers><Server><Name>Local development</Name><DNS>127.0.0.1</DNS><Lat>0</Lat><Long>0</Long><Usage>0</Usage></Server></Servers><News/></Chars>",
+            "<Chars nextCharId=\"{}\" maxNumChars=\"1\">{chars}<Account><AccountId>{}</AccountId><Name>{}</Name>{chosen}<Stats><Fame>{}</Fame><TotalFame>{}</TotalFame>{records}</Stats><Credits>{}</Credits><NextCharSlotPrice>600</NextCharSlotPrice></Account><Servers><Server><Name>Local development</Name><DNS>127.0.0.1</DNS><Lat>0</Lat><Long>0</Long><Usage>0</Usage></Server></Servers><News>{news}</News></Chars>",
             self.next_id,
             self.id,
             xml_escape(&self.name),
             self.fame,
-            self.earned_fame
+            self.earned_fame,
+            self.credits
         )
     }
 }
@@ -1319,7 +1360,7 @@ mod tests {
         assert!(content.unlocked(0x0310, &account.best_levels).unwrap());
         assert!(!content.unlocked(0x0300, &account.best_levels).unwrap());
         assert!(!content.unlocked(0x031f, &account.best_levels).unwrap());
-        let xml = account.xml();
+        let xml = account.xml("");
         let parsed = roxmltree::Document::parse(&xml).unwrap();
         let record = parsed
             .descendants()
@@ -1509,7 +1550,7 @@ mod tests {
         let content = Content::load(Path::new("data")).unwrap();
         let store = Store::open(Path::new(":memory:"), &content).unwrap();
         let mut wizard = store
-            .shore_character("Bayleaf".into(), &content, true)
+            .shore_character("Bayleaf".into(), "Triceps".into(), &content, true)
             .await
             .unwrap();
         assert_eq!(wizard.class, WIZARD);
@@ -1517,7 +1558,7 @@ mod tests {
         wizard.exp = level_start(5).unwrap();
         store.progress(wizard.clone()).await.unwrap();
         let living = store
-            .shore_character("Bayleaf".into(), &content, true)
+            .shore_character("Bayleaf".into(), "Triceps".into(), &content, true)
             .await
             .unwrap();
         assert_eq!(living.id, wizard.id);
@@ -1530,7 +1571,7 @@ mod tests {
             .await
             .unwrap();
         let replacement = store
-            .shore_character("Bayleaf".into(), &content, true)
+            .shore_character("Bayleaf".into(), "Triceps".into(), &content, true)
             .await
             .unwrap();
         assert_eq!(replacement.account, wizard.account);
@@ -1567,9 +1608,9 @@ mod tests {
         let store = Store::open(&path, &content).unwrap();
         let wizard = content.get(WIZARD).unwrap();
         let human = store.list("shore-human".into()).await.unwrap();
-        store.rename(human.id, "Bayleaf".into()).await.unwrap();
+        store.rename(human.id, "Triceps".into()).await.unwrap();
         let mut bot = store
-            .shore_character("Bayleaf".into(), &content, true)
+            .shore_character("Bayleaf".into(), "Bayleaf".into(), &content, true)
             .await
             .unwrap();
         assert_ne!(bot.account, human.id);
@@ -1581,10 +1622,14 @@ mod tests {
         store.progress(bot.clone()).await.unwrap();
         let reopened = Store::open(&path, &content).unwrap();
         let resumed = reopened
-            .shore_character("Bayleaf".into(), &content, true)
+            .shore_character("Bayleaf".into(), "Triceps".into(), &content, true)
             .await
             .unwrap();
         assert_eq!((resumed.account, resumed.id), identity);
+        assert_eq!(resumed.name, "Triceps");
+        assert_eq!(resumed.items, bot.items);
+        assert_eq!(resumed.revision, bot.revision);
+        assert_eq!(reopened.list_id(human.id).await.unwrap().name, "Triceps");
         assert_eq!(resumed.exp, 12);
         assert_eq!(resumed.hp, 42);
         assert_eq!(resumed.shots, 4);
@@ -1592,7 +1637,7 @@ mod tests {
         bot.alive = false;
         store.death(bot, "test enemy".into()).await.unwrap();
         let replacement = reopened
-            .shore_character("Bayleaf".into(), &content, true)
+            .shore_character("Bayleaf".into(), "Triceps".into(), &content, true)
             .await
             .unwrap();
         assert_eq!(replacement.account, identity.0);
@@ -1602,10 +1647,22 @@ mod tests {
         assert_eq!(replacement.exp, 0);
         assert_eq!(replacement.items, wizard.equipment);
         let resumed = store
-            .shore_character("Bayleaf".into(), &content, true)
+            .shore_character("Bayleaf".into(), "Triceps".into(), &content, true)
             .await
             .unwrap();
         assert_eq!(resumed.id, replacement.id);
+        assert_eq!(resumed.name, "Triceps");
+        assert_eq!(
+            store
+                .call(|db| Ok(db.query_row(
+                    "SELECT count(*) FROM shore_bots WHERE name=\'Bayleaf\'",
+                    [],
+                    |r| r.get::<_, i32>(0)
+                )?))
+                .await
+                .unwrap(),
+            1
+        );
         assert!(store.load(identity.0, identity.1).await.is_err());
         let records: i32 = store
             .call(move |db| {

@@ -49,6 +49,7 @@ fn target_stars_and_next_quest_use_class_maxima_not_wallet_or_current_fame() {
         (i32::MAX, 5, -1),
     ] {
         let p = AccountPresentation {
+            credits: 100,
             fame: i32::MAX,
             best_fame: BTreeMap::from([(WIZARD, fame)]),
         };
@@ -59,6 +60,7 @@ fn target_stars_and_next_quest_use_class_maxima_not_wallet_or_current_fame() {
         assert_eq!(p.next_quest(PRIEST, 0), 20);
     }
     let p = AccountPresentation {
+        credits: 100,
         fame: 0,
         best_fame: BTreeMap::from([(WIZARD, 150), (PRIEST, 20)]),
     };
@@ -66,6 +68,7 @@ fn target_stars_and_next_quest_use_class_maxima_not_wallet_or_current_fame() {
     assert_eq!(p.next_quest(WIZARD, 400), 800);
     assert_eq!(p.next_quest(PRIEST, 149), 150);
     let empty = AccountPresentation {
+        credits: 100,
         fame: 0,
         best_fame: BTreeMap::new(),
     };
@@ -96,7 +99,7 @@ async fn presentation_and_xml_share_committed_class_bests_across_replacement_and
         ch.alive = false;
         s.death(ch, "prepared threshold".into()).await.unwrap();
         let listed = s.list("class-history".into()).await.unwrap();
-        assert_eq!(class_record(&listed.xml(), WIZARD), (5, fame));
+        assert_eq!(class_record(&listed.xml(""), WIZARD), (5, fame));
         let p = s.presentation(account).await.unwrap();
         assert_eq!(p.best_fame, listed.best_fame);
         assert_eq!(p.best_fame[&WIZARD], fame);
@@ -149,13 +152,14 @@ async fn presentation_and_xml_share_committed_class_bests_across_replacement_and
     let listed = reopened.list("class-history".into()).await.unwrap();
     assert_eq!(listed.fame, 27);
     assert_eq!(listed.earned_fame, 3689);
-    assert_eq!(class_record(&listed.xml(), WIZARD), (5, 2000));
-    assert_eq!(class_record(&listed.xml(), PRIEST), (1, 150));
+    assert_eq!(class_record(&listed.xml(""), WIZARD), (5, 2000));
+    assert_eq!(class_record(&listed.xml(""), PRIEST), (1, 150));
     assert!(content.unlocked(PRIEST, &listed.best_levels).unwrap());
     let other = reopened.list("unrelated".into()).await.unwrap();
     assert_eq!(
         reopened.presentation(other.id).await.unwrap(),
         AccountPresentation {
+            credits: 100,
             fame: 0,
             best_fame: BTreeMap::new()
         }
@@ -191,7 +195,7 @@ async fn presentation_decodes_legacy_committed_snapshots_without_birth_metadata(
     assert_eq!(p.stars(), 1);
     assert_eq!(
         class_record(
-            &s.list("legacy-history".into()).await.unwrap().xml(),
+            &s.list("legacy-history".into()).await.unwrap().xml(""),
             WIZARD
         ),
         (1, 40)
