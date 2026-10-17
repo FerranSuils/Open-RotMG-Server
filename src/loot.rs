@@ -13,6 +13,19 @@ pub(crate) const RINGS: &[i32] = &[9];
 fn table(kind: u16) -> &'static [(f64, Pick)] {
     use Pick::{Item, Tier};
     match kind {
+        crate::dungeon::trench::HERMIT => {
+            &[(0.1, Item(0xa34)), (0.1, Item(0xa4c)), (0.004, Item(0xc08))]
+        }
+        0xd62 => &[(0.1, Item(0xa22)), (0.1, Item(0xa23))],
+        0x1705 | crate::dungeon::trench::THESSAL => &[
+            (0.3, Item(0xc12)),
+            (0.01, Item(0xc10)),
+            (0.03, Item(0xc1c)),
+            (0.02, Item(0x722)),
+            (0.04, Item(0xc18)),
+            (0.04, Item(0xc13)),
+        ],
+        0xd63..=0xd65 | 0x1700..=0x1704 | 0x1707..=0x170e => &[],
         // Behavior coverage alone does not establish new drop probabilities.
         kind if crate::encounter::fauna::ROSTER.contains(&kind)
             || crate::encounter::landmarks::ROSTER.contains(&kind) =>
@@ -393,7 +406,7 @@ pub fn roll(content: &Content, kind: u16, rng: &mut impl Rng) -> Option<u16> {
 }
 pub fn rewards(content: &Content, kind: u16, rng: &mut impl Rng) -> Vec<u16> {
     let mut items = if crate::quest::final_root(kind)
-        || kind == 0xd60
+        || matches!(kind, 0xd60 | 0x1705 | crate::dungeon::trench::THESSAL)
         || matches!(
             kind,
             0x917
@@ -425,6 +438,9 @@ pub fn rewards(content: &Content, kind: u16, rng: &mut impl Rng) -> Vec<u16> {
     {
         items.push(item);
     }
+    if kind == 0x1705 && rng.gen_bool(0.04) {
+        items.push(0xaea);
+    }
     if kind == 0xd56 {
         for item in [0x121e, 0x131e, 0x1241, 0x1341, 0x120e, 0x130e] {
             if rng.gen_bool(0.01) {
@@ -441,7 +457,10 @@ pub fn rewards(content: &Content, kind: u16, rng: &mut impl Rng) -> Vec<u16> {
 }
 pub fn private(kind: u16) -> bool {
     crate::quest::final_root(kind)
-        || matches!(kind, 0xd5a | 0xd60)
+        || matches!(
+            kind,
+            0xd5a | 0xd60 | 0x1705 | crate::dungeon::trench::THESSAL
+        )
         || matches!(kind, 0x649 | 0x91a | 0x6d8 | 0x905..=0x907 | 0x683..=0x686 | 0x927 | 0x640 | 0x645 | 0x646 | 0x64f | 0x650..=0x659
         | 0xd05 | 0x917 | 0xd06 | 0xd90 | 0xd95 | 0xd98..=0xd9a
         | crate::dungeon::abyss::MALPHAS | crate::dungeon::abyss::IDOL

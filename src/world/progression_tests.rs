@@ -196,7 +196,9 @@ fn selected_dungeons_credit_character_identity_once_and_publish_exits_after_comm
         assert_eq!(w.players[&b].experience_queued, 1);
         assert!(w.begin_departure(b).is_err());
         assert_eq!(
-            if index == 4 {
+            if index == 5 {
+                plans[0].1.trenches
+            } else if index == 4 {
                 plans[0].1.abysses
             } else {
                 plans[0].1.dungeons[index - 1]
@@ -210,7 +212,9 @@ fn selected_dungeons_credit_character_identity_once_and_publish_exits_after_comm
         w.finish_progress(a, plans[0].1.clone()).unwrap();
         assert!(w.entities[&exit].published);
         assert_eq!(
-            if index == 4 {
+            if index == 5 {
+                w.players[&a].character.trenches
+            } else if index == 4 {
                 w.players[&a].character.abysses
             } else {
                 w.players[&a].character.dungeons[index - 1]

@@ -193,6 +193,9 @@ impl World {
         elapsed: u64,
     ) -> Result<()> {
         let target = target.into();
+        if crate::dungeon::trench::ROSTER.contains(&self.entities[&id].kind) {
+            return self.ocean_mechanics(id, target, elapsed);
+        }
         if crate::encounter::landmarks::ROSTER.contains(&self.entities[&id].kind) {
             return self.landmark_mechanics(id, target, elapsed);
         }
@@ -515,6 +518,9 @@ impl World {
     }
 
     pub(super) fn encounter_death(&mut self, defeated: &Entity) -> Result<()> {
+        if crate::dungeon::trench::ROSTER.contains(&defeated.kind) {
+            return self.ocean_death(defeated);
+        }
         if crate::encounter::fauna::ROSTER.contains(&defeated.kind) {
             return self.fauna_death(defeated);
         }
