@@ -18,6 +18,7 @@ mod credits_tests;
 mod death_date_tests;
 #[cfg(test)]
 mod deletion_tests;
+pub(crate) mod gold;
 mod guilds;
 mod hiscores;
 mod legends;
@@ -277,8 +278,17 @@ impl Store {
         let mut c = Connection::open(path)?;
         let version: i32 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            matches!(version, 0 | 5 | 6 | 7 | 8 | 9),
+            matches!(version, 0 | 5 | 6 | 7 | 8 | 9 | 10),
             "unsupported game database schema {version}"
+        );
+        let rewards_exist: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='gold_rewards')",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            version < 10 || rewards_exist,
+            "schema-10 gold rewards missing; restore reviewed state instead of allowing duplicate grants"
         );
         let credits_exist: bool = c.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('accounts') WHERE name='credits')",
@@ -345,6 +355,9 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         tracing::info!(%journal, synchronous, "account store durability configured");
         let migration = c.transaction()?;
         guilds::migrate(&migration, version)?;
+        if !rewards_exist {
+            migration.execute_batch(gold::SCHEMA)?;
+        }
         if !credits_exist {
             migration.execute_batch("ALTER TABLE accounts ADD COLUMN credits INTEGER NOT NULL DEFAULT 100 CHECK(credits BETWEEN 0 AND 2147483647)")?;
         }
@@ -419,7 +432,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 "account fame wallet missing; restore reviewed state instead of recreating balances"
             );
         }
-        migration.pragma_update(None, "user_version", 9)?;
+        migration.pragma_update(None, "user_version", 10)?;
         migration.commit()?;
         if migrated > 0 {
             tracing::info!(
@@ -769,14 +782,18 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 ensure!(n == 1, "inventory conflict: character {}, account {}, expected revision {}", write.id, write.account, write.revision);
                 revisions.push(write.revision + 1);
             }
-            if let Some(item) = collected {
-                tx.execute("INSERT OR IGNORE INTO collections(account,item,found_at) VALUES(?1,?2,unixepoch())", params![collector,item])?;
-            }
+            let rewarded = if let Some(item) = collected {
+                tx.execute("INSERT OR IGNORE INTO collections(account,item,found_at) VALUES(?1,?2,unixepoch())", params![collector,item])? > 0
+                    && gold::collection(&tx, collector)?
+            } else { false };
             if let Some(vault) = vault {
                 let n = tx.execute("UPDATE vaults SET items=?3,revision=revision+1 WHERE account=?1 AND revision=?2", params![vault.account, vault.revision, serde_json::to_string(&vault.items)?])?;
                 ensure!(n == 1, "vault conflict: account {}, expected revision {}", vault.account, vault.revision);
             }
             tx.commit()?;
+            if rewarded {
+                tracing::info!(account=collector, amount=gold::AMOUNT, reward="collection_top_half", "gold reward committed");
+            }
             Ok(revisions)
         }).await
     }

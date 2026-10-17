@@ -36,6 +36,7 @@ mod ghost_ship;
 mod gods;
 #[cfg(test)]
 mod gods_tests;
+mod gold;
 mod golems;
 mod ground;
 #[cfg(test)]
