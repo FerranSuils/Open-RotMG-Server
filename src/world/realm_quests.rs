@@ -509,12 +509,22 @@ impl World {
         }
         Ok(())
     }
-    pub(super) fn quest_movement(&self, id: i32, elapsed: u64) -> (Motion, f32) {
+    pub(super) fn quest_movement(&self, id: i32, target: Pos, elapsed: u64) -> (Motion, f32) {
         if (0xd56..=0xd60).contains(&self.entities[&id].kind) {
             return self.event_movement(id, elapsed);
         }
         let e = &self.entities[&id];
-        if e.pos.distance(e.home) > 16. {
+        let leash = match e.kind {
+            0x91f | 0x920 => 6.,
+            0x91b | 0x91c | 0x91d | 0x6c1 => 5.,
+            0x923 | 0x924 | 0x91e => 11.,
+            0x929..=0x92c => 7.,
+            0x675 => 2.,
+            0x928 if e.stage.unwrap_or(0) >= 7 => 8.,
+            0x928 => 3.,
+            _ => 16.,
+        };
+        if e.pos.distance(e.home) > leash {
             return (
                 Motion::Protect {
                     anchor: Anchor::Home,
@@ -523,9 +533,13 @@ impl World {
                 12.,
             );
         }
-        match e.kind {
+        let (motion, rate_tenths) = match e.kind {
             0x6c2 => (Motion::Stationary, 0.),
-            0x92d => (Motion::Wiggle, 5.),
+            0x92d => (Motion::Pace { distance: 3. }, 5.),
+            0x928 if e.stage == Some(0) => (Motion::Pace { distance: 3. }, 3.),
+            0x928 if e.stage.unwrap_or(0) >= 7 && elapsed % 4000 >= 2000 => {
+                (Motion::Stationary, 0.)
+            }
             0x928 if e.stage.unwrap_or(0) >= 7 => (
                 Motion::Chase {
                     sight: 10.,
@@ -534,7 +548,9 @@ impl World {
                 6.,
             ),
             0x91c => {
-                if let Some(bearer) = self.quest_members(id, &[0x91d]).first() {
+                if let Some(bearer) = self.quest_members(id, &[0x91d]).first()
+                    && e.pos.distance(self.entities[bearer].pos) > 2.
+                {
                     (
                         Motion::Protect {
                             anchor: Anchor::QuestMember(self.entities[bearer].kind),
@@ -547,58 +563,114 @@ impl World {
                 }
             }
             0x676 | 0x677 | 0x65f..=0x661 => {
+                let protection = if e.kind == 0x677 { 11. } else { 10. };
+                let birdman = matches!(e.kind, 0x676 | 0x677);
                 if let Some(leader) = self.quest_leader(id)
-                    && e.pos.distance(self.entities[&leader].pos) > 12.
+                    && e.pos.distance(self.entities[&leader].pos) > protection
                 {
                     (
                         Motion::Protect {
                             anchor: Anchor::QuestMember(self.entities[&leader].kind),
-                            distance: 10.,
+                            distance: protection,
                         },
-                        10.,
+                        if birdman { 5. } else { 10. },
                     )
-                } else {
+                } else if e.pos.distance(target) < 10.
+                    && e.pos.distance(target) > if e.kind == 0x676 { 9. } else { 7. }
+                {
                     (
                         Motion::Chase {
                             sight: 10.,
-                            stop: 7.,
+                            stop: if e.kind == 0x676 { 9. } else { 7. },
                         },
-                        10.,
+                        if birdman { 10. } else { 12. },
                     )
+                } else {
+                    (Motion::Wander, if birdman { 5. } else { 4. })
                 }
             }
-            0x921 => (
-                Motion::Chase {
-                    sight: 9.,
-                    stop: 1.,
-                },
-                2.5,
-            ),
-            0x923 | 0x924 => (
+            0x921 | 0x922 => {
+                let (distance, speed) = if e.kind == 0x921 {
+                    (7., 2.5)
+                } else {
+                    (4., 5.5)
+                };
+                if let Some(leader) = self.quest_leader(id)
+                    && e.pos.distance(self.entities[&leader].pos) > distance
+                {
+                    (
+                        Motion::Protect {
+                            anchor: Anchor::QuestMember(self.entities[&leader].kind),
+                            distance,
+                        },
+                        speed,
+                    )
+                } else if e.kind == 0x921 {
+                    (
+                        Motion::Chase {
+                            sight: 9.,
+                            stop: 1.,
+                        },
+                        speed,
+                    )
+                } else {
+                    (Motion::Wander, speed)
+                }
+            }
+            0x923 | 0x924 if e.pos.distance(target) < 7. => (
                 Motion::Orbit {
-                    anchor: Anchor::Home,
+                    anchor: Anchor::Player,
                     radius: 4.,
                 },
-                10.,
+                15.,
             ),
-            0x91d if elapsed % 3000 < 1500 => (
-                Motion::Orbit {
-                    anchor: Anchor::Home,
-                    radius: 4.,
-                },
-                6.5,
+            0x923 | 0x924 => (Motion::Stationary, 0.),
+            0x91d if e.hp < 1800 => (
+                Motion::Wander,
+                if elapsed % 5000 < 2500 { 13. } else { 10. },
             ),
-            0x91d => (Motion::Retreat { distance: 2. }, 6.5),
+            0x91d if elapsed % 3000 < 1500 => {
+                let (speed, sight) = if e.hp >= 3900 { (5.5, 5.) } else { (6.5, 10.) };
+                if e.pos.distance(target) < sight {
+                    (
+                        Motion::Orbit {
+                            anchor: Anchor::Player,
+                            radius: 4.,
+                        },
+                        speed,
+                    )
+                } else {
+                    (Motion::Stationary, 0.)
+                }
+            }
+            0x91d if e.pos.distance(target) < 2. => (
+                Motion::Retreat { distance: 2. },
+                if e.hp >= 3900 { 5.5 } else { 6.5 },
+            ),
+            0x91d => (Motion::Wander, if e.hp >= 3900 { 5.5 } else { 6.5 }),
+            0x91e if elapsed % 10000 >= 7000 => (Motion::Stationary, 0.),
+            0x91e => (Motion::Wander, 10.),
             0x929..=0x92c
                 if self.entities[&id].condition & condition::bit(condition::INVULNERABLE) == 0 =>
             {
                 (Motion::Stationary, 0.)
             }
-            0x929..=0x92c => (Motion::Wander, 12.),
+            0x929..=0x92c => (Motion::Wander, 20.),
             0x920 => (Motion::Wander, 2.),
             0x6c1 => (Motion::Wander, 9.),
+            0x675 => (Motion::Wander, 4.),
+            0x91f if e.stage == Some(0) => (Motion::Wander, 1.),
             _ => (Motion::Wander, 4.),
-        }
+        };
+        // NR-Core adds a base motor rate; a linear speed conversion loses it on slow quest bosses.
+        (
+            motion,
+            if rate_tenths == 0. {
+                0.
+            } else {
+                (5.55 * rate_tenths / 10. + 0.74) * 1.5
+            },
+        )
     }
     pub(super) fn quest_shots(&self, id: i32, target: Pos, t: u64) -> Result<Vec<(u8, f32)>> {
         if (0xd56..=0xd60).contains(&self.entities[&id].kind) {

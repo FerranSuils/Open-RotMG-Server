@@ -1,7 +1,7 @@
 use crate::content::Content;
 use anyhow::{Result, ensure};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Anchor {
     Player,
     Parent,
@@ -11,13 +11,15 @@ pub enum Anchor {
     CampMember(u16),
     QuestMember(u16),
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Motion {
     Stationary,
     Wander,
     Chase { sight: f32, stop: f32 },
     Circle,
-    Wiggle,
+    Pace { distance: f32 },
+    Tangential,
+    Maintain { sight: f32, distance: f32 },
     Retreat { distance: f32 },
     Orbit { anchor: Anchor, radius: f32 },
     Protect { anchor: Anchor, distance: f32 },

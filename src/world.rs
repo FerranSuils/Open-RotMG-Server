@@ -41,6 +41,8 @@ mod population_tests;
 mod realm_events;
 #[cfg(test)]
 mod realm_events_tests;
+#[cfg(test)]
+mod realm_movement_tests;
 mod realm_portal;
 mod realm_quests;
 #[cfg(test)]
@@ -120,6 +122,9 @@ pub struct Entity {
     damage: BTreeMap<i32, i32>,
     home: Pos,
     goal: Option<Pos>,
+    #[serde(skip)]
+    motion: Option<crate::encounter::Motion>,
+    last_step: Pos,
     phase: f32,
     orbit: Option<realm_events::Orbit>,
     next_shot: u64,
@@ -1132,6 +1137,8 @@ impl World {
                         pos,
                         home: pos,
                         goal: None,
+                        motion: None,
+                        last_step: Pos { x: 0., y: 0. },
                         phase: 0.,
                         orbit: None,
                         hp: o.hp,
@@ -1324,6 +1331,8 @@ impl World {
                 pos,
                 home: pos,
                 goal: None,
+                motion: None,
+                last_step: Pos { x: 0., y: 0. },
                 phase: 0.,
                 orbit: None,
                 hp: definition.hp,
@@ -3294,6 +3303,7 @@ impl World {
         let old = self.entities[&id].pos;
         let length = old.distance(goal);
         if length <= 0.001 {
+            self.entities.get_mut(&id).unwrap().last_step = Pos { x: 0., y: 0. };
             return Ok(());
         }
         let distance = distance.min(length);
@@ -3315,7 +3325,12 @@ impl World {
             "moving NPC missing from spatial index"
         );
         self.cells[cell(pos)].insert(id);
-        self.entities.get_mut(&id).unwrap().pos = pos;
+        let e = self.entities.get_mut(&id).unwrap();
+        e.pos = pos;
+        e.last_step = Pos {
+            x: pos.x - old.x,
+            y: pos.y - old.y,
+        };
         Ok(())
     }
     fn npc_step(&mut self) -> Vec<(i32, Vec<u8>)> {
@@ -3425,7 +3440,7 @@ impl World {
             let (motion, mut speed) = if kind == 0x909 && current.stage == Some(1) {
                 (Motion::Stationary, 0.)
             } else if current.quest.is_some() {
-                self.quest_movement(id, elapsed)
+                self.quest_movement(id, target, elapsed)
             } else if kind == 0x6c6 || (self.entities[&id].camp.is_some() && midlands::member(kind))
             {
                 match self.midland_movement(id, target, elapsed) {
@@ -3465,16 +3480,55 @@ impl World {
             } else {
                 crate::encounter::movement(kind, self.entities[&id].hp, elapsed)
             };
+            let e = self.entities.get_mut(&id).unwrap();
+            if e.motion != Some(motion) {
+                e.motion = Some(motion);
+                e.goal = None;
+                if matches!(motion, Motion::Pace { .. }) {
+                    e.phase = 1.;
+                }
+                tracing::debug!(entity = id, kind, ?motion, speed, "NPC movement entered");
+            }
             let goal = match motion {
                 Motion::Stationary => {
                     speed = 0.;
                     Some(pos)
                 }
-                Motion::Wiggle => Some(Pos {
-                    x: self.entities[&id].home.x
-                        + (elapsed as f32 / 1000. * std::f32::consts::TAU).sin(),
-                    y: self.entities[&id].home.y,
-                }),
+                Motion::Pace { distance } => {
+                    let e = self.entities.get_mut(&id).unwrap();
+                    Some(match e.goal {
+                        Some(goal) if pos.distance(goal) > 0.001 => goal,
+                        _ => {
+                            if e.goal.is_some() {
+                                e.phase = -e.phase;
+                            }
+                            Pos {
+                                x: pos.x + distance * e.phase,
+                                y: pos.y,
+                            }
+                        }
+                    })
+                }
+                Motion::Tangential => {
+                    let step = self.entities[&id].last_step;
+                    let length = step.x.hypot(step.y);
+                    if length == 0. {
+                        speed = 0.;
+                        Some(pos)
+                    } else {
+                        Some(Pos {
+                            x: pos.x + step.x / length,
+                            y: pos.y + step.y / length,
+                        })
+                    }
+                }
+                Motion::Maintain { sight, distance } if pos.distance(target) < sight => {
+                    let angle = (pos.y - target.y).atan2(pos.x - target.x);
+                    Some(Pos {
+                        x: target.x + distance * angle.cos(),
+                        y: target.y + distance * angle.sin(),
+                    })
+                }
                 Motion::Retreat { distance } => {
                     if pos.distance(target) >= distance {
                         speed = 0.;
@@ -3524,11 +3578,9 @@ impl World {
                         }
                         1.
                     };
-                    let angular_speed = if (0xd56..=0xd60).contains(&kind) {
+                    let angular_speed = if e.quest.is_some() {
                         speed / 1.5
-                            * if flags & crate::condition::bit(crate::condition::PARALYZED) != 0 {
-                                0.
-                            } else if flags & crate::condition::bit(crate::condition::SLOWED) != 0 {
+                            * if flags & crate::condition::bit(crate::condition::SLOWED) != 0 {
                                 0.5
                             } else {
                                 1.
@@ -3536,8 +3588,10 @@ impl World {
                     } else {
                         speed
                     };
-                    e.phase = (e.phase + direction * angular_speed / radius * 0.05)
-                        % std::f32::consts::TAU;
+                    if flags & crate::condition::bit(crate::condition::PARALYZED) == 0 {
+                        e.phase = (e.phase + direction * angular_speed / radius * 0.05)
+                            % std::f32::consts::TAU;
+                    }
                     Some(Pos {
                         x: target.x + e.phase.cos() * radius,
                         y: target.y + e.phase.sin() * radius,
@@ -3577,20 +3631,34 @@ impl World {
             } else {
                 let e = self.entities.get_mut(&id).unwrap();
                 speed = match motion {
-                    Motion::Wander => speed,
+                    Motion::Wander | Motion::Maintain { .. } => speed,
                     Motion::Chase { .. } if kind == 0x600 => 4.,
                     Motion::Chase { .. } if !(0x687..=0x689).contains(&kind) => 4.,
                     Motion::Protect { .. } => profile.speed,
                     _ => 2.,
                 };
-                if e.goal
-                    .is_none_or(|goal| goal.distance(e.pos) < 0.1 || goal.distance(e.home) > 2.01)
-                {
+                let realm = self.name == "Realm";
+                if e.goal.is_none_or(|goal| {
+                    goal.distance(e.pos) < 0.1
+                        || if realm {
+                            goal.distance(e.pos) > 1.01
+                        } else {
+                            goal.distance(e.home) > 2.01
+                        }
+                }) {
                     let angle = self.rng.gen_range(0. ..std::f32::consts::TAU);
-                    let radius = self.rng.gen_range(0. ..2.);
-                    e.goal = Some(Pos {
-                        x: e.home.x + angle.cos() * radius,
-                        y: e.home.y + angle.sin() * radius,
+                    let (center, radius) = if realm {
+                        (e.pos, 1.)
+                    } else {
+                        (e.home, self.rng.gen_range(0. ..2.))
+                    };
+                    e.goal = Some(if realm && e.pos.distance(e.home) > 24. {
+                        e.home
+                    } else {
+                        Pos {
+                            x: center.x + angle.cos() * radius,
+                            y: center.y + angle.sin() * radius,
+                        }
                     });
                 }
                 e.goal.expect("wander destination assigned")
@@ -3602,7 +3670,9 @@ impl World {
             }
             self.entities.get_mut(&id).unwrap().goal = Some(goal);
             if let Err(error) = self.move_entity(id, goal, speed / 1.5 * 0.05) {
-                self.entities.get_mut(&id).unwrap().goal = None;
+                let e = self.entities.get_mut(&id).unwrap();
+                e.goal = None;
+                e.last_step = Pos { x: 0., y: 0. };
                 tracing::debug!(entity=id,%error,"NPC movement blocked; retargeting");
             }
             let e = &self.entities[&id];
