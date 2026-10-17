@@ -29,6 +29,7 @@ pub(super) fn patch(data: &mut [u8], url: u32, label: u32) -> Result<()> {
     // Bypass the abandoned payment overlay without enabling ExternalInterface or changing the reference asset.
     let mut code = b"\xd0\x30\x5d\x86\x08\x5d\xce\x01\x2c".to_vec();
     put_u30(&mut code, url);
+    // Ruffle permits only new-tab navigation while script access remains disabled.
     code.extend(b"\x4a\xce\x01\x01\x2c\x92\x02\x4f\x86\x08\x02\x47");
     let start = positions[0] + 5;
     data[start..start + 87].fill(0x02);
