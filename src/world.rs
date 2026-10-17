@@ -27,6 +27,7 @@ mod families;
 mod gods;
 #[cfg(test)]
 mod gods_tests;
+mod guilds;
 mod midlands;
 #[cfg(test)]
 mod midlands_tests;
@@ -364,6 +365,7 @@ pub struct World {
     pub map: Arc<Map>,
     pub entities: BTreeMap<i32, Entity>,
     pub players: BTreeMap<i32, Player>,
+    pub guild: Option<(i32, i32)>,
     pub bullets: Vec<Bullet>,
     grenades: Vec<mechanics::Grenade>,
     lava_patches: BTreeMap<usize, (u64, u8)>,
@@ -434,6 +436,7 @@ pub struct Directory {
     grants: BTreeMap<Vec<u8>, Grant>,
     portals: BTreeMap<i32, Portal>,
     chat_budgets: BTreeMap<i32, chat::ChatBudget>,
+    guild_invites: BTreeMap<i32, guilds::Invitation>,
     endgame: endgame::RealmDirectory,
     realm_portal: i32,
     realm_name: usize,
@@ -541,6 +544,10 @@ impl Directory {
             crate::endgame::CELLAR,
             "sprite-world",
             "undead-lair",
+            "guild-hall-1",
+            "guild-hall-2",
+            "guild-hall-3",
+            "guild-hall-4",
         ] {
             templates.insert(
                 name.to_string(),
@@ -560,6 +567,7 @@ impl Directory {
             grants: BTreeMap::new(),
             portals: BTreeMap::new(),
             chat_budgets: BTreeMap::new(),
+            guild_invites: BTreeMap::new(),
             endgame: endgame::RealmDirectory::default(),
             realm_portal: 0,
             realm_name: (seed % realm_portal::NAMES.len() as u64) as usize,
@@ -796,6 +804,20 @@ impl Directory {
             0x703 | 0x70d | 0x712 | 0x71d => -2,
             0x704 | 0x70e | 0x71c => self.initial(-3)?,
             0x720 => self.instance("vault", Some(account))?,
+            0x72f => {
+                let guild = p
+                    .presentation
+                    .guild
+                    .as_ref()
+                    .context("You are not in a guild.")?
+                    .id;
+                *self
+                    .worlds
+                    .iter()
+                    .find(|(_, w)| w.guild.is_some_and(|(id, _)| id == guild))
+                    .context("Guild Hall has not been initialized.")?
+                    .0
+            }
             kind if crate::dungeon::DUNGEONS
                 .iter()
                 .chain(crate::endgame::DUNGEONS)
@@ -1203,6 +1225,7 @@ impl World {
             map,
             entities,
             players: BTreeMap::new(),
+            guild: None,
             bullets: Vec::new(),
             grenades: Vec::new(),
             lava_patches: BTreeMap::new(),
@@ -1426,6 +1449,7 @@ impl World {
             tx,
             Some(Pos { x, y }),
             AccountPresentation {
+                guild: None,
                 credits: 100,
                 fame: 0,
                 best_fame: BTreeMap::new(),
@@ -1451,6 +1475,11 @@ impl World {
         ensure!(
             self.owner.is_none_or(|owner| owner == ch.account),
             "private world belongs to another account"
+        );
+        ensure!(
+            self.guild
+                .is_none_or(|(id, _)| presentation.guild.as_ref().is_some_and(|m| m.id == id)),
+            "Guild Hall membership has been revoked."
         );
         ensure!(
             self.players.len() < self.max_players,
@@ -1641,8 +1670,19 @@ impl World {
                 p.presentation
                     .next_quest(p.character.class, p.character.fame),
             );
-            text_stat(&mut o, 62, "");
-            stat(&mut o, 63, 0);
+            text_stat(
+                &mut o,
+                62,
+                p.presentation
+                    .guild
+                    .as_ref()
+                    .map_or("", |g| g.name.as_str()),
+            );
+            stat(
+                &mut o,
+                63,
+                p.presentation.guild.as_ref().map_or(0, |g| g.rank),
+            );
         } else {
             let e = self.entities.get(&id).context("entity missing")?;
             o.i32(id).f32(e.pos.x).f32(e.pos.y).i16(

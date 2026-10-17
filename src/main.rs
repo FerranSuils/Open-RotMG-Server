@@ -156,6 +156,7 @@ async fn main() -> Result<()> {
         },
         owners: Arc::default(),
         authentication: Arc::default(),
+        guild_actions: Arc::default(),
         bots: Arc::default(),
         quarantined: Arc::default(),
         shutdown: tokio::sync::watch::channel(false).0,
