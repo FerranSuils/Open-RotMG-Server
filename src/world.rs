@@ -19,6 +19,8 @@ mod abilities;
 pub(crate) mod chat;
 #[cfg(test)]
 mod client_contract_tests;
+mod companions;
+mod consumables;
 mod endgame;
 mod endgame_ai;
 mod enemy_damage;
@@ -68,6 +70,8 @@ mod bot_tests;
 mod class_tests;
 #[cfg(test)]
 mod complete_abilities_tests;
+#[cfg(test)]
+mod consumable_tests;
 mod cooperative;
 #[cfg(test)]
 mod cooperative_tests;
@@ -82,6 +86,7 @@ mod quiver_tests;
 mod reconciliation;
 #[cfg(test)]
 mod reconciliation_tests;
+mod resurrection;
 pub use reconciliation::{NativeInput, RejectedNativeShot};
 mod progression;
 #[cfg(test)]
@@ -221,6 +226,8 @@ pub struct Player {
     tick: i32,
     last_motion: Option<(f32, u64)>,
     last_ability: Option<u64>,
+    boosts: Vec<consumables::Boost>,
+    last_companion: Option<u64>,
     ability_shot: Option<(u16, i32, bool, i32)>,
 }
 impl Player {
@@ -293,7 +300,7 @@ impl Player {
         } else if condition & SLOWED != 0 {
             0.004
         } else {
-            (0.004 + (0.0096 - 0.004) * self.character.effective(content)?[4] as f32 / 75.)
+            (0.004 + (0.0096 - 0.004) * self.effective(content, now)?[4] as f32 / 75.)
                 * if condition & SPEEDY != 0 { 1.5 } else { 1. }
         })
     }
@@ -353,10 +360,10 @@ pub struct InventoryPlan {
     pub account: i32,
     pub character: i32,
     pub bag: Option<(i32, Vec<i32>)>,
-    pub healing: i32,
-    pub healing_nova: Option<(i32, f32)>,
-    pub mana: i32,
+    pub effects: Vec<crate::content::ConsumableEffect>,
     pub stat_growth: Option<(Character, Slot, usize, i32)>,
+    pub appearance: Option<(Slot, u32, u32)>,
+    pub(crate) companion: Option<companions::Plan>,
     pub vault: Option<Vault>,
     pub dropped: Option<i32>,
     pub unlock: Option<PortalPlan>,
@@ -392,6 +399,7 @@ pub struct World {
     grenades: Vec<mechanics::Grenade>,
     lava_patches: BTreeMap<usize, (u64, u8)>,
     ability_state: abilities::State,
+    companions: companions::State,
     finale: endgame_ai::Actors,
     cells: Vec<BTreeSet<i32>>,
     fountains: Vec<(i32, Pos)>,
@@ -447,7 +455,7 @@ struct Grant {
 }
 struct Portal {
     origin: i32,
-    destination: i32,
+    destination: Option<i32>,
     expires: u64,
 }
 pub struct Directory {
@@ -842,11 +850,7 @@ impl Directory {
                     .context("Guild Hall has not been initialized.")?
                     .0
             }
-            kind if crate::dungeon::DUNGEONS
-                .iter()
-                .chain(crate::endgame::DUNGEONS)
-                .any(|(portal, _, _, _)| *portal == kind) =>
-            {
+            _ if portal.is_some_and(|id| self.portals.contains_key(&id)) => {
                 let binding = self
                     .portals
                     .get(&portal.context("dungeon portal identity missing")?)
@@ -855,7 +859,9 @@ impl Directory {
                     binding.origin == origin && binding.expires > self.tick,
                     "dungeon portal binding expired or belongs to another world"
                 );
-                binding.destination
+                binding
+                    .destination
+                    .context("This dungeon is not implemented yet.")?
             }
             _ => bail!("unsupported portal destination {kind:#x}"),
         };
@@ -959,7 +965,7 @@ impl Directory {
             id,
             Portal {
                 origin,
-                destination,
+                destination: Some(destination),
                 expires: self.tick + if kind == 0x70c { 300 } else { 600 },
             },
         );
@@ -1031,7 +1037,7 @@ impl Directory {
                     && !self
                         .portals
                         .values()
-                        .any(|portal| portal.destination == **id)
+                        .any(|portal| portal.destination == Some(**id))
             })
             .map(|(id, _)| *id)
             .collect();
@@ -1256,6 +1262,7 @@ impl World {
             grenades: Vec::new(),
             lava_patches: BTreeMap::new(),
             ability_state: abilities::State::default(),
+            companions: companions::State::default(),
             finale: endgame_ai::Actors::default(),
             cells,
             fountains,
@@ -1539,6 +1546,9 @@ impl World {
             Pos { x, y }
         };
         let char_id = ch.id;
+        if let Some(kind) = ch.pet_kind {
+            self.attach_companion(id, kind, pos)?;
+        }
         self.players.insert(
             id,
             Player {
@@ -1599,6 +1609,8 @@ impl World {
                 tick: 0,
                 last_motion: None,
                 last_ability: None,
+                boosts: Vec::new(),
+                last_companion: None,
                 ability_shot: None,
             },
         );
@@ -1633,6 +1645,7 @@ impl World {
             !p.pending && !p.death_pending,
             "inventory or death operation pending"
         );
+        self.clear_companions(id);
         let p = self.players.remove(&id).unwrap();
         self.bullets.retain(|b| b.owner != id);
         tracing::info!(player = id, character = p.character.id, "player left");
@@ -1641,7 +1654,7 @@ impl World {
     pub fn stats(&self, id: i32, recipient: i32) -> Result<Vec<u8>> {
         let mut o = Writer::new();
         if let Some(p) = self.players.get(&id) {
-            let values = p.character.effective(&self.content)?;
+            let values = p.effective(&self.content, self.now)?;
             o.i32(id)
                 .f32(p.pos.x)
                 .f32(p.pos.y)
@@ -1680,8 +1693,8 @@ impl World {
                 stat(&mut o, k, v);
             }
             text_stat(&mut o, 31, &p.character.name);
-            stat(&mut o, 32, 0);
-            stat(&mut o, 33, 0);
+            stat(&mut o, 32, p.character.tex1 as i32);
+            stat(&mut o, 33, p.character.tex2 as i32);
             stat(&mut o, 38, p.character.account);
             if id == recipient {
                 stat(&mut o, 35, p.presentation.credits);
@@ -1790,7 +1803,7 @@ impl World {
     }
     fn defense(&self, id: i32) -> Result<i32> {
         let p = &self.players[&id];
-        Ok(p.character.effective(&self.content)?[3])
+        Ok(p.effective(&self.content, self.now)?[3])
     }
     fn quest_target(&self, id: i32) -> Option<i32> {
         if self.safe {
@@ -2305,7 +2318,7 @@ impl World {
             .context("weapon has no projectile zero")?;
         // The selected client's integer attack period cannot fund a fractional charge indefinitely.
         let frequency =
-            0.0015 + (0.008 - 0.0015) * p.character.effective(&self.content)?[5] as f64 / 75.;
+            0.0015 + (0.008 - 0.0015) * p.effective(&self.content, self.now)?[5] as f64 / 75.;
         // Expired buffs remain for the existing one-second native transition window.
         let late_berserk = native
             && p.statuses
@@ -2396,7 +2409,7 @@ impl World {
         } else if condition & crate::condition::bit(crate::condition::WEAK) != 0 {
             0.5
         } else {
-            (0.5 + (f64::from(p.character.effective(&self.content)?[2]) / 75.) * (2. - 0.5))
+            (0.5 + (f64::from(p.effective(&self.content, self.now)?[2]) / 75.) * (2. - 0.5))
                 * if condition & crate::condition::bit(crate::condition::DAMAGING) != 0 {
                     1.5
                 } else {
@@ -2490,25 +2503,41 @@ impl World {
             self.activate_ability(id, slot, &item, pos)?;
             return Ok(None);
         }
+        if matches!(
+            item.activate.as_str(),
+            "Dye" | "Pet" | "PermaPet" | "Create" | "UnlockPortal"
+        ) {
+            ensure!(
+                slot.object == id,
+                "item activation requires owned inventory"
+            );
+        }
         match item.activate.as_str() {
-            "Heal" | "Magic" => {
+            "Dye" => {
                 ensure!(
-                    item.activate != "Magic"
-                        || p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET)
-                            == 0,
-                    "cannot restore mana while Quiet"
+                    item.class == "Dye"
+                        && item.consumable
+                        && item.activations == 1
+                        && item.textures.iter().any(Option::is_some),
+                    "invalid appearance consumable"
                 );
-                let mut plan = self.consumable_plan(id, slot);
-                if item.activate == "Heal" {
-                    plan.healing = item.heal;
-                } else {
-                    plan.mana = item.heal;
+                let (mut tex1, mut tex2) = (p.character.tex1, p.character.tex2);
+                if let Some(value) = item.textures[0] {
+                    tex1 = value;
                 }
+                if let Some(value) = item.textures[1] {
+                    tex2 = value;
+                }
+                let mut plan = self.consumable_plan(id, slot, -1);
+                plan.appearance = Some((slot, tex1, tex2));
                 Ok(Some(plan))
             }
             "IncrementStat" => {
                 ensure!(
-                    matches!(item.kind, 0xa1f | 0xa20 | 0xa21 | 0xa34 | 0xa35 | 0xa4c)
+                    matches!(
+                        item.kind,
+                        0xa1f | 0xa20 | 0xa21 | 0xa34 | 0xa35 | 0xa4c | 0xae9 | 0xaea
+                    ) && item.consumable
                         && item.activations == 1,
                     "unsupported permanent stat consumable"
                 );
@@ -2519,48 +2548,32 @@ impl World {
                     .iter()
                     .position(|(id, _)| *id == stat)
                     .context("unsupported permanent potion stat")?;
+                let remaining =
+                    self.content.classes[&p.character.class].caps[index] - p.character.base[index];
                 ensure!(
-                    amount > 0
-                        && p.character.base[index]
-                            < self.content.classes[&p.character.class].caps[index],
+                    amount > 0 && remaining > 0,
                     "stat is already at its class cap"
                 );
+                let amount = amount.min(remaining);
                 let snapshot = p.character.clone();
-                let mut plan = self.consumable_plan(id, slot);
+                let mut plan = self.consumable_plan(id, slot, -1);
                 plan.stat_growth = Some((snapshot, slot, index, amount));
                 Ok(Some(plan))
             }
-            "Create" | "UnlockPortal" => {
-                ensure!(
-                    slot.object == id,
-                    "portal consumable must be in your inventory"
-                );
-                if item.activate == "Create" {
-                    self.begin_create(id, slot, &item).map(Some)
-                } else {
-                    self.begin_unlock(id, slot, &item).map(Some)
-                }
-            }
-            "HealNova" if item.kind == 0xa3f => {
-                ensure!(
-                    item.activations == 1 && item.heal == 100 && item.heal_range == 10.,
-                    "invalid selected Snake Oil activation"
-                );
-                let mut plan = self.consumable_plan(id, slot);
-                plan.healing_nova = Some((item.heal, item.heal_range));
-                Ok(Some(plan))
-            }
-            _ => bail!("item activation not implemented: {}", item.activate),
+            "Pet" | "PermaPet" => self.begin_companion(id, slot, &item).map(Some),
+            "Create" => self.begin_create(id, slot, &item).map(Some),
+            "UnlockPortal" => self.begin_unlock(id, slot, &item).map(Some),
+            _ => self.begin_consumable(id, slot, &item).map(Some),
         }
     }
-    fn consumable_plan(&mut self, id: i32, slot: Slot) -> InventoryPlan {
-        let mut plan = self.plan(id, self.players[&id].character.items.clone(), None, 0);
+    fn consumable_plan(&mut self, id: i32, slot: Slot, next: i32) -> InventoryPlan {
+        let mut plan = self.plan(id, self.players[&id].character.items.clone(), None);
         if slot.object == id {
-            plan.items[slot.slot] = -1;
+            plan.items[slot.slot] = next;
         } else {
             let bag = self.entities.get_mut(&slot.object).unwrap();
             let mut items = bag.items.clone();
-            items[slot.slot] = -1;
+            items[slot.slot] = next;
             bag.reserved = true;
             if let Some((container, vault)) = &self.vault
                 && *container == slot.object
@@ -2575,13 +2588,7 @@ impl World {
         self.players.get_mut(&id).unwrap().pending = true;
         plan
     }
-    fn plan(
-        &self,
-        id: i32,
-        items: Vec<i32>,
-        bag: Option<(i32, Vec<i32>)>,
-        healing: i32,
-    ) -> InventoryPlan {
+    fn plan(&self, id: i32, items: Vec<i32>, bag: Option<(i32, Vec<i32>)>) -> InventoryPlan {
         let p = &self.players[&id];
         InventoryPlan {
             player: id,
@@ -2590,10 +2597,10 @@ impl World {
             account: p.character.account,
             character: p.character.id,
             bag,
-            healing,
-            healing_nova: None,
-            mana: 0,
+            effects: Vec::new(),
             stat_growth: None,
+            appearance: None,
+            companion: None,
             vault: None,
             dropped: None,
             unlock: None,
@@ -2642,7 +2649,7 @@ impl World {
             self.entities.get_mut(source).unwrap().reserved = true;
         }
         self.players.get_mut(&id).unwrap().pending = true;
-        let mut plan = self.plan(id, items, source, 0);
+        let mut plan = self.plan(id, items, source);
         if let (Some((container, vault)), Some((source, items))) = (&self.vault, &plan.bag)
             && container == source
         {
@@ -2761,7 +2768,7 @@ impl World {
             self.entities.get_mut(&b).unwrap().reserved = true;
         }
         self.players.get_mut(&id).unwrap().pending = true;
-        let mut plan = self.plan(id, items, bag_id.map(|b| (b, bag)), 0);
+        let mut plan = self.plan(id, items, bag_id.map(|b| (b, bag)));
         plan.dropped = dropped;
         if let Some(container) = bag_id {
             let source = if from.object == container { &from } else { &to };
@@ -2805,8 +2812,14 @@ impl World {
             "portal unlock requires its directory commit"
         );
         let player = plan.player;
+        let source = (plan.character, plan.revision);
+        let companion = plan.companion.clone();
         let result = self.publish_inventory(plan, result);
         if let Err(error) = &result {
+            self.discard_consumable(source);
+            if let Err(cleanup) = self.discard_companion(&companion) {
+                tracing::error!(player,%cleanup,"companion cleanup failed after rejected publication");
+            }
             self.poison(player, format!("{error:#}"))?;
         }
         result
@@ -2874,21 +2887,20 @@ impl World {
                 "permanent stat potion committed"
             );
         }
-        let values = p.character.effective(&self.content)?;
+        if let Some((_, tex1, tex2)) = plan.appearance {
+            p.character.tex1 = tex1;
+            p.character.tex2 = tex2;
+            tracing::info!(
+                player = plan.player,
+                tex1,
+                tex2,
+                revision,
+                "appearance consumable committed"
+            );
+        }
+        let values = p.effective(&self.content, self.now)?;
         p.character.hp = p.character.hp.min(values[0]);
         p.character.mp = p.character.mp.min(values[1]);
-        if plan.healing > 0
-            && !p.death_pending
-            && p.conditions(self.now) & crate::condition::bit(crate::condition::SICK) == 0
-        {
-            p.character.hp = (p.character.hp + plan.healing).min(values[0]);
-        }
-        if plan.mana > 0
-            && !p.death_pending
-            && p.conditions(self.now) & crate::condition::bit(crate::condition::QUIET) == 0
-        {
-            p.character.mp = (p.character.mp + plan.mana).min(values[1]);
-        }
         if self.prepared_seed.is_some()
             && let Some((bag, slot)) = plan.loot_slot
         {
@@ -2903,9 +2915,8 @@ impl World {
             vault.revision += 1;
             self.vault.as_mut().context("committed chest missing")?.1 = vault;
         }
-        if let Some((amount, range)) = plan.healing_nova {
-            self.consumable_heal_nova(plan.player, amount, range)?;
-        }
+        self.finish_consumable(plan.player, (plan.character, plan.revision), plan.effects)?;
+        self.finish_companion(plan.player, plan.companion)?;
         if let Some((id, items)) = plan.bag {
             let bag = self.entities.get_mut(&id).unwrap();
             bag.items = items;
@@ -3068,7 +3079,7 @@ impl World {
         p.character.dungeons = snapshot.dungeons;
         p.character.abysses = snapshot.abysses;
         if leveled && !p.death_pending {
-            let values = p.character.effective(&self.content)?;
+            let values = p.effective(&self.content, self.now)?;
             p.character.hp = values[0];
             p.character.mp = values[1];
             p.hp_fraction = 0.;
@@ -3156,6 +3167,7 @@ impl World {
         send(p, 41, out.0);
         tracing::info!(player=id,character=p.character.id,killed_by=%p.killer,"permanent death committed");
         self.clear_abilities(id);
+        self.clear_companions(id);
         Ok(())
     }
     pub fn begin_departure(&mut self, id: i32) -> Result<Option<Character>> {
@@ -3499,6 +3511,14 @@ impl World {
             })),
             "NPC movement crosses a blocked tile"
         );
+        self.position_entity(id, pos)
+    }
+    fn position_entity(&mut self, id: i32, pos: Pos) -> Result<()> {
+        ensure!(
+            pos.x.is_finite() && pos.y.is_finite() && self.map.cell(pos.x, pos.y).is_some(),
+            "entity position outside world"
+        );
+        let old = self.entities[&id].pos;
         let cell = |p: Pos| p.y as usize * self.map.width as usize + p.x as usize;
         assert!(
             self.cells[cell(old)].remove(&id),
@@ -3994,6 +4014,9 @@ impl World {
     pub fn step(&mut self) {
         self.now += 50;
         self.tick += 1;
+        self.expire_consumable_boosts();
+        self.companion_step()
+            .expect("validated companion simulation");
         self.trade_step();
         self.fountain_heal();
         self.expire_goto_acks();
@@ -4006,8 +4029,7 @@ impl World {
             }
             let p = self.players.get_mut(id).unwrap();
             let values = p
-                .character
-                .effective(&self.content)
+                .effective(&self.content, self.now)
                 .expect("validated player equipment and base stats");
             let flags = p.conditions(self.now);
             p.statuses
@@ -4290,6 +4312,7 @@ impl World {
                     .iter()
                     .filter(|entity| {
                         self.players.contains_key(entity)
+                            || self.companions.contains(entity)
                             || self.entities.get(entity).is_some_and(|e| {
                                 e.hp > 0
                                     || !e.items.is_empty()
@@ -4311,8 +4334,7 @@ impl World {
                 let motion_condition = p.conditions(self.now) & (slow | paralyzed | SPEEDY);
                 let base = 0.004
                     + 0.0056
-                        * p.character
-                            .effective(&self.content)
+                        * p.effective(&self.content, self.now)
                             .expect("valid player equipment")[4] as f32
                         / 75.;
                 let speed = |flags: i32| {
@@ -4439,6 +4461,9 @@ mod tests {
             schema: 1,
             class: WIZARD,
             base: w.content.classes[&WIZARD].base,
+            tex1: 0,
+            tex2: 0,
+            pet_kind: None,
             id: 1,
             account: 1,
             name: "Test".into(),
