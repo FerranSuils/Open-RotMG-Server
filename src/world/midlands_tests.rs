@@ -229,11 +229,10 @@ fn shield_orc_commander_heals_its_group_but_only_the_key_fires_its_final_burst()
             .filter(|id| **id != key)
             .all(|id| w.entities.contains_key(id))
     );
-    assert_eq!(w.players[&p].character.kills, 1);
-    let xp = w.players[&p].experience_queued;
-    assert!(xp > 0);
+    assert_eq!(w.players[&p].character.kills, 0);
+    assert_eq!(w.players[&p].experience_queued, 0);
     w.mechanic_expiry();
-    assert_eq!(w.players[&p].experience_queued, xp);
+    assert_eq!(w.players[&p].experience_queued, 0);
     for id in ids.into_iter().filter(|id| *id != key) {
         w.midland_mechanics(id).unwrap();
         assert!(w.shield_shots(id, 0.).unwrap().is_empty());

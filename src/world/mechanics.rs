@@ -505,7 +505,7 @@ impl World {
             .map(|e| e.id)
             .collect();
         for id in expired {
-            if matches!(self.entities[&id].kind, 0x91a | 0x900 | 0xd50)
+            if matches!(self.entities[&id].kind, 0x91a | 0xd50)
                 && self.entities[&id]
                     .expires
                     .is_some_and(|deadline| deadline <= self.now)
