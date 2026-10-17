@@ -9,9 +9,10 @@ pub(crate) fn fixture() -> (PathBuf, App) {
         ),
         started: std::time::Instant::now(),
         testing: None,
+        society: Arc::default(),
         store: Store::open(&dir.join("game.db"), &content).unwrap(),
         world: Handle::spawn(
-            crate::world::Directory::with_seed(
+            crate::world::Directory::test_with_seed(
                 std::path::Path::new("data"),
                 content.clone(),
                 16,
