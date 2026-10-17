@@ -185,7 +185,12 @@ impl World {
         }
         Ok(())
     }
-    pub(super) fn ocean_mechanics(&mut self, id: i32, _target: Pos, elapsed: u64) -> Result<()> {
+    pub(super) fn ocean_mechanics(
+        &mut self,
+        id: i32,
+        _target: impl Into<Option<Pos>>,
+        elapsed: u64,
+    ) -> Result<()> {
         let kind = self.entities[&id].kind;
         if matches!(kind, 0xd62..=0xd64) && self.entities[&id].orbit.is_none() {
             let (value, radius) = if kind == 0xd63 {
@@ -359,7 +364,16 @@ impl World {
         }
         Ok(())
     }
-    pub(super) fn ocean_movement(&self, id: i32, target: Pos, elapsed: u64) -> (Motion, f32) {
+    pub(super) fn ocean_movement(
+        &self,
+        id: i32,
+        target: Option<Pos>,
+        elapsed: u64,
+    ) -> (Motion, f32) {
+        // Shared NPCs may now tick untargeted; aquatic movement still requires acquisition.
+        let Some(target) = target else {
+            return (Motion::Stationary, 0.);
+        };
         let e = &self.entities[&id];
         let distance = e.pos.distance(target);
         let chase = |sight, stop| Motion::Chase { sight, stop };

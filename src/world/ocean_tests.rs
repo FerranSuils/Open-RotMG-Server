@@ -195,6 +195,15 @@ fn thessal_uses_selected_patterns_and_native_stun_suppresses_shooting() {
     e.next_shot = w.now;
     w.apply_condition(boss, condition::STUNNED, 1000).unwrap();
     assert!(w.npc_step().into_iter().all(|(owner, _)| owner != boss));
+    w.entities.get_mut(&boss).unwrap().statuses.clear();
+    w.players
+        .get_mut(&p)
+        .unwrap()
+        .statuses
+        .insert(condition::INVISIBLE, (0, 1000));
+    let position = w.entities[&boss].pos;
+    assert!(w.npc_step().into_iter().all(|(owner, _)| owner != boss));
+    assert_eq!(w.entities[&boss].pos.distance(position), 0.);
 }
 
 #[test]
