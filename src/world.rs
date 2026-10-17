@@ -27,6 +27,7 @@ mod families;
 mod gods;
 #[cfg(test)]
 mod gods_tests;
+mod gold;
 mod ground;
 #[cfg(test)]
 mod ground_tests;
