@@ -103,6 +103,82 @@ fn foreign_or_wrong_revision_completion_quarantines_without_success() {
 }
 
 #[tokio::test]
+async fn failed_pickup_publication_keeps_the_source_reserved() {
+    use crate::store::{InventoryWrite, Store};
+    let mut w = tests::world();
+    let store = Store::open(std::path::Path::new(":memory:"), &w.content).unwrap();
+    let account = store
+        .list("publication-source-reservation".into())
+        .await
+        .unwrap();
+    let ch = store
+        .create(account.id, w.content.get(crate::content::WIZARD).unwrap())
+        .await
+        .unwrap();
+    let player = w.enter(ch.clone(), None).unwrap();
+    let mut other = tests::ch(&w);
+    other.id = 2;
+    other.account = 2;
+    let other = w.enter(other, None).unwrap();
+    let bag = w
+        .entities
+        .values()
+        .find(|e| e.kind == 0x806)
+        .unwrap()
+        .clone();
+    w.players.get_mut(&player).unwrap().pos = bag.pos;
+    let plan = w
+        .swap(
+            player,
+            Slot {
+                object: bag.id,
+                slot: 0,
+                kind: 0xa4f,
+            },
+            Slot {
+                object: player,
+                slot: 3,
+                kind: -1,
+            },
+        )
+        .unwrap();
+    let revisions = store
+        .exchange(
+            vec![InventoryWrite {
+                id: plan.character,
+                account: plan.account,
+                revision: plan.revision,
+                items: plan.items.clone(),
+            }],
+            None,
+        )
+        .await
+        .unwrap();
+    w.players.get_mut(&player).unwrap().character.base[0] = -1;
+    assert!(w.finish_inventory(plan, Ok(revisions[0])).is_err());
+    assert!(w.players[&player].persistence_failure.is_some());
+    assert!(w.entities[&bag.id].reserved);
+    assert_eq!(store.load(ch.account, ch.id).await.unwrap().items[3], 0xa4f);
+    w.players.get_mut(&other).unwrap().pos = bag.pos;
+    assert!(
+        w.swap(
+            other,
+            Slot {
+                object: bag.id,
+                slot: 0,
+                kind: 0xa4f
+            },
+            Slot {
+                object: other,
+                slot: 3,
+                kind: -1
+            },
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
 async fn committed_vault_transfer_recovers_after_publication_failure() {
     use crate::store::{InventoryWrite, Store};
     let path = std::env::temp_dir().join(format!(

@@ -2767,10 +2767,22 @@ impl World {
         );
         p.pending = false;
         if let Some((id, _)) = &plan.bag {
-            self.entities
-                .get_mut(id)
-                .context("reserved bag disappeared")?
-                .reserved = false;
+            ensure!(
+                self.entities
+                    .get(id)
+                    .context("reserved bag disappeared")?
+                    .reserved,
+                "inventory source reservation lost"
+            );
+        }
+        if let Some(dropped) = plan.dropped {
+            ensure!(
+                self.entities
+                    .get(&dropped)
+                    .context("reserved ground drop missing")?
+                    .reserved,
+                "ground drop reservation lost"
+            );
         }
         if let Some((bag, slot)) = plan.loot_slot {
             self.entities
@@ -2826,24 +2838,23 @@ impl World {
                 .context("committed loot identity missing")?;
             tracing::info!(player=plan.player,character=p.character.id,bag,slot,item=*item,world=%self.name,"loot slot committed");
         }
-        if let Some((id, items)) = plan.bag {
-            self.entities.get_mut(&id).unwrap().items = items;
-        }
-        if let Some(dropped) = plan.dropped {
-            let e = self
-                .entities
-                .get_mut(&dropped)
-                .context("reserved ground drop missing")?;
-            e.reserved = false;
-            e.published = true;
-            self.bag_expiry.insert(dropped, self.now + 60_000);
-        }
         if let Some(mut vault) = plan.vault {
             vault.revision += 1;
             self.vault.as_mut().context("committed chest missing")?.1 = vault;
         }
         if let Some((amount, range)) = plan.healing_nova {
             self.consumable_heal_nova(plan.player, amount, range)?;
+        }
+        if let Some((id, items)) = plan.bag {
+            let bag = self.entities.get_mut(&id).unwrap();
+            bag.items = items;
+            bag.reserved = false;
+        }
+        if let Some(dropped) = plan.dropped {
+            let e = self.entities.get_mut(&dropped).unwrap();
+            e.reserved = false;
+            e.published = true;
+            self.bag_expiry.insert(dropped, self.now + 60_000);
         }
         tracing::info!(player = plan.player, revision, "inventory committed");
         let p = &self.players[&plan.player];
