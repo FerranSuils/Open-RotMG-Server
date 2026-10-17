@@ -415,6 +415,11 @@ impl World {
                     .map(|e| e.pos),
             )
             .collect();
+        let quest_positions: Vec<_> = self
+            .entities
+            .values()
+            .filter_map(|e| e.quest.map(|_| e.pos))
+            .collect();
         let mut candidates: Vec<_> = self
             .map
             .cells
@@ -452,20 +457,18 @@ impl World {
                         .iter()
                         .all(|(x, y)| a.distance(Pos { x: *x, y: *y }) >= 64.)
                     && protected.iter().all(|p| a.distance(*p) >= 4.)
-                    && self
-                        .entities
-                        .values()
-                        .filter(|e| e.quest.is_some())
-                        .all(|e| {
-                            e.pos.distance(Pos {
-                                x: (a.x + piece.boss.0 as i32) as f32 + 0.5,
-                                y: (a.y + piece.boss.1 as i32) as f32 + 0.5,
-                            }) >= 32.
-                        })
+                    && quest_positions.iter().all(|p| {
+                        p.distance(Pos {
+                            x: (a.x + piece.boss.0 as i32) as f32 + 0.5,
+                            y: (a.y + piece.boss.1 as i32) as f32 + 0.5,
+                        }) >= 32.
+                    })
                     && (a.y..a.y + a.height).all(|y| {
                         (a.x..a.x + a.width).all(|x| {
                             let c = &self.map.cells[(y * self.map.width + x) as usize];
-                            c.region == 0 && self.content.grounds[&c.ground] > 0.
+                            c.region == 0
+                                && self.content.grounds[&c.ground] > 0.
+                                && !matches!(c.ground, 0x72 | 0x73)
                         })
                     })
             })
@@ -522,5 +525,32 @@ impl World {
         );
         self.setpieces.push(area);
         Ok(pos)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authored_arenas_preserve_generated_waterways() {
+        let content = super::super::tests::world().content;
+        for seed in [0, 12351, u64::MAX] {
+            let d = Directory::prepared(std::path::Path::new("data"), content.clone(), 4, seed)
+                .unwrap();
+            let raw = &d.templates["realm-shore"];
+            let live = &d.worlds[&-3].map;
+            for (i, (before, after)) in raw.cells.iter().zip(&live.cells).enumerate() {
+                if matches!(before.ground, 0x72 | 0x73) {
+                    assert_eq!(
+                        after.ground,
+                        before.ground,
+                        "seed {seed}: arena erased water at {},{}",
+                        i % 512,
+                        i / 512
+                    );
+                }
+            }
+        }
     }
 }
