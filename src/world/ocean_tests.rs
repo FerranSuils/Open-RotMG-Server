@@ -357,12 +357,24 @@ fn a_refused_hermit_wave_cannot_leave_partial_children_to_duplicate_on_retry() {
             .unwrap();
         w.entities.get_mut(&id).unwrap().parent = Some(root);
     }
-    for _ in 0..2 {
-        let error = w
-            .ocean_mechanics(root, w.players[&player].pos, 0)
-            .unwrap_err();
-        assert!(error.to_string().contains("budget"));
-        assert_eq!(w.entities[&root].stage, Some(0));
-        assert!(!w.entities.values().any(|e| e.kind == 0xd64));
+    for reserved in [false, true] {
+        if reserved {
+            let id = w.entities.values().find(|e| e.kind == 0x170b).unwrap().id;
+            w.remove_entity(id);
+            assert_eq!(
+                w.named_toss(root, 0x170b, 1, &[Pos { x: 20.5, y: 20.5 }])
+                    .unwrap(),
+                1
+            );
+            assert_eq!(w.named_births.len(), 1);
+        }
+        for _ in 0..2 {
+            let error = w
+                .ocean_mechanics(root, w.players[&player].pos, 0)
+                .unwrap_err();
+            assert!(error.to_string().contains("budget"));
+            assert_eq!(w.entities[&root].stage, Some(0));
+            assert!(!w.entities.values().any(|e| e.kind == 0xd64));
+        }
     }
 }

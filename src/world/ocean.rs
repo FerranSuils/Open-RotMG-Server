@@ -4,13 +4,10 @@ use super::*;
 use crate::{
     condition,
     dungeon::trench,
-    encounter::{Anchor, Motion},
+    encounter::{Anchor, Motion, nr_speed as speed},
 };
 use std::f32::consts::TAU;
 
-fn speed(value: f32) -> f32 {
-    (5.55 * value + 0.74) * 1.5
-}
 fn due(time: u64, interval: u64) -> bool {
     time % interval < 50
 }
@@ -53,6 +50,7 @@ impl World {
             self.actors()
                 .filter(|e| e.parent.is_some() || e.quest.is_some())
                 .count()
+                + self.named_births.len()
                 < 256,
             "ocean summon budget exhausted"
         );
@@ -104,6 +102,7 @@ impl World {
             self.actors()
                 .filter(|e| e.parent.is_some() || e.quest.is_some())
                 .count()
+                + self.named_births.len()
                 + positions.len()
                 <= 256,
             "Hermit wave exceeds summon budget"
@@ -176,6 +175,7 @@ impl World {
             self.actors()
                 .filter(|e| e.parent.is_some() || e.quest.is_some())
                 .count()
+                + self.named_births.len()
                 + count
                 <= 256,
             "ocean toss exceeds summon budget"
