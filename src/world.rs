@@ -27,6 +27,9 @@ mod families;
 mod gods;
 #[cfg(test)]
 mod gods_tests;
+mod ground;
+#[cfg(test)]
+mod ground_tests;
 mod guilds;
 mod midlands;
 #[cfg(test)]
@@ -36,6 +39,9 @@ mod player_position_tests;
 mod population;
 #[cfg(test)]
 mod population_tests;
+mod realm_events;
+#[cfg(test)]
+mod realm_events_tests;
 #[cfg(test)]
 mod realm_movement_tests;
 mod realm_portal;
@@ -121,6 +127,7 @@ pub struct Entity {
     motion: Option<crate::encounter::Motion>,
     last_step: Pos,
     phase: f32,
+    orbit: Option<realm_events::Orbit>,
     next_shot: u64,
     activated: Option<u64>,
     stage: Option<u64>,
@@ -179,8 +186,8 @@ pub struct Player {
     shoot_acks: VecDeque<(Instant, Vec<Bullet>)>,
     weapon_ticks: VecDeque<(i32, i32)>,
     visible_projectiles: BTreeMap<(i32, u8), native_hits::VisibleProjectile>,
-    tiles: BTreeSet<(i16, i16)>,
     ground_hits: BTreeMap<usize, i32>,
+    tiles: BTreeSet<(i16, i16)>,
     pub death_started: bool,
     killer: String,
     movement_credit: f32,
@@ -388,6 +395,7 @@ pub struct World {
     encounter: bool,
     population: Vec<Spawn>,
     camps: Vec<population::Camp>,
+    setpieces: Vec<realm_setpieces::Area>,
     portal_requests: Vec<(u16, Pos)>,
     critical_deaths: Vec<i32>,
     admission_open: bool,
@@ -649,6 +657,7 @@ impl Directory {
             world.populate_inland()?;
             world.populate_realm_heroes()?;
             world.populate_named_quests()?;
+            world.populate_realm_events()?;
         }
         world.prepare_endgame()?;
         if template == "sprite-world" {
@@ -1153,6 +1162,7 @@ impl World {
                         motion: None,
                         last_step: Pos { x: 0., y: 0. },
                         phase: 0.,
+                        orbit: None,
                         hp: o.hp,
                         size: o.size,
                         condition: crate::dungeon::abyss::initial_condition(kind)
@@ -1248,6 +1258,7 @@ impl World {
             encounter: false,
             population: vec![],
             camps: vec![],
+            setpieces: vec![],
             portal_requests: vec![],
             critical_deaths: vec![],
             admission_open: true,
@@ -1346,6 +1357,7 @@ impl World {
                 motion: None,
                 last_step: Pos { x: 0., y: 0. },
                 phase: 0.,
+                orbit: None,
                 hp: definition.hp,
                 size: definition.size,
                 condition: crate::dungeon::abyss::initial_condition(kind)
@@ -1528,8 +1540,8 @@ impl World {
                 known_since: BTreeMap::new(),
                 shoot_acks: VecDeque::new(),
                 visible_projectiles: BTreeMap::new(),
-                tiles: BTreeSet::new(),
                 ground_hits: BTreeMap::new(),
+                tiles: BTreeSet::new(),
                 death_started: false,
                 killer: String::new(),
                 movement_credit: 0.78,
@@ -3129,7 +3141,12 @@ impl World {
     fn defeat_entity(&mut self, id: i32) -> Result<()> {
         let e = self.remove_entity(id);
         let definition = &self.content.objects[&e.kind];
-        let reward = (definition.hp as f32 * definition.xp_multiplier / 10.).ceil() as i32;
+        // Reference Reproduce suppresses follower XP; Pentaract Spawn explicitly allows eye XP.
+        let reward = if e.quest.is_some() && matches!(e.kind, 0xd57 | 0xd58 | 0xd5a..=0xd5c) {
+            0
+        } else {
+            (definition.hp as f32 * definition.xp_multiplier / 10.).ceil() as i32
+        };
         for (id, p) in &mut self.players {
             if p.character.alive && !p.death_pending && !p.departing && p.pos.distance(e.pos) < 25.
             {
@@ -3185,7 +3202,11 @@ impl World {
             .map(|(id, _)| id);
         // Self-destruction has no final player bullet, so the largest eligible contributor owns its kill statistic.
         if let Some(owner) = owner {
-            self.players.get_mut(&owner).unwrap().character.kills += 1;
+            let p = self.players.get_mut(&owner).unwrap();
+            p.character.kills += 1;
+            if self.content.objects[&kind].quest {
+                p.character.quests += 1;
+            }
         }
         self.defeat_entity(id)?;
         tracing::info!(entity = id, kind, ?owner, "timed enemy defeat");
@@ -3239,7 +3260,11 @@ impl World {
         }
         let private = crate::loot::private(defeated.kind);
         // A flat 100-damage officer threshold exceeds the selected officers' entire HP.
-        let threshold = if defeated.kind == 0x927 {
+        let threshold = if matches!(defeated.kind, 0xd56 | 0xd59) {
+            self.content.objects[&defeated.kind].hp / 20
+        } else if matches!(defeated.kind, 0xd5a | 0xd60) {
+            self.content.objects[&defeated.kind].hp / 100
+        } else if defeated.kind == 0x927 {
             100
         } else {
             (self.content.objects[&defeated.kind].hp / 10).max(1)
@@ -3360,7 +3385,9 @@ impl World {
             .filter(|e| {
                 let object = &self.content.objects[&e.kind];
                 // Breakable scenery takes damage but has no movement/attack state machine.
-                object.class != "Wall" && (object.enemy || matches!(e.kind, 0x173 | 0xd7d))
+                object.class != "Wall"
+                    && !matches!(e.kind, 0xd5f | 0xd60)
+                    && (object.enemy || matches!(e.kind, 0x173 | 0xd7d))
             })
             .map(|e| e.id)
             .collect();
@@ -3580,9 +3607,17 @@ impl World {
                         }
                     };
                     let e = self.entities.get_mut(&id).unwrap();
-                    if e.goal.is_none() {
-                        e.phase = (pos.y - target.y).atan2(pos.x - target.x);
-                    }
+                    let direction = if let Some(orbit) = e.orbit {
+                        if pos.distance(target) > 0.001 {
+                            e.phase = (pos.y - target.y).atan2(pos.x - target.x);
+                        }
+                        orbit.direction
+                    } else {
+                        if e.goal.is_none() {
+                            e.phase = (pos.y - target.y).atan2(pos.x - target.x);
+                        }
+                        1.
+                    };
                     let angular_speed = if e.quest.is_some() {
                         speed / 1.5
                             * if flags & crate::condition::bit(crate::condition::SLOWED) != 0 {
@@ -3594,7 +3629,8 @@ impl World {
                         speed
                     };
                     if flags & crate::condition::bit(crate::condition::PARALYZED) == 0 {
-                        e.phase = (e.phase + angular_speed / radius * 0.05) % std::f32::consts::TAU;
+                        e.phase = (e.phase + direction * angular_speed / radius * 0.05)
+                            % std::f32::consts::TAU;
                     }
                     Some(Pos {
                         x: target.x + e.phase.cos() * radius,
@@ -3948,24 +3984,8 @@ impl World {
         }
         self.mechanic_expiry();
         self.abyss_step();
-        for id in &ids {
-            let p = &self.players[id];
-            if p.controller != Controller::Human
-                && p.character.alive
-                && !p.paused
-                && !p.departing
-                && !p.death_pending
-            {
-                let pos = p.pos;
-                let hazard = self
-                    .map
-                    .cell(pos.x, pos.y)
-                    .is_some_and(|c| self.content.hazards.contains_key(&c.ground));
-                if hazard && let Err(error) = self.ground_damage(*id, self.now as i32, pos) {
-                    tracing::error!(player=id,%error,"actor ground damage refused");
-                }
-            }
-        }
+        self.ground_step();
+        self.event_step();
         self.ability_step();
         let shots = self.npc_step();
         self.grenade_step();
@@ -5683,7 +5703,9 @@ mod tests {
                 .values()
                 .filter(|e| {
                     let object = &w.content.objects[&e.kind];
-                    object.enemy && object.class != "Wall"
+                    object.enemy
+                        && object.class != "Wall"
+                        && !(e.quest.is_some() && e.kind == 0xd5e)
                 })
                 .count(),
             w.population
@@ -5693,7 +5715,7 @@ mod tests {
                 + w.hero_identities().len()
         );
         assert!(w.population_count(11) <= 24);
-        assert_eq!(w.hero_identities().len(), 10);
+        assert_eq!(w.hero_identities().len(), 13);
         assert!(
             w.population
                 .iter()

@@ -14,15 +14,13 @@ impl World {
             quest::validate(&self.content, *kind)?;
             crate::loot::validate(&self.content, *kind)?;
         }
-        let mut placed = Vec::new();
         for (kind, terrains) in [
             (0x91f, &[7, 6][..]),
             (0x91b, &[6, 7][..]),
             (0x928, &[4, 3][..]),
             (0x675, &[5, 2][..]),
         ] {
-            let (pos, area) = self.place_named_setpiece(kind, terrains, &placed)?;
-            placed.push(area);
+            let pos = self.place_named_setpiece(kind, terrains)?;
             let id = self.spawn_entity(kind, pos, vec![])?;
             let e = self.entities.get_mut(&id).unwrap();
             e.quest = Some(id);
@@ -37,7 +35,7 @@ impl World {
         }
         Ok(())
     }
-    fn quest_members(&self, id: i32, kinds: &[u16]) -> Vec<i32> {
+    pub(super) fn quest_members(&self, id: i32, kinds: &[u16]) -> Vec<i32> {
         let tag = self.entities[&id].quest.expect("named quest membership");
         self.entities
             .values()
@@ -87,7 +85,7 @@ impl World {
             send(p, packet.id, packet.body.clone());
         }
     }
-    fn quest_shield(&mut self, id: i32, shield: bool) {
+    pub(super) fn quest_shield(&mut self, id: i32, shield: bool) {
         let e = self.entities.get_mut(&id).unwrap();
         e.condition &= !condition::bit(condition::INVULNERABLE);
         if shield {
@@ -115,7 +113,7 @@ impl World {
             radius,
         )
     }
-    fn quest_birth(
+    pub(super) fn quest_birth(
         &mut self,
         owner: (i32, Pos, Pos),
         kind: u16,
@@ -275,6 +273,9 @@ impl World {
         }
     }
     pub(super) fn quest_mechanics(&mut self, id: i32) -> Result<()> {
+        if (0xd56..=0xd60).contains(&self.entities[&id].kind) {
+            return self.event_mechanics(id);
+        }
         if self.entities[&id].stage.is_none() {
             self.quest_phase(id, 0);
         }
@@ -509,6 +510,9 @@ impl World {
         Ok(())
     }
     pub(super) fn quest_movement(&self, id: i32, target: Pos, elapsed: u64) -> (Motion, f32) {
+        if (0xd56..=0xd60).contains(&self.entities[&id].kind) {
+            return self.event_movement(id, elapsed);
+        }
         let e = &self.entities[&id];
         let leash = match e.kind {
             0x91f | 0x920 => 6.,
@@ -669,6 +673,9 @@ impl World {
         )
     }
     pub(super) fn quest_shots(&self, id: i32, target: Pos, t: u64) -> Result<Vec<(u8, f32)>> {
+        if (0xd56..=0xd60).contains(&self.entities[&id].kind) {
+            return self.event_shots(id, target, t);
+        }
         let e = &self.entities[&id];
         let k = e.kind;
         let s = e.stage.unwrap_or(0);

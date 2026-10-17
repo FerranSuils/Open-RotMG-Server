@@ -48,8 +48,11 @@ impl World {
                         x: (i % self.map.width as usize) as f32 + 0.5,
                         y: (i / self.map.width as usize) as f32 + 0.5,
                     };
-                    (cell.terrain == *terrain && cell.object.is_none() && self.walkable(pos))
-                        .then_some(pos)
+                    (cell.terrain == *terrain
+                        && cell.object.is_none()
+                        && self.walkable(pos)
+                        && self.outside_setpieces(pos))
+                    .then_some(pos)
                 })
                 .collect();
             candidates.shuffle(&mut self.rng);

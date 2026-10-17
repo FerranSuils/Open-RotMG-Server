@@ -434,6 +434,9 @@ impl World {
     }
 
     pub(super) fn encounter_death(&mut self, defeated: &Entity) -> Result<()> {
+        if defeated.kind == 0xd5e && defeated.quest.is_some() {
+            return self.event_tower_death(defeated);
+        }
         if defeated.kind == crate::dungeon::abyss::IDOL {
             self.idol_bridge(defeated.home, true)?;
         }
