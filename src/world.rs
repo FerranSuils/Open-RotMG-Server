@@ -38,6 +38,8 @@ mod ground;
 #[cfg(test)]
 mod ground_tests;
 mod guilds;
+#[cfg(test)]
+mod key_tests;
 mod lair;
 mod midlands;
 #[cfg(test)]
@@ -354,6 +356,17 @@ pub struct Slot {
     pub slot: usize,
     pub kind: i32,
 }
+#[derive(Clone, Copy)]
+pub struct PortalPlan {
+    locked: Option<i32>,
+    opened: i32,
+}
+impl PortalPlan {
+    fn lifetime(self) -> u64 {
+        // Trapped's Create uses 20 seconds; preserve the existing Cellar's 120-second policy.
+        if self.locked.is_some() { 2400 } else { 400 }
+    }
+}
 #[derive(Clone)]
 pub struct InventoryPlan {
     pub player: i32,
@@ -368,7 +381,7 @@ pub struct InventoryPlan {
     pub stat_growth: Option<(Character, Slot, usize, i32)>,
     pub vault: Option<Vault>,
     pub dropped: Option<i32>,
-    pub unlock: Option<(i32, i32)>,
+    pub unlock: Option<PortalPlan>,
     pub collected: Option<u16>,
     pub purchase: Option<(i32, crate::store::Purchase)>,
     loot_slot: Option<(i32, usize)>,
@@ -1366,6 +1379,13 @@ impl World {
     }
     pub fn spawn_entity(&mut self, kind: u16, pos: Pos, items: Vec<i32>) -> Result<i32> {
         ensure!(self.walkable(pos), "entity spawn is blocked");
+        self.insert_entity(kind, pos, items)
+    }
+    fn insert_entity(&mut self, kind: u16, pos: Pos, items: Vec<i32>) -> Result<i32> {
+        ensure!(
+            pos.x.is_finite() && pos.y.is_finite() && self.map.cell(pos.x, pos.y).is_some(),
+            "entity spawn outside map"
+        );
         let cell = pos.y.floor() as usize * self.map.width as usize + pos.x.floor() as usize;
         let definition = self.content.get(kind)?;
         let id = allocate_id(&self.ids)?;
@@ -2535,6 +2555,7 @@ impl World {
                 self.players.get_mut(&id).unwrap().pending = true;
                 Ok(Some(plan))
             }
+            "Create" => self.begin_create(id, slot, &item).map(Some),
             "UnlockPortal" => self.begin_unlock(id, slot, &item).map(Some),
             "HealNova" if item.kind == 0xa3f => {
                 ensure!(
@@ -3043,8 +3064,34 @@ impl World {
             .collect()
     }
     pub fn finish_death(&mut self, id: i32) -> Result<()> {
-        let p = self.players.get_mut(&id).context("dying player missing")?;
-        ensure!(p.death_started && p.death_pending, "death not pending");
+        let p = self.players.get(&id).context("dying player missing")?;
+        ensure!(
+            p.death_started && p.death_pending && p.persistence_failure.is_none(),
+            "death not pending or persistence failed"
+        );
+        let maxed = p
+            .character
+            .base
+            .iter()
+            .zip(self.content.classes[&p.character.class].caps)
+            .filter(|(value, cap)| **value >= *cap)
+            .count();
+        let (kind, lifetime) = match maxed {
+            0 if p.character.level == 1 => (0x723, Some(30_000)),
+            0 if p.character.level < 20 => (0x724, Some(60_000)),
+            0 => (0x725, Some(300_000)),
+            7 => (0x734, None),
+            8 => (0x735, None),
+            n => (0x725 + n as u16, None),
+        };
+        let (pos, name) = (p.pos, p.character.name.clone());
+        // Gates or terrain can become blocked after the dying player entered the tile.
+        let grave = self.insert_entity(kind, pos, vec![])?;
+        let entity = self.entities.get_mut(&grave).unwrap();
+        entity.name = name;
+        entity.expires = lifetime.map(|ms| self.now + ms);
+        tracing::info!(player=id, grave, kind, maxed, expires=?entity.expires, "gravestone created");
+        let p = self.players.get_mut(&id).unwrap();
         p.character.alive = false;
         p.character.items.fill(-1);
         p.death_pending = false;
@@ -4350,6 +4397,8 @@ fn inside_box(a: Pos, b: Pos) -> bool {
 #[cfg(test)]
 #[path = "../examples/testing/cover.rs"]
 mod cover_example;
+#[cfg(test)]
+mod gravestones_tests;
 #[cfg(test)]
 #[path = "../examples/testing/timing.rs"]
 mod timing_example;
