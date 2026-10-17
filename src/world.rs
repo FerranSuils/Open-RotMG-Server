@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 mod abilities;
 #[cfg(test)]
 mod audit_tests;
+mod charges;
 pub(crate) mod chat;
 #[cfg(test)]
 mod client_contract_tests;
@@ -26,6 +27,9 @@ mod endgame_ai;
 mod enemy_damage;
 mod enemy_shots;
 mod families;
+mod fauna;
+mod fauna_births;
+mod fauna_special;
 mod gods;
 #[cfg(test)]
 mod gods_tests;
@@ -139,6 +143,8 @@ pub struct Entity {
     motion: Option<crate::encounter::Motion>,
     #[serde(skip)]
     following: Following,
+    #[serde(skip)]
+    charge: Option<charges::Charge>,
     last_step: Pos,
     phase: f32,
     orbit: Option<realm_events::Orbit>,
@@ -393,6 +399,7 @@ pub struct World {
     pub guild: Option<(i32, i32)>,
     pub bullets: Vec<Bullet>,
     grenades: Vec<mechanics::Grenade>,
+    fauna_births: Vec<fauna_births::Birth>,
     lava_patches: BTreeMap<usize, (u64, u8)>,
     ability_state: abilities::State,
     finale: endgame_ai::Actors,
@@ -1180,6 +1187,7 @@ impl World {
                         goal: None,
                         motion: None,
                         following: Following::Unknown,
+                        charge: None,
                         last_step: Pos { x: 0., y: 0. },
                         phase: 0.,
                         orbit: None,
@@ -1261,6 +1269,7 @@ impl World {
             guild: None,
             bullets: Vec::new(),
             grenades: Vec::new(),
+            fauna_births: Vec::new(),
             lava_patches: BTreeMap::new(),
             ability_state: abilities::State::default(),
             finale: endgame_ai::Actors::default(),
@@ -1380,6 +1389,7 @@ impl World {
                 goal: None,
                 motion: None,
                 following: Following::Unknown,
+                charge: None,
                 last_step: Pos { x: 0., y: 0. },
                 phase: 0.,
                 orbit: None,
@@ -3512,6 +3522,14 @@ impl World {
                 (Motion::Stationary, 0.)
             } else if current.quest.is_some() {
                 self.quest_movement(id, target, elapsed)
+            } else if crate::encounter::fauna::ROSTER.contains(&kind) {
+                match self.fauna_movement(id, target, elapsed) {
+                    Ok(movement) => movement,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"fauna movement refused");
+                        continue;
+                    }
+                }
             } else if kind == 0x6c6 || (self.entities[&id].camp.is_some() && midlands::member(kind))
             {
                 match self.midland_movement(id, target, elapsed) {
@@ -3590,6 +3608,7 @@ impl World {
             if e.motion != Some(motion) {
                 e.motion = Some(motion);
                 e.following = Following::Unknown;
+                e.charge = None;
                 e.goal = None;
                 if matches!(motion, Motion::Pace { .. }) {
                     e.phase = 1.;
@@ -3598,6 +3617,9 @@ impl World {
             }
             let planned_motion = if flags & crate::condition::bit(crate::condition::PARALYZED) != 0
             {
+                if let Some(charge) = &mut e.charge {
+                    charge.suspend(delta);
+                }
                 Motion::Stationary
             } else {
                 motion
@@ -3607,6 +3629,7 @@ impl World {
                     speed = 0.;
                     Some(pos)
                 }
+                Motion::Charge { .. } => self.charge_goal(id, target, motion, speed),
                 Motion::WanderHome { radius } => {
                     let e = self.entities.get_mut(&id).unwrap();
                     if e.goal.is_none_or(|p| {
@@ -3802,7 +3825,7 @@ impl World {
                 let e = self.entities.get_mut(&id).unwrap();
                 speed = match motion {
                     Motion::Wander | Motion::Maintain { .. } => speed,
-                    Motion::Follow { idle, .. } => idle,
+                    Motion::Follow { idle, .. } | Motion::Charge { idle, .. } => idle,
                     Motion::Chase { .. } if kind == 0x600 => 4.,
                     Motion::Chase { .. } if !(0x687..=0x689).contains(&kind) => 4.,
                     Motion::Protect { .. } => profile.speed,
@@ -3887,15 +3910,13 @@ impl World {
                     continue;
                 }
             };
-            let shots =
-                if flags & crate::condition::bit(crate::condition::DAZED) != 0 && shots.len() > 1 {
-                    let count = (shots.len() / 2).max(1);
-                    (0..count)
-                        .map(|i| shots[(2 * i + 1) * shots.len() / (2 * count)])
-                        .collect()
-                } else {
-                    shots
-                };
+            let shots = if schedule.is_none()
+                && flags & crate::condition::bit(crate::condition::DAZED) != 0
+            {
+                enemy_shots::dazed(shots)
+            } else {
+                shots
+            };
             let interval = match kind {
                 0x633 if elapsed % 10000 >= 5000 => 500,
                 0x917 if !(1875..3750).contains(&self.entities[&id].hp) => 1000,
@@ -4409,6 +4430,21 @@ mod tests {
         let c = Arc::new(Content::load(Path::new("data")).unwrap());
         let m = Arc::new(Map::load(Path::new("data/tutorial.wmap"), &c).unwrap());
         World::new(c, m).unwrap()
+    }
+    pub(super) fn arena(terrain: u8) -> World {
+        let mut w = world();
+        w.encounter = true;
+        for id in w.entities.keys().copied().collect::<Vec<_>>() {
+            w.remove_entity(id);
+        }
+        let map = Arc::make_mut(&mut w.map);
+        map.spawns = vec![(1.5, 1.5)];
+        for cell in &mut map.cells {
+            cell.ground = 0x61;
+            cell.terrain = terrain;
+            cell.object = None;
+        }
+        w
     }
     pub(super) fn ch(w: &World) -> Character {
         Character {

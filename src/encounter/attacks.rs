@@ -10,9 +10,22 @@ pub(crate) enum Prediction {
     Chance(f64),
 }
 #[derive(Clone, Copy, Debug)]
+pub(crate) struct Alternative {
+    pub projectile: u8,
+    pub count: usize,
+    pub gap: f32,
+    pub offset: f32,
+}
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum Action {
-    Shoot { projectile: u8, choice: Option<u8> },
-    Grenade { radius: f32, damage: i32 },
+    Shoot {
+        projectile: u8,
+        choice: Option<Alternative>,
+    },
+    Grenade {
+        radius: f32,
+        damage: i32,
+    },
 }
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Attack {
@@ -28,7 +41,7 @@ pub(crate) struct Attack {
     pub enabled: bool,
 }
 impl Attack {
-    fn fan(projectile: u8, count: usize, gap: f32, interval: u64, range: f32) -> Self {
+    pub(super) fn fan(projectile: u8, count: usize, gap: f32, interval: u64, range: f32) -> Self {
         Self {
             action: Action::Shoot {
                 projectile,
@@ -45,21 +58,21 @@ impl Attack {
             enabled: true,
         }
     }
-    fn ring(projectile: u8, count: usize, interval: u64, range: f32) -> Self {
+    pub(super) fn ring(projectile: u8, count: usize, interval: u64, range: f32) -> Self {
         Self::fan(projectile, count, 360. / count as f32, interval, range)
             .offset(180. - 180. / count as f32)
     }
-    fn grenade(radius: f32, damage: i32, interval: u64, range: f32) -> Self {
+    pub(super) fn grenade(radius: f32, damage: i32, interval: u64, range: f32) -> Self {
         Self {
             action: Action::Grenade { radius, damage },
             ..Self::fan(0, 1, 0., interval, range)
         }
     }
-    fn offset(mut self, degrees: f32) -> Self {
+    pub(super) fn offset(mut self, degrees: f32) -> Self {
         self.offset += degrees.to_radians();
         self
     }
-    fn delay(mut self, ms: u64) -> Self {
+    pub(super) fn delay(mut self, ms: u64) -> Self {
         self.delay = ms;
         self
     }
@@ -67,19 +80,19 @@ impl Attack {
         self.predict = Prediction::Lead(factor);
         self
     }
-    fn chance(mut self, chance: f64) -> Self {
+    pub(super) fn chance(mut self, chance: f64) -> Self {
         self.predict = Prediction::Chance(chance);
         self
     }
-    fn fixed(mut self, angle: f32) -> Self {
+    pub(super) fn fixed(mut self, angle: f32) -> Self {
         self.aim = Aim::Fixed(angle);
         self
     }
-    fn once(mut self) -> Self {
+    pub(super) fn once(mut self) -> Self {
         self.interval = None;
         self
     }
-    fn enabled(mut self, enabled: bool) -> Self {
+    pub(super) fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
     }
@@ -87,7 +100,24 @@ impl Attack {
         let Action::Shoot { choice, .. } = &mut self.action else {
             unreachable!()
         };
-        *choice = Some(index);
+        *choice = Some(Alternative {
+            projectile: index,
+            count: self.count,
+            gap: self.gap,
+            offset: self.offset,
+        });
+        self
+    }
+    pub(super) fn alternate(mut self, projectile: u8, count: usize, gap: f32, offset: f32) -> Self {
+        let Action::Shoot { choice, .. } = &mut self.action else {
+            panic!("grenade cannot have an alternate volley")
+        };
+        *choice = Some(Alternative {
+            projectile,
+            count,
+            gap: gap.to_radians(),
+            offset: offset.to_radians(),
+        });
         self
     }
     pub fn shots(self, projectile: u8, heading: f32) -> Vec<(u8, f32)> {
@@ -131,6 +161,9 @@ impl Schedule {
     }
 }
 pub(crate) fn schedule(kind: u16, hp: i32, elapsed: u64) -> Option<Schedule> {
+    if super::fauna::ROSTER.contains(&kind) {
+        return Some(super::fauna::schedule(kind, hp, elapsed));
+    }
     let fan = Attack::fan;
     let ring = Attack::ring;
     let grenade = Attack::grenade;

@@ -1,5 +1,8 @@
 use super::*;
-use crate::encounter::attacks::{Action, Aim, Prediction, Schedule};
+use crate::{
+    condition,
+    encounter::attacks::{Action, Aim, Prediction, Schedule},
+};
 
 impl World {
     pub(super) fn suspend_npc(&mut self, id: i32, delta: u64) {
@@ -20,6 +23,9 @@ impl World {
             e.reaction_until += delta;
         }
         e.attacks.suspend(delta);
+        if let Some(charge) = &mut e.charge {
+            charge.suspend(delta);
+        }
     }
     pub(super) fn npc_attack_schedule(&self, id: i32, elapsed: u64) -> Result<Option<Schedule>> {
         use crate::{
@@ -63,6 +69,20 @@ impl World {
                 attacks::endgame_schedule(e.kind, e.hp, self.content.objects[&e.kind].hp, elapsed)
             }
         };
+        if matches!(e.kind, 0x903 | 0x904) {
+            let stage = e.stage.context("Flamer attack phase missing")?;
+            let s = schedule.as_mut().context("Flamer schedule missing")?;
+            s.state = stage;
+            s.attacks[0].enabled = stage == 1;
+            s.attacks[1].enabled = stage == 3;
+        }
+        if e.kind == 0x20d {
+            schedule
+                .as_mut()
+                .context("Gray Blob schedule missing")?
+                .attacks[0]
+                .enabled = e.stage == Some(1);
+        }
         if e.kind == ORYX && e.hp <= self.content.objects[&e.kind].hp / 5 {
             schedule
                 .as_mut()
@@ -130,7 +150,7 @@ impl World {
         let pos = self.entities[&id].pos;
         let mut shots = vec![];
         for slot in due {
-            let attack = schedule.attacks[slot];
+            let mut attack = schedule.attacks[slot];
             let heading = match attack.aim {
                 Aim::Fixed(angle) => angle,
                 Aim::Target => {
@@ -151,7 +171,12 @@ impl World {
                 }
                 Action::Shoot { projectile, choice } => {
                     let projectile = match choice {
-                        Some(other) if self.rng.gen_bool(0.5) => other,
+                        Some(other) if self.rng.gen_bool(0.5) => {
+                            attack.count = other.count;
+                            attack.gap = other.gap;
+                            attack.offset = other.offset;
+                            other.projectile
+                        }
                         _ => projectile,
                     };
                     let mut volley = attack.shots(projectile, heading);
@@ -173,6 +198,11 @@ impl World {
                             &mut volley,
                             |_| factor,
                         )?;
+                    }
+                    if self.entities[&id].conditions(self.now) & condition::bit(condition::DAZED)
+                        != 0
+                    {
+                        volley = enemy_shots::dazed(volley);
                     }
                     shots.extend(volley);
                 }

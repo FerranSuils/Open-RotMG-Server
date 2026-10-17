@@ -13,6 +13,8 @@ pub(crate) const RINGS: &[i32] = &[9];
 fn table(kind: u16) -> &'static [(f64, Pick)] {
     use Pick::{Item, Tier};
     match kind {
+        // Behavior coverage alone does not establish new drop probabilities.
+        kind if crate::encounter::fauna::ROSTER.contains(&kind) => &[],
         0x122 | 0x162 | 0x163 | 0xd57 | 0xd58 | 0xd5b..=0xd5f => &[],
         0xd5a => &[(0.05, Item(0xa3b))],
         0xd56 | 0xd59 | 0xd60 => &[

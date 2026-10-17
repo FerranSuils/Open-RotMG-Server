@@ -105,8 +105,19 @@ fn ordinary_seed_density_stays_within_real_body_budgets_and_preserves_closure() 
 
 #[test]
 fn royal_healing_and_mage_orbits_cannot_adopt_another_orc_camp() {
-    let mut d = directory(12351);
-    let w = d.worlds.get_mut(&-3).unwrap();
+    let mut arena = tests::arena(6);
+    let p = Pos {
+        x: arena.map.width as f32 / 2. + 0.5,
+        y: arena.map.height as f32 / 2. + 0.5,
+    };
+    arena
+        .populate_families(
+            6,
+            &[Pos { y: p.y - 6., ..p }, Pos { y: p.y + 6., ..p }],
+            &[0x62c, 0x62c],
+        )
+        .unwrap();
+    let w = &mut arena;
     let king = member(w, 0x62c);
     let queen = w.camp_member(king, 0x62b).unwrap().unwrap();
     let mage = w.camp_member(king, 0x62a).unwrap().unwrap();
@@ -116,6 +127,7 @@ fn royal_healing_and_mage_orbits_cannot_adopt_another_orc_camp() {
         .find(|e| e.kind == 0x62c && e.id != king)
         .unwrap()
         .id;
+    w.move_entity(other, w.entities[&king].pos, 20.).unwrap();
     w.entities.get_mut(&king).unwrap().hp = 100;
     w.entities.get_mut(&other).unwrap().hp = 100;
     w.midland_mechanics(queen).unwrap();

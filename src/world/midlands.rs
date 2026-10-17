@@ -162,7 +162,7 @@ impl World {
             .map(|e| e.id)
             .collect())
     }
-    fn flash_inland(&self, id: i32, color: u32, period: f32, cycles: f32) {
+    pub(super) fn flash_inland(&self, id: i32, color: u32, period: f32, cycles: f32) {
         let mut out = Writer::new();
         out.u8(15)
             .i32(id)

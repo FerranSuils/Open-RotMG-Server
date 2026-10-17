@@ -2,6 +2,7 @@ use crate::content::Content;
 use anyhow::{Result, ensure};
 
 pub(crate) mod attacks;
+pub(crate) mod fauna;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Anchor {
@@ -18,17 +19,49 @@ pub enum Anchor {
 pub enum Motion {
     Stationary,
     Wander,
-    WanderHome { radius: f32 },
-    Chase { sight: f32, stop: f32 },
-    Follow { sight: f32, stop: f32, idle: f32 },
+    WanderHome {
+        radius: f32,
+    },
+    Chase {
+        sight: f32,
+        stop: f32,
+    },
+    Follow {
+        sight: f32,
+        stop: f32,
+        idle: f32,
+    },
+    Charge {
+        sight: f32,
+        cooldown: u64,
+        delay: u64,
+        stop: f32,
+        idle: f32,
+    },
     Circle,
-    Pace { distance: f32 },
+    Pace {
+        distance: f32,
+    },
     Tangential,
-    Maintain { sight: f32, distance: f32 },
-    Retreat { distance: f32 },
-    Orbit { anchor: Anchor, radius: f32 },
-    StrictOrbit { anchor: Anchor, radius: f32 },
-    Protect { anchor: Anchor, distance: f32 },
+    Maintain {
+        sight: f32,
+        distance: f32,
+    },
+    Retreat {
+        distance: f32,
+    },
+    Orbit {
+        anchor: Anchor,
+        radius: f32,
+    },
+    StrictOrbit {
+        anchor: Anchor,
+        radius: f32,
+    },
+    Protect {
+        anchor: Anchor,
+        distance: f32,
+    },
 }
 #[derive(Clone, Copy)]
 pub struct Profile {
@@ -41,6 +74,9 @@ pub(crate) fn nr_speed(rate: f32) -> f32 {
     (5.55 * rate + 0.74) * 1.5
 }
 pub fn profile(kind: u16) -> Option<Profile> {
+    if fauna::ROSTER.contains(&kind) {
+        return Some(fauna::profile(kind));
+    }
     use Motion::*;
     let chase = |stop| Chase { sight: 10., stop };
     let (motion, speed, interval, range) = match kind {
@@ -477,7 +513,17 @@ pub fn validate(content: &Content, kind: u16) -> Result<()> {
                     );
                     match attack.action {
                         attacks::Action::Shoot { projectile, choice } => {
-                            for index in std::iter::once(projectile).chain(choice) {
+                            if let Some(other) = choice {
+                                ensure!(
+                                    (1..=255).contains(&other.count)
+                                        && other.gap.is_finite()
+                                        && other.offset.is_finite(),
+                                    "invalid alternate volley for {kind:#x}"
+                                );
+                            }
+                            for index in std::iter::once(projectile)
+                                .chain(choice.map(|other| other.projectile))
+                            {
                                 ensure!(
                                     content.get(kind)?.projectiles.contains_key(&index),
                                     "encounter {kind:#x} references absent selected projectile {index}"

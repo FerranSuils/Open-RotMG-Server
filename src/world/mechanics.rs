@@ -205,6 +205,9 @@ impl World {
             return self.finale_mechanics(id, target, elapsed);
         }
         let kind = self.entities[&id].kind;
+        if crate::encounter::fauna::ROSTER.contains(&kind) {
+            return self.fauna_mechanics(id, target, elapsed);
+        }
         if matches!(kind, 0xdaa | 0xdac) {
             return Ok(());
         }
@@ -384,6 +387,19 @@ impl World {
         Ok(())
     }
 
+    pub(super) fn telegraph_throw(&self, owner: i32, position: Pos, color: u32) {
+        let mut out = Writer::new();
+        out.u8(4)
+            .i32(owner)
+            .f32(position.x)
+            .f32(position.y)
+            .f32(0.)
+            .f32(0.)
+            .u32(color);
+        for p in self.players.values().filter(|p| p.known.contains(&owner)) {
+            send(p, wire::SHOW_EFFECT, out.0.clone());
+        }
+    }
     pub(super) fn throw_grenade(
         &mut self,
         owner: i32,
@@ -395,17 +411,7 @@ impl World {
         if self.entities[&owner].conditions(self.now) & condition::bit(condition::STUNNED) != 0 {
             return Ok(());
         }
-        let mut out = Writer::new();
-        out.u8(4)
-            .i32(owner)
-            .f32(position.x)
-            .f32(position.y)
-            .f32(0.)
-            .f32(0.)
-            .u32(0xffff0000);
-        for p in self.players.values().filter(|p| p.known.contains(&owner)) {
-            send(p, wire::SHOW_EFFECT, out.0.clone());
-        }
+        self.telegraph_throw(owner, position, 0xffff0000);
         self.grenades.push(Grenade {
             kind: self.entities[&owner].kind,
             position,
@@ -482,6 +488,7 @@ impl World {
     }
 
     pub(super) fn mechanic_expiry(&mut self) {
+        self.fauna_birth_step();
         let expired: Vec<_> = self
             .entities
             .values()
@@ -508,6 +515,9 @@ impl World {
     }
 
     pub(super) fn encounter_death(&mut self, defeated: &Entity) -> Result<()> {
+        if crate::encounter::fauna::ROSTER.contains(&defeated.kind) {
+            return self.fauna_death(defeated);
+        }
         if defeated.kind == 0xd5e && defeated.quest.is_some() {
             return self.event_tower_death(defeated);
         }
