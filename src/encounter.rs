@@ -32,6 +32,9 @@ pub struct Profile {
     pub range: f32,
 }
 pub fn profile(kind: u16) -> Option<Profile> {
+    if let Some(profile) = crate::dungeon::trench::profile(kind) {
+        return Some(profile);
+    }
     use Motion::*;
     let chase = |stop| Chase { sight: 10., stop };
     let (motion, speed, interval, range) = match kind {
@@ -584,6 +587,9 @@ pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8
     }
 }
 pub fn validate(content: &Content, kind: u16) -> Result<()> {
+    if crate::dungeon::trench::ROSTER.contains(&kind) {
+        return crate::dungeon::trench::validate(content, kind);
+    }
     if crate::quest::ROSTER.contains(&kind) {
         return crate::quest::validate(content, kind);
     }

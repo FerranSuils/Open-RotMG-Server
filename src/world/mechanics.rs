@@ -152,6 +152,9 @@ impl World {
     }
 
     pub(super) fn encounter_mechanics(&mut self, id: i32, target: Pos, elapsed: u64) -> Result<()> {
+        if crate::dungeon::trench::ROSTER.contains(&self.entities[&id].kind) {
+            return self.ocean_mechanics(id, target, elapsed);
+        }
         if crate::dungeon::abyss::ROSTER.contains(&self.entities[&id].kind) {
             return self.abyss_mechanics(id, target, elapsed);
         }
@@ -434,6 +437,9 @@ impl World {
     }
 
     pub(super) fn encounter_death(&mut self, defeated: &Entity) -> Result<()> {
+        if crate::dungeon::trench::ROSTER.contains(&defeated.kind) {
+            return self.ocean_death(defeated);
+        }
         if defeated.kind == 0xd5e && defeated.quest.is_some() {
             return self.event_tower_death(defeated);
         }
