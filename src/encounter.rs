@@ -11,13 +11,16 @@ pub enum Anchor {
     Home,
     CampLeader,
     CampMember(u16),
+    CampEntity(i32),
     QuestMember(u16),
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Motion {
     Stationary,
     Wander,
+    WanderHome { radius: f32 },
     Chase { sight: f32, stop: f32 },
+    Follow { sight: f32, stop: f32, idle: f32 },
     Circle,
     Pace { distance: f32 },
     Tangential,
@@ -33,6 +36,9 @@ pub struct Profile {
     pub speed: f32,
     pub interval: u64,
     pub range: f32,
+}
+pub(crate) fn nr_speed(rate: f32) -> f32 {
+    (5.55 * rate + 0.74) * 1.5
 }
 pub fn profile(kind: u16) -> Option<Profile> {
     use Motion::*;
@@ -458,8 +464,9 @@ pub fn validate(content: &Content, kind: u16) -> Result<()> {
             if let Some(schedule) = attacks::schedule(kind, hp, elapsed) {
                 for attack in schedule.attacks {
                     ensure!(
-                        attack.interval > 0
-                            && attack.interval.is_multiple_of(50)
+                        attack
+                            .interval
+                            .is_none_or(|ms| ms > 0 && ms.is_multiple_of(50))
                             && attack.delay.is_multiple_of(50)
                             && (1..=255).contains(&attack.count)
                             && attack.gap.is_finite()

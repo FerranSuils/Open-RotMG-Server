@@ -73,7 +73,7 @@ fn selected_pack_is_complete_but_fragmented_or_absent_biomes_never_get_fake_grou
         if seed == 1 {
             assert_eq!(
                 w.camps.iter().filter(|c| c.family.leader == 0x61f).count(),
-                2
+                1
             );
         }
         if seed == 42 {
@@ -159,7 +159,7 @@ fn royal_healing_and_mage_orbits_cannot_adopt_another_orc_camp() {
 }
 
 #[test]
-fn shield_orc_commander_heals_its_group_then_telegraphs_all_final_bursts_and_leaves_survivors() {
+fn shield_orc_commander_heals_its_group_but_only_the_key_fires_its_final_burst() {
     let mut d = directory(12351);
     let w = d.worlds.get_mut(&-3).unwrap();
     let key = member(w, 0x900);
@@ -202,12 +202,12 @@ fn shield_orc_commander_heals_its_group_then_telegraphs_all_final_bursts_and_lea
     w.npc_step();
     assert_eq!(
         w.bullets.iter().filter(|b| ids.contains(&b.owner)).count() - before,
-        40
+        10
     );
     w.npc_step();
     assert_eq!(
         w.bullets.iter().filter(|b| ids.contains(&b.owner)).count() - before,
-        40
+        10
     );
     w.now = 1100;
     w.mechanic_expiry();
@@ -272,7 +272,7 @@ fn lesser_gods_own_reinforcement_not_their_nonreproducing_kings() {
 }
 
 #[test]
-fn nonreproducing_ogre_bands_use_melee_king_and_ranged_wizard_without_free_replacements() {
+fn nonreproducing_ogre_bands_keep_ranged_king_and_wizard_without_free_replacements() {
     let mut d = directory(12351);
     let w = d.worlds.get_mut(&-3).unwrap();
     let king = member(w, 0x645);
@@ -282,9 +282,9 @@ fn nonreproducing_ogre_bands_use_melee_king_and_ranged_wizard_without_free_repla
     assert_eq!(w.entities[&king].hp, 500);
     assert!(matches!(
         w.midland_movement(king, w.entities[&king].pos, 0).unwrap(),
-        (Motion::Chase { stop: 1., .. }, 12.)
+        (Motion::Maintain { distance: 8., .. }, 4.)
     ));
-    assert_eq!(encounter::phased_attacks(0x644, 300, 0., 0).len(), 3);
+    assert_eq!(encounter::phased_attacks(0x644, 300, 0., 0).len(), 1);
     let wizard = w.camp_member(king, 0x644).unwrap().unwrap();
     w.remove_entity(wizard);
     player(w, w.entities[&king].pos);

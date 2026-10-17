@@ -42,6 +42,31 @@ impl World {
         }
         Ok(gained)
     }
+    pub(super) fn escort_anchor(
+        &self,
+        id: i32,
+        kind: u16,
+    ) -> Result<Option<(i32, encounter::Anchor)>> {
+        let e = self.entities.get(&id).context("escort entity missing")?;
+        if let Some(parent) = e.parent {
+            let boss = self
+                .entities
+                .get(&parent)
+                .context("escort's owned boss disappeared")?;
+            ensure!(
+                boss.kind == kind,
+                "escort belongs to a different boss identity"
+            );
+            return Ok(Some((parent, encounter::Anchor::Parent)));
+        }
+        let mut bosses = self.entities.values().filter(|e| e.kind == kind);
+        let boss = bosses.next().map(|e| e.id);
+        ensure!(
+            bosses.next().is_none(),
+            "map-born escort has ambiguous boss ownership"
+        );
+        Ok(boss.map(|id| (id, encounter::Anchor::Kind(kind))))
+    }
     pub(super) fn orbit_anchor(
         &self,
         id: i32,
@@ -76,6 +101,17 @@ impl World {
                     .get(&leader)
                     .context("family leader is no longer alive")?
                     .pos)
+            }
+            encounter::Anchor::CampEntity(member) => {
+                let owner = self
+                    .entities
+                    .get(&member)
+                    .context("owned camp anchor absent")?;
+                ensure!(
+                    e.camp.is_some() && owner.camp == e.camp,
+                    "camp anchor ownership mismatch"
+                );
+                Ok(owner.pos)
             }
             encounter::Anchor::CampMember(kind) => Ok(self.entities[&self
                 .camp_member(id, kind)?
@@ -169,6 +205,9 @@ impl World {
             return self.finale_mechanics(id, target, elapsed);
         }
         let kind = self.entities[&id].kind;
+        if matches!(kind, 0xdaa | 0xdac) {
+            return Ok(());
+        }
         if matches!(kind, 0x62b | 0x900..=0x902) {
             return self.midland_mechanics(id);
         }
@@ -324,10 +363,15 @@ impl World {
                 self.entities.get_mut(&id).unwrap().expires = Some(self.now + 50);
             }
             0xdae => {
+                self.escort_anchor(id, 0xd90)?;
                 let allies: Vec<_> = self
                     .entities
                     .values()
-                    .filter(|e| (0xdaa..=0xdaf).contains(&e.kind) && pos.distance(e.pos) < 5.)
+                    .filter(|e| {
+                        (0xdaa..=0xdaf).contains(&e.kind)
+                            && pos.distance(e.pos) < 5.
+                            && e.parent == self.entities[&id].parent
+                    })
                     .map(|e| e.id)
                     .collect();
                 for ally in allies {

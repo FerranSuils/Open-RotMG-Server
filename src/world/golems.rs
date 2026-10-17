@@ -28,11 +28,12 @@ impl World {
             && let Some(hub) = self
                 .entities
                 .values()
-                .find(|x| x.camp == Some(camp) && matches!(x.kind, 0x6d2..=0x6d4))
+                .filter(|x| x.camp == Some(camp) && matches!(x.kind, 0x6d2..=0x6d4))
+                .min_by(|a, b| e.pos.distance(a.pos).total_cmp(&e.pos.distance(b.pos)))
         {
             return Ok((
                 Motion::StrictOrbit {
-                    anchor: Anchor::CampMember(hub.kind),
+                    anchor: Anchor::CampEntity(hub.id),
                     radius: 1.,
                 },
                 10.,
@@ -41,7 +42,7 @@ impl World {
         Ok(match root {
             Some(root) => (
                 Motion::StrictOrbit {
-                    anchor: Anchor::CampMember(root.kind),
+                    anchor: Anchor::CampEntity(root.id),
                     radius: 3.,
                 },
                 5.,

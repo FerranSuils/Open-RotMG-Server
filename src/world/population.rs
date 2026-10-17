@@ -56,7 +56,7 @@ pub(super) const FAMILIES: &[Family] = &[
     family!(@once 0x633,5; 0x6d2,1; 0x6d5,1; 0x6d6,1; 0x6d7,1),
     Family {
         leader: 0x62d,
-        terrain: 6,
+        terrain: 7,
         roles: &[
             Role {
                 kind: 0x62d,
@@ -90,9 +90,9 @@ pub(super) const FAMILIES: &[Family] = &[
             },
         ],
     },
-    family!(@once 0x62e,6; 0x6d2,1; 0x6d5,1; 0x6d6,1; 0x6d7,1),
-    family!(@once 0x62f,7; 0x6d2,1; 0x6d5,1; 0x6d6,1; 0x6d7,1),
-    family!(@once 0x631,7; 0x6d2,1; 0x6d5,1; 0x6d6,1; 0x6d7,1),
+    family!(@once 0x62e,7; 0x6d2,1; 0x6d5,1; 0x6d6,1; 0x6d7,1),
+    family!(@once 0x62f,6; 0x6d2,1; 0x6d5,1; 0x6d6,1; 0x6d7,1),
+    family!(@once 0x631,6; 0x6d2,1; 0x6d5,1; 0x6d6,1; 0x6d7,1),
 ];
 pub(super) struct Camp {
     pub start: usize,

@@ -21,7 +21,7 @@ pub(crate) struct Attack {
     pub count: usize,
     pub gap: f32,
     pub offset: f32,
-    pub interval: u64,
+    pub interval: Option<u64>,
     pub delay: u64,
     pub range: f32,
     pub predict: Prediction,
@@ -38,7 +38,7 @@ impl Attack {
             count,
             gap: gap.to_radians(),
             offset: 0.,
-            interval,
+            interval: Some(interval),
             delay: 0,
             range,
             predict: Prediction::None,
@@ -73,6 +73,10 @@ impl Attack {
     }
     fn fixed(mut self, angle: f32) -> Self {
         self.aim = Aim::Fixed(angle);
+        self
+    }
+    fn once(mut self) -> Self {
+        self.interval = None;
         self
     }
     fn enabled(mut self, enabled: bool) -> Self {
@@ -112,7 +116,12 @@ impl Schedule {
         self.attacks
             .iter()
             .filter(|a| {
-                a.enabled && self.age >= a.delay && (self.age - a.delay).is_multiple_of(a.interval)
+                a.enabled
+                    && self.age >= a.delay
+                    && match a.interval {
+                        Some(ms) => (self.age - a.delay).is_multiple_of(ms),
+                        None => self.age == a.delay,
+                    }
             })
             .flat_map(|a| match a.action {
                 Action::Shoot { projectile, .. } => a.shots(projectile, heading),
@@ -372,16 +381,179 @@ pub(crate) fn schedule(kind: u16, hp: i32, elapsed: u64) -> Option<Schedule> {
     })
 }
 
+pub(crate) fn armor_schedule(stage: u64, age: u64) -> Schedule {
+    let attacks = match stage {
+        0 => vec![],
+        1 => vec![Attack::fan(0, 2, 15., 600, 10.)],
+        2 => vec![Attack::fan(0, 6, 60., 200, 10.)],
+        _ => panic!("invalid Suit of Armor phase"),
+    };
+    Schedule {
+        state: stage,
+        age,
+        attacks,
+    }
+}
+pub(crate) fn endgame_schedule(kind: u16, hp: i32, max_hp: i32, elapsed: u64) -> Option<Schedule> {
+    use crate::endgame::{ORYX, OryxPhase, oryx_phase};
+    let fan = Attack::fan;
+    let ring = Attack::ring;
+    let mut state = 0;
+    let mut age = elapsed;
+    let attacks = match kind {
+        0x668 => vec![
+            fan(0, 5, 5., 1000, 10.).predict(1.),
+            fan(1, 1, 0., 500, 10.),
+        ],
+        0x66a | 0x66b => vec![fan(0, 3, 5., 1000, 10.).predict(0.5)],
+        0xd7e => {
+            return Some(armor_schedule(
+                if hp == max_hp {
+                    0
+                } else if hp < max_hp / 5 {
+                    2
+                } else {
+                    1
+                },
+                elapsed,
+            ));
+        }
+        0xd82 => {
+            state = elapsed / 9000 * 2 + u64::from(elapsed % 9000 >= 5000);
+            if elapsed % 9000 < 5000 {
+                age = elapsed % 9000;
+                vec![ring(1, 5, 1000, 10.)]
+            } else {
+                age = elapsed % 9000 - 5000;
+                vec![
+                    ring(1, 5, 1000, 10.),
+                    ring(2, 5, 750, 10.),
+                    fan(0, 3, 10., 300, 10.),
+                ]
+            }
+        }
+        0xd83 => {
+            state = elapsed / 7500 * 2 + u64::from(elapsed % 7500 >= 5000);
+            if elapsed % 7500 < 5000 {
+                age = elapsed % 7500;
+                vec![fan(0, 3, 20., 350, 10.)]
+            } else {
+                age = elapsed % 7500 - 5000;
+                vec![
+                    fan(0, 1, 0., 50, 10.),
+                    fan(1, 1, 0., 1000, 10.),
+                    fan(2, 1, 0., 450, 10.),
+                ]
+            }
+        }
+        0x1748 => vec![ring(0, 12, 700, 50.).delay(200)],
+        0x174a if elapsed >= 10000 => {
+            state = 1;
+            age = elapsed - 10000;
+            vec![fan(0, 1, 0., 700, 3.)]
+        }
+        0x174a | 0x174b => vec![fan(0, 3, 10., 1000, 25.)],
+        0x944 => vec![
+            fan(0, 1, 0., 1500, 8.).chance(1.),
+            fan(1, 3, 20., 1500, 8.).delay(500),
+        ],
+        ORYX if hp <= max_hp / 5 => {
+            state = u64::MAX;
+            vec![
+                fan(1, 2, 10., 1500, 7.).delay(2000),
+                fan(16, 5, 10., 1500, 7.).delay(2000),
+            ]
+        }
+        ORYX => {
+            let phase = oryx_phase(elapsed);
+            if phase != OryxPhase::Opening {
+                let t = (elapsed - 20000) % 85000;
+                let (index, start) = match phase {
+                    OryxPhase::Dance => (1, 0),
+                    OryxPhase::Artifacts => (2, 25000),
+                    OryxPhase::Gaze => (3, 50000),
+                    OryxPhase::DanceTwo => (4, 60000),
+                    _ => unreachable!(),
+                };
+                state = (elapsed - 20000) / 85000 * 4 + index;
+                age = t - start;
+            }
+            match phase {
+                OryxPhase::Opening => vec![fan(5, 4, 10., 1000, 25.)],
+                OryxPhase::Dance => vec![ring(6, 8, 700, 50.).delay(200)],
+                OryxPhase::Artifacts => vec![
+                    ring(7, 10, 500, 50.).delay(200),
+                    ring(9, 3, 1500, 50.).delay(200),
+                    ring(8, 10, 2000, 50.).delay(200),
+                ],
+                OryxPhase::Gaze => vec![fan(1, 2, 10., 1000, 7.).delay(800)],
+                OryxPhase::DanceTwo => vec![
+                    ring(8, 4, 200, 0.)
+                        .fixed([0f32, 30., 15., 45.][(age / 200 % 4) as usize].to_radians()),
+                ],
+                _ => unreachable!(),
+            }
+        }
+        _ => return None,
+    };
+    Some(Schedule {
+        state,
+        age,
+        attacks,
+    })
+}
+pub(crate) fn oryx2_schedule(phase: crate::endgame::OryxPhase, age: u64) -> Schedule {
+    use crate::endgame::OryxPhase;
+    let fan = Attack::fan;
+    if phase == OryxPhase::PrepareRage {
+        return Schedule {
+            state: 1,
+            age,
+            attacks: vec![
+                fan(13, 1, 0., 4000, 0.).fixed(0.).delay(4000),
+                fan(14, 1, 0., 4000, 0.)
+                    .fixed(30f32.to_radians())
+                    .delay(4000),
+            ],
+        };
+    }
+    assert!(
+        matches!(phase, OryxPhase::Opening | OryxPhase::Rage),
+        "invalid Oryx2 attack phase"
+    );
+    let mut attacks = vec![Attack::ring(0, 8, 1500, 25.)];
+    attacks.extend(
+        [(1, 3), (2, 3), (3, 2), (4, 3), (5, 2), (6, 3)]
+            .into_iter()
+            .map(|(index, n)| fan(index, n, 10., 1000, 25.)),
+    );
+    if phase == OryxPhase::Rage {
+        attacks.push(fan(13, 1, 0., 50, 25.).delay(8000).once());
+        attacks.push(fan(14, 1, 0., 50, 25.).delay(8500).once());
+    }
+    Schedule {
+        state: if phase == OryxPhase::Rage { 2 } else { 0 },
+        age,
+        attacks,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Deadline {
+    Unarmed,
+    At(u64),
+    Finished,
+}
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Clocks {
     state: Option<u64>,
-    deadlines: Vec<Option<u64>>,
+    deadlines: Vec<Deadline>,
 }
 impl Clocks {
     pub fn due(&mut self, schedule: &Schedule, now: u64) -> Vec<usize> {
         if self.state != Some(schedule.state) {
             self.state = Some(schedule.state);
-            self.deadlines = vec![None; schedule.attacks.len()];
+            self.deadlines = vec![Deadline::Unarmed; schedule.attacks.len()];
         }
         assert_eq!(
             self.deadlines.len(),
@@ -394,21 +566,35 @@ impl Clocks {
             .filter_map(|(i, deadline)| {
                 let attack = schedule.attacks[i];
                 if !attack.enabled {
-                    *deadline = None;
+                    *deadline = Deadline::Unarmed;
                     return None;
                 }
-                let deadline = deadline.get_or_insert(now + attack.delay);
-                if now < *deadline {
+                if matches!(deadline, Deadline::Unarmed) {
+                    *deadline = Deadline::At(
+                        now.checked_sub(schedule.age)
+                            .expect("attack phase age exceeds world time")
+                            + attack.delay,
+                    );
+                }
+                let Deadline::At(at) = *deadline else {
+                    return None;
+                };
+                if now < at {
                     return None;
                 }
-                *deadline = now + attack.interval;
+                *deadline = match attack.interval {
+                    Some(ms) => Deadline::At(now + ms),
+                    None => Deadline::Finished,
+                };
                 Some(i)
             })
             .collect()
     }
     pub fn suspend(&mut self, delta: u64) {
-        for deadline in self.deadlines.iter_mut().flatten() {
-            *deadline += delta;
+        for clock in &mut self.deadlines {
+            if let Deadline::At(at) = clock {
+                *at += delta;
+            }
         }
     }
 }

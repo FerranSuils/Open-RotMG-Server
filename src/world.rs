@@ -16,6 +16,8 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 mod abilities;
+#[cfg(test)]
+mod audit_tests;
 pub(crate) mod chat;
 #[cfg(test)]
 mod client_contract_tests;
@@ -32,6 +34,7 @@ mod ground;
 #[cfg(test)]
 mod ground_tests;
 mod guilds;
+mod lair;
 mod midlands;
 #[cfg(test)]
 mod midlands_tests;
@@ -106,6 +109,13 @@ impl Pos {
         ((self.x - p.x).powi(2) + (self.y - p.y).powi(2)).sqrt()
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Following {
+    #[default]
+    Unknown,
+    Acquired,
+    Resting,
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct Entity {
     pub id: i32,
@@ -127,6 +137,8 @@ pub struct Entity {
     goal: Option<Pos>,
     #[serde(skip)]
     motion: Option<crate::encounter::Motion>,
+    #[serde(skip)]
+    following: Following,
     last_step: Pos,
     phase: f32,
     orbit: Option<realm_events::Orbit>,
@@ -1167,6 +1179,7 @@ impl World {
                         home: pos,
                         goal: None,
                         motion: None,
+                        following: Following::Unknown,
                         last_step: Pos { x: 0., y: 0. },
                         phase: 0.,
                         orbit: None,
@@ -1366,6 +1379,7 @@ impl World {
                 home: pos,
                 goal: None,
                 motion: None,
+                following: Following::Unknown,
                 last_step: Pos { x: 0., y: 0. },
                 phase: 0.,
                 orbit: None,
@@ -3414,7 +3428,9 @@ impl World {
             };
             let kind = entity.kind;
             let pos = entity.pos;
-            if kind == crate::dungeon::abyss::IDOL && entity.hp == self.content.objects[&kind].hp {
+            if entity.hp == self.content.objects[&kind].hp
+                && (kind == crate::dungeon::abyss::IDOL || kind == 0xd7e && entity.stage.is_none())
+            {
                 continue;
             }
             let profile = profile(kind).expect("validated encounter profile");
@@ -3451,7 +3467,8 @@ impl World {
                 0x609 | 0xd06 | crate::dungeon::abyss::MALPHAS => 11.,
                 0x617 | 0x61a | 0x6d8 => 12.,
                 0x91a => 7.,
-                0xd90 => 8.,
+                0xd90 | 0xd7e => 8.,
+                0xd82 | 0xd83 => 10.,
                 _ => 20.,
             };
             let radius = if entity.activated.is_some() {
@@ -3531,8 +3548,16 @@ impl World {
                         continue;
                     }
                 }
+            } else if matches!(kind, 0xdaa | 0xdac) {
+                match self.lair_escort_movement(id) {
+                    Ok(movement) => movement,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"Lair escort movement refused");
+                        continue;
+                    }
+                }
             } else if crate::endgame::ROSTER.contains(&kind) {
-                match self.finale_movement(id, elapsed) {
+                match self.finale_movement(id, target, elapsed) {
                     Ok(movement) => movement,
                     Err(error) => {
                         tracing::error!(entity=id,%error,"endgame movement refused");
@@ -3564,16 +3589,64 @@ impl World {
             let e = self.entities.get_mut(&id).unwrap();
             if e.motion != Some(motion) {
                 e.motion = Some(motion);
+                e.following = Following::Unknown;
                 e.goal = None;
                 if matches!(motion, Motion::Pace { .. }) {
                     e.phase = 1.;
                 }
                 tracing::debug!(entity = id, kind, ?motion, speed, "NPC movement entered");
             }
-            let goal = match motion {
+            let planned_motion = if flags & crate::condition::bit(crate::condition::PARALYZED) != 0
+            {
+                Motion::Stationary
+            } else {
+                motion
+            };
+            let goal = match planned_motion {
                 Motion::Stationary => {
                     speed = 0.;
                     Some(pos)
+                }
+                Motion::WanderHome { radius } => {
+                    let e = self.entities.get_mut(&id).unwrap();
+                    if e.goal.is_none_or(|p| {
+                        p.distance(e.pos) < 0.1 || p.distance(e.home) > radius + 0.01
+                    }) {
+                        let angle = self.rng.gen_range(0. ..std::f32::consts::TAU);
+                        let distance = self.rng.gen_range(0. ..radius);
+                        e.goal = Some(Pos {
+                            x: e.home.x + distance * angle.cos(),
+                            y: e.home.y + distance * angle.sin(),
+                        });
+                    }
+                    e.goal
+                }
+                Motion::Follow { sight, stop, .. } => {
+                    let e = self.entities.get_mut(&id).unwrap();
+                    if flags & crate::condition::bit(crate::condition::PARALYZED) != 0 {
+                        Some(pos)
+                    } else {
+                        let old = e.following;
+                        let target = target.filter(|p| pos.distance(*p) < sight);
+                        e.following = match target {
+                            None => Following::Unknown,
+                            Some(p)
+                                if pos.distance(p)
+                                    > stop + if old == Following::Resting { 1. } else { 0. } =>
+                            {
+                                Following::Acquired
+                            }
+                            Some(_) => Following::Resting,
+                        };
+                        if old != e.following {
+                            e.goal = None;
+                        }
+                        if e.following == Following::Acquired {
+                            target
+                        } else {
+                            None
+                        }
+                    }
                 }
                 Motion::Pace { distance } => {
                     let e = self.entities.get_mut(&id).unwrap();
@@ -3669,20 +3742,22 @@ impl World {
                         }
                         1.
                     };
-                    let angular_speed =
-                        if e.quest.is_some() || matches!(motion, Motion::StrictOrbit { .. }) {
-                            (if e.quest.is_some() {
-                                speed / 1.5
-                            } else {
-                                speed
-                            }) * if flags & crate::condition::bit(crate::condition::SLOWED) != 0 {
-                                0.5
-                            } else {
-                                1.
-                            }
+                    let angular_speed = if e.quest.is_some()
+                        || e.orbit.is_some()
+                        || matches!(motion, Motion::StrictOrbit { .. })
+                    {
+                        (if e.quest.is_some() || e.orbit.is_some() {
+                            speed / 1.5
                         } else {
                             speed
-                        };
+                        }) * if flags & crate::condition::bit(crate::condition::SLOWED) != 0 {
+                            0.5
+                        } else {
+                            1.
+                        }
+                    } else {
+                        speed
+                    };
                     if flags & crate::condition::bit(crate::condition::PARALYZED) == 0 {
                         e.phase = (e.phase + direction * angular_speed / radius * 0.05)
                             % std::f32::consts::TAU;
@@ -3727,6 +3802,7 @@ impl World {
                 let e = self.entities.get_mut(&id).unwrap();
                 speed = match motion {
                     Motion::Wander | Motion::Maintain { .. } => speed,
+                    Motion::Follow { idle, .. } => idle,
                     Motion::Chase { .. } if kind == 0x600 => 4.,
                     Motion::Chase { .. } if !(0x687..=0x689).contains(&kind) => 4.,
                     Motion::Protect { .. } => profile.speed,
@@ -3763,7 +3839,9 @@ impl World {
             } else if flags & crate::condition::bit(crate::condition::SLOWED) != 0 {
                 speed *= 0.5;
             }
-            self.entities.get_mut(&id).unwrap().goal = Some(goal);
+            if flags & crate::condition::bit(crate::condition::PARALYZED) == 0 {
+                self.entities.get_mut(&id).unwrap().goal = Some(goal);
+            }
             let distance = if matches!(motion, Motion::StrictOrbit { .. }) && speed > 0. {
                 pos.distance(goal)
             } else {
@@ -3776,16 +3854,17 @@ impl World {
                 tracing::debug!(entity=id,%error,"NPC movement blocked; retargeting");
             }
             let e = &self.entities[&id];
-            let mut schedule = (!burst)
-                .then(|| crate::encounter::attacks::schedule(kind, e.hp, elapsed))
-                .flatten();
-            if kind == 0xd06 && e.reaction_until > self.now {
-                schedule
-                    .as_mut()
-                    .expect("Limon attack schedule missing")
-                    .attacks[2]
-                    .enabled = true;
-            }
+            let schedule = if burst {
+                None
+            } else {
+                match self.npc_attack_schedule(id, elapsed) {
+                    Ok(schedule) => schedule,
+                    Err(error) => {
+                        tracing::error!(entity=id,kind,%error,"NPC attack schedule refused");
+                        continue;
+                    }
+                }
+            };
             if profile.interval == 0
                 || e.activated.is_none()
                 || (!burst

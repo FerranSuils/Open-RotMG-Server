@@ -21,6 +21,69 @@ impl World {
         }
         e.attacks.suspend(delta);
     }
+    pub(super) fn npc_attack_schedule(&self, id: i32, elapsed: u64) -> Result<Option<Schedule>> {
+        use crate::{
+            encounter::attacks,
+            endgame::{ORYX, ORYX2, OryxPhase},
+        };
+        let e = &self.entities[&id];
+        if e.kind == ORYX2 {
+            let brain = self
+                .finale
+                .bosses
+                .get(&id)
+                .context("activated Oryx2 brain missing")?;
+            let phase = brain.phase().context("activated Oryx2 phase missing")?;
+            let age = match phase {
+                OryxPhase::Opening => elapsed,
+                OryxPhase::PrepareRage => brain
+                    .rage_elapsed(elapsed)
+                    .context("rage preparation clock missing")?,
+                OryxPhase::Rage => brain
+                    .rage_elapsed(elapsed)
+                    .context("rage clock missing")?
+                    .checked_sub(10000)
+                    .context("rage began before protected preparation completed")?,
+                _ => bail!("invalid Oryx2 phase"),
+            };
+            return Ok(Some(attacks::oryx2_schedule(phase, age)));
+        }
+        if e.kind == 0xd7e {
+            let stage = e.stage.context("activated Suit of Armor phase missing")?;
+            let age = if stage == 2 {
+                self.now - (e.reaction_until - 1500)
+            } else {
+                elapsed
+            };
+            return Ok(Some(attacks::armor_schedule(stage, age)));
+        }
+        let mut schedule = match attacks::schedule(e.kind, e.hp, elapsed) {
+            Some(schedule) => Some(schedule),
+            None => {
+                attacks::endgame_schedule(e.kind, e.hp, self.content.objects[&e.kind].hp, elapsed)
+            }
+        };
+        if e.kind == ORYX && e.hp <= self.content.objects[&e.kind].hp / 5 {
+            schedule
+                .as_mut()
+                .context("Oryx rage attack schedule missing")?
+                .age = self
+                .finale
+                .bosses
+                .get(&id)
+                .context("activated Oryx brain missing")?
+                .rage_elapsed(elapsed)
+                .context("Oryx rage entry clock missing")?;
+        }
+        if e.kind == 0xd06 && e.reaction_until > self.now {
+            schedule
+                .as_mut()
+                .context("Limon attack schedule missing")?
+                .attacks[2]
+                .enabled = true;
+        }
+        Ok(schedule)
+    }
     pub(super) fn legacy_enemy_shots(
         &self,
         id: i32,
@@ -117,7 +180,11 @@ impl World {
             tracing::trace!(
                 entity = id,
                 slot,
+                phase = schedule.state,
                 now = self.now,
+                interval = ?attack.interval,
+                delay = attack.delay,
+                range = attack.range,
                 "NPC weapon deadline fired"
             );
         }
