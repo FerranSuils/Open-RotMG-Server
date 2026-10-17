@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 
 mod account_actions;
 mod accounts;
+mod consumables;
 #[cfg(all(test, unix))]
 mod crash_tests;
 #[cfg(test)]
@@ -24,6 +25,7 @@ pub use guilds::{Guild, GuildAction, Membership as GuildMembership};
 #[cfg(test)]
 mod presentation_tests;
 mod purchases;
+mod resurrection;
 mod social;
 pub use purchases::Purchase;
 mod updates;
@@ -80,6 +82,12 @@ pub struct Character {
     pub schema: u8,
     pub class: u16,
     pub base: [i32; 8],
+    #[serde(default)]
+    pub tex1: u32,
+    #[serde(default)]
+    pub tex2: u32,
+    #[serde(default)]
+    pub pet_kind: Option<u16>,
     pub id: i32,
     pub account: i32,
     pub name: String,
@@ -234,6 +242,7 @@ pub struct Store {
     classes: std::sync::Arc<std::collections::BTreeMap<u16, Class>>,
     hashes: std::sync::Arc<tokio::sync::Semaphore>,
     dummy_hash: String,
+    dyes: std::sync::Arc<BTreeMap<u16, [Option<u32>; 2]>>,
 }
 pub(crate) fn decode_character(raw: &str, legacy_base: [i32; 8]) -> Result<Character> {
     let mut value: serde_json::Value = serde_json::from_str(raw)?;
@@ -433,6 +442,14 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             classes: std::sync::Arc::new(content.classes.clone()),
             hashes: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
             dummy_hash: accounts::hash("unknown-account")?,
+            dyes: std::sync::Arc::new(
+                content
+                    .objects
+                    .values()
+                    .filter(|item| item.class == "Dye" && item.activate == "Dye")
+                    .map(|item| (item.kind, item.textures))
+                    .collect(),
+            ),
         })
     }
     async fn call<T: Send + 'static>(
@@ -608,6 +625,9 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 schema: 1,
                 class: kind,
                 base,
+                tex1: 0,
+                tex2: 0,
+                pet_kind: None,
                 id: 0,
                 account,
                 name,
@@ -760,21 +780,27 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
     pub async fn consume_stat(
         &self,
         mut ch: Character,
-        slot: usize,
+        slot: Option<usize>,
         index: usize,
         amount: i32,
+        vault: Option<Vault>,
     ) -> Result<i32> {
-        let kind = match index {
-            2 => 0xa1f,
-            3 => 0xa20,
-            4 => 0xa21,
-            5 => 0xa4c,
-            6 => 0xa34,
-            7 => 0xa35,
+        let (kind, step) = match index {
+            0 => (0xae9, 5),
+            1 => (0xaea, 5),
+            2 => (0xa1f, 1),
+            3 => (0xa20, 1),
+            4 => (0xa21, 1),
+            5 => (0xa4c, 1),
+            6 => (0xa34, 1),
+            7 => (0xa35, 1),
             _ => anyhow::bail!("unsupported permanent potion stat"),
         };
         ensure!(
-            amount == 1 && slot < 12 && ch.items.len() == 12 && ch.items[slot] == kind,
+            amount > 0
+                && amount <= step
+                && ch.items.len() == 12
+                && slot.is_none_or(|slot| ch.items.get(slot) == Some(&kind)),
             "permanent potion ownership or activation mismatch"
         );
         let cap = self
@@ -783,12 +809,22 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             .context("unknown potion class")?
             .caps[index];
         ensure!(
-            ch.alive && ch.hp > 0 && ch.base[index] >= 0 && ch.base[index] < cap,
+            ch.alive
+                && ch.hp > 0
+                && ch.base[index] >= 0
+                && ch.base[index] < cap
+                && amount == (cap - ch.base[index]).min(step),
             "dead character or permanent stat already capped"
         );
         ensure!(
             ch.revision >= 0 && ch.revision < i32::MAX,
             "invalid potion revision"
+        );
+        ensure!(
+            vault
+                .as_ref()
+                .is_none_or(|v| slot.is_none() && v.account == ch.account),
+            "potion vault owner mismatch"
         );
         self.call(move |db| {
             let tx = db.transaction()?;
@@ -803,11 +839,17 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 && serde_json::from_str::<Vec<i32>>(&items)? == ch.items,
                 "permanent potion reservation changed");
             ch.base[index] += amount;
-            ch.items[slot] = -1;
+            if let Some(slot) = slot {
+                ch.items[slot] = -1;
+            }
             ch.revision += 1;
             let n = tx.execute("UPDATE characters SET stats=?4,items=?5,revision=revision+1 WHERE id=?1 AND account=?2 AND revision=?3 AND alive=1",
                 params![ch.id, ch.account, ch.revision - 1, serde_json::to_string(&ch)?, serde_json::to_string(&ch.items)?])?;
             ensure!(n == 1, "permanent potion commit lost its reservation");
+            if let Some(vault) = vault {
+                let n = tx.execute("UPDATE vaults SET items=?3,revision=revision+1 WHERE account=?1 AND revision=?2", params![vault.account, vault.revision, serde_json::to_string(&vault.items)?])?;
+                ensure!(n == 1, "permanent potion vault conflict");
+            }
             tx.commit()?;
             Ok(ch.revision)
         }).await
@@ -845,7 +887,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
     pub async fn fame(&self, account: i32, id: i32) -> Result<String> {
         let legacy_base = self.legacy_base;
         // The legacy field is called CreatedOn, but the client labels it as the death date.
-        self.call(move|db|{let (snapshot,killer,died_at):(String,String,u64)=db.query_row("SELECT snapshot,killed_by,died_at FROM deaths JOIN characters ON characters.id=deaths.character WHERE characters.account=?1 AND deaths.character=?2",params![account,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;let c = decode_character(&snapshot, legacy_base)?;ensure!(died_at>0 && died_at<=8_640_000_000_000,"invalid recorded death time");Ok(format!("<Fame><Char id=\"{}\"><Account><Name>{}</Name></Account><ObjectType>{}</ObjectType><Level>{}</Level><Tex1>0</Tex1><Tex2>0</Tex2></Char><CreatedOn>{}</CreatedOn><KilledBy>{}</KilledBy><TotalFame>{}</TotalFame><Shots>{}</Shots><ShotsThatDamage>{}</ShotsThatDamage><TilesUncovered>{}</TilesUncovered><MonsterKills>{}</MonsterKills><GodKills>0</GodKills><OryxKills>0</OryxKills><QuestsCompleted>{}</QuestsCompleted><PirateCavesCompleted>{}</PirateCavesCompleted><UndeadLairsCompleted>{}</UndeadLairsCompleted><AbyssOfDemonsCompleted>{}</AbyssOfDemonsCompleted><SnakePitsCompleted>{}</SnakePitsCompleted><SpiderDensCompleted>0</SpiderDensCompleted><SpriteWorldsCompleted>{}</SpriteWorldsCompleted><TombsCompleted>0</TombsCompleted><LevelUpAssists>0</LevelUpAssists><BaseFame>{}</BaseFame></Fame>",c.id,xml_escape(&c.name),c.class,c.level,died_at,xml_escape(&killer),c.fame,c.shots,c.hits,c.tiles,c.kills,c.quests,c.pirate_caves,c.dungeons[2],c.abysses,c.dungeons[0],c.dungeons[1],c.fame))}).await
+        self.call(move|db|{let (snapshot,killer,died_at):(String,String,u64)=db.query_row("SELECT snapshot,killed_by,died_at FROM deaths JOIN characters ON characters.id=deaths.character WHERE characters.account=?1 AND deaths.character=?2",params![account,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;let c = decode_character(&snapshot, legacy_base)?;ensure!(died_at>0 && died_at<=8_640_000_000_000,"invalid recorded death time");Ok(format!("<Fame><Char id=\"{}\"><Account><Name>{}</Name></Account><ObjectType>{}</ObjectType><Level>{}</Level><Tex1>{}</Tex1><Tex2>{}</Tex2></Char><CreatedOn>{}</CreatedOn><KilledBy>{}</KilledBy><TotalFame>{}</TotalFame><Shots>{}</Shots><ShotsThatDamage>{}</ShotsThatDamage><TilesUncovered>{}</TilesUncovered><MonsterKills>{}</MonsterKills><GodKills>0</GodKills><OryxKills>0</OryxKills><QuestsCompleted>{}</QuestsCompleted><PirateCavesCompleted>{}</PirateCavesCompleted><UndeadLairsCompleted>{}</UndeadLairsCompleted><AbyssOfDemonsCompleted>{}</AbyssOfDemonsCompleted><SnakePitsCompleted>{}</SnakePitsCompleted><SpiderDensCompleted>0</SpiderDensCompleted><SpriteWorldsCompleted>{}</SpriteWorldsCompleted><TombsCompleted>0</TombsCompleted><LevelUpAssists>0</LevelUpAssists><BaseFame>{}</BaseFame></Fame>",c.id,xml_escape(&c.name),c.class,c.level,c.tex1,c.tex2,died_at,xml_escape(&killer),c.fame,c.shots,c.hits,c.tiles,c.kills,c.quests,c.pirate_caves,c.dungeons[2],c.abysses,c.dungeons[0],c.dungeons[1],c.fame))}).await
     }
     #[cfg(test)]
     pub async fn rename(&self, account: i32, name: String) -> Result<()> {
@@ -937,12 +979,14 @@ impl Account {
         let mut chars = String::new();
         for c in &self.characters {
             chars += &format!(
-                "<Char id=\"{}\"><ObjectType>{}</ObjectType><Level>{}</Level><Exp>{}</Exp><CurrentFame>{}</CurrentFame><Tex1>0</Tex1><Tex2>0</Tex2><Equipment>{}</Equipment><MaxHitPoints>{}</MaxHitPoints><HitPoints>{}</HitPoints><MaxMagicPoints>{}</MaxMagicPoints><MagicPoints>{}</MagicPoints><Attack>{}</Attack><Defense>{}</Defense><Speed>{}</Speed><Dexterity>{}</Dexterity><HpRegen>{}</HpRegen><MpRegen>{}</MpRegen></Char>",
+                "<Char id=\"{}\"><ObjectType>{}</ObjectType><Level>{}</Level><Exp>{}</Exp><CurrentFame>{}</CurrentFame><Tex1>{}</Tex1><Tex2>{}</Tex2><Equipment>{}</Equipment><MaxHitPoints>{}</MaxHitPoints><HitPoints>{}</HitPoints><MaxMagicPoints>{}</MaxMagicPoints><MagicPoints>{}</MagicPoints><Attack>{}</Attack><Defense>{}</Defense><Speed>{}</Speed><Dexterity>{}</Dexterity><HpRegen>{}</HpRegen><MpRegen>{}</MpRegen></Char>",
                 c.id,
                 c.class,
                 c.level,
                 c.exp,
                 c.fame,
+                c.tex1,
+                c.tex2,
                 c.items
                     .iter()
                     .map(i32::to_string)
@@ -996,6 +1040,65 @@ impl Account {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn ground_stat_potions_preserve_backpacks_and_commit_vault_sources_atomically() {
+        let content = Content::load(Path::new("data")).unwrap();
+        let s = Store::open(Path::new(":memory:"), &content).unwrap();
+        let account = s.list("ground-stat-potion".into()).await.unwrap();
+        let mut ch = s
+            .create(account.id, content.get(WIZARD).unwrap())
+            .await
+            .unwrap();
+        let mut vault = s.vault(account.id).await.unwrap();
+        vault.items[0] = 0xa1f;
+        ch.revision = s
+            .exchange(
+                vec![InventoryWrite {
+                    id: ch.id,
+                    account: ch.account,
+                    revision: ch.revision,
+                    items: ch.items.clone(),
+                }],
+                Some(vault),
+            )
+            .await
+            .unwrap()[0];
+        let source = s.vault(account.id).await.unwrap();
+        let mut consumed = source.clone();
+        consumed.items[0] = -1;
+        let mut stale = consumed.clone();
+        stale.revision += 1;
+        assert!(
+            s.consume_stat(ch.clone(), None, 2, 1, Some(stale))
+                .await
+                .is_err()
+        );
+        let saved = s.load(account.id, ch.id).await.unwrap();
+        assert_eq!((saved.base, saved.revision), (ch.base, ch.revision));
+        assert_eq!(s.vault(account.id).await.unwrap().items, source.items);
+        let revision = s
+            .consume_stat(ch.clone(), None, 2, 1, Some(consumed.clone()))
+            .await
+            .unwrap();
+        assert!(
+            s.consume_stat(ch.clone(), None, 2, 1, Some(consumed))
+                .await
+                .is_err()
+        );
+        let saved = s.load(account.id, ch.id).await.unwrap();
+        assert_eq!(saved.items, ch.items);
+        assert_eq!(saved.base[2], ch.base[2] + 1);
+        assert_eq!(saved.revision, revision);
+        let after = s.vault(account.id).await.unwrap();
+        assert_eq!(after.items[0], -1);
+        assert_eq!(after.revision, source.revision + 1);
+        s.consume_stat(saved.clone(), None, 2, 1, None)
+            .await
+            .unwrap();
+        let ground = s.load(account.id, ch.id).await.unwrap();
+        assert_eq!(ground.items, saved.items);
+        assert_eq!(ground.base[2], saved.base[2] + 1);
+    }
+    #[tokio::test]
     async fn permanent_potions_commit_items_and_base_together_and_reject_replay() {
         let content = Content::load(Path::new("data")).unwrap();
         let s = Store::open(Path::new(":memory:"), &content).unwrap();
@@ -1026,11 +1129,22 @@ mod tests {
                 .await
                 .unwrap()[0];
             let before = ch.base;
-            let revision = s.consume_stat(ch.clone(), slot, index, 1).await.unwrap();
-            assert!(s.consume_stat(ch.clone(), slot, index, 1).await.is_err());
+            let revision = s
+                .consume_stat(ch.clone(), Some(slot), index, 1, None)
+                .await
+                .unwrap();
+            assert!(
+                s.consume_stat(ch.clone(), Some(slot), index, 1, None)
+                    .await
+                    .is_err()
+            );
             let mut foreign = ch.clone();
             foreign.account += 1;
-            assert!(s.consume_stat(foreign, slot, index, 1).await.is_err());
+            assert!(
+                s.consume_stat(foreign, Some(slot), index, 1, None)
+                    .await
+                    .is_err()
+            );
             ch = s.load(ch.account, ch.id).await.unwrap();
             assert_eq!(ch.revision, revision);
             assert_eq!(ch.items[slot], -1);
@@ -1054,8 +1168,16 @@ mod tests {
             )
             .await
             .unwrap()[0];
-        assert!(s.consume_stat(ch.clone(), 4, 4, 1).await.is_err());
-        assert!(s.consume_stat(ch.clone(), 4, 4, 2).await.is_err());
+        assert!(
+            s.consume_stat(ch.clone(), Some(4), 4, 1, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            s.consume_stat(ch.clone(), Some(4), 4, 2, None)
+                .await
+                .is_err()
+        );
         let saved = s.load(ch.account, ch.id).await.unwrap();
         assert_eq!(
             (saved.base[4], saved.items[4], saved.revision),
@@ -1065,7 +1187,7 @@ mod tests {
         dead.alive = false;
         dead.hp = 0;
         s.death(dead, "potion regression".into()).await.unwrap();
-        assert!(s.consume_stat(ch, 4, 4, 1).await.is_err());
+        assert!(s.consume_stat(ch, Some(4), 4, 1, None).await.is_err());
     }
     #[tokio::test]
     async fn permanent_potion_conflicts_with_trade_and_vault_without_duplication() {
@@ -1122,11 +1244,17 @@ mod tests {
                         None
                     };
                     if potion_first {
-                        s.consume_stat(source.clone(), 4, index, 1).await.unwrap();
+                        s.consume_stat(source.clone(), Some(4), index, 1, None)
+                            .await
+                            .unwrap();
                         assert!(s.exchange(writes, vault).await.is_err());
                     } else {
                         s.exchange(writes, vault).await.unwrap();
-                        assert!(s.consume_stat(source.clone(), 4, index, 1).await.is_err());
+                        assert!(
+                            s.consume_stat(source.clone(), Some(4), index, 1, None)
+                                .await
+                                .is_err()
+                        );
                     }
                     let saved = s.load(owner.id, source.id).await.unwrap();
                     let other = s.load(recipient.id, target.id).await.unwrap();

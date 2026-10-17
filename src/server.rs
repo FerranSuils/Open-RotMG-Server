@@ -5,6 +5,8 @@ mod input;
 mod purchase_tests;
 #[cfg(test)]
 mod queue_tests;
+#[cfg(test)]
+mod resurrection_tests;
 use crate::{
     content::{Content, WIZARD},
     crypto::Keys,
@@ -162,6 +164,7 @@ pub struct App {
     pub behind_proxy: bool,
     pub shore_bots: bool,
     pub dialogue: Option<Arc<crate::bots::dialogue::Service>>,
+    pub society: Arc<Mutex<crate::bots::adventures::Society>>,
     pub requests: Arc<Mutex<HashMap<IpAddr, (std::time::Instant, u32)>>>,
     pub connections: Arc<tokio::sync::Semaphore>,
     pub control: Option<String>,
@@ -543,9 +546,44 @@ pub(crate) async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
             .await;
     }
     let plan = a.world.directory(move |d| d.stage_unlock(plan)).await?;
-    let result = if let Some((snapshot, slot, index, amount)) = &plan.stat_growth {
+    let result = if let Some(pet) = plan.companion.as_ref().filter(|pet| pet.permanent) {
         a.store
-            .consume_stat(snapshot.clone(), slot.slot, *index, *amount)
+            .select_companion(
+                InventoryWrite {
+                    id: plan.character,
+                    account: plan.account,
+                    revision: plan.revision,
+                    items: plan.items.clone(),
+                },
+                pet.source.slot,
+                u16::try_from(pet.source.kind)?,
+                pet.selected,
+                a.content.clone(),
+            )
+            .await
+    } else if let Some((slot, tex1, tex2)) = plan.appearance {
+        a.store
+            .consume_dye(
+                InventoryWrite {
+                    id: plan.character,
+                    account: plan.account,
+                    revision: plan.revision,
+                    items: plan.items.clone(),
+                },
+                slot.slot,
+                u16::try_from(slot.kind)?,
+                [tex1, tex2],
+            )
+            .await
+    } else if let Some((snapshot, slot, index, amount)) = &plan.stat_growth {
+        a.store
+            .consume_stat(
+                snapshot.clone(),
+                (slot.object == plan.player).then_some(slot.slot),
+                *index,
+                *amount,
+                plan.vault.clone(),
+            )
             .await
     } else {
         a.store
@@ -569,6 +607,41 @@ pub(crate) async fn persist(a: &App, plan: InventoryPlan) -> Result<()> {
     a.world
         .directory(move |d| d.finish_inventory(plan, result))
         .await
+}
+async fn persist_death(
+    a: &App,
+    id: i32,
+    ch: crate::store::Character,
+    killer: String,
+) -> Result<()> {
+    let slot = ch
+        .items
+        .iter()
+        .take(4)
+        .position(|kind| *kind >= 0 && a.content.objects[&(*kind as u16)].resurrects);
+    if let Some(slot) = slot {
+        let result = a
+            .store
+            .resurrect(ch, slot, a.content.clone())
+            .await
+            .context("resurrection persistence failed");
+        a.world
+            .directory(move |d| d.finish_resurrection(id, result))
+            .await
+    } else {
+        let result = a
+            .store
+            .death(ch, killer)
+            .await
+            .context("death persistence failed");
+        a.world
+            .for_player(id)
+            .call(move |w| {
+                w.committed(id, result)?;
+                w.finish_death(id)
+            })
+            .await
+    }
 }
 async fn persist_trade(a: &App, plan: TradePlan) -> Result<()> {
     let id = plan.plans[0].player;
@@ -662,32 +735,28 @@ async fn handle(
         reconnecting,
         diagnostics,
     } = session;
-    if *reconnecting
-        && matches!(
-            packet.id,
-            7 | 14 | 16 | 22 | 24 | 38 | 42 | 51 | 59 | 66 | 76
-        )
-    {
+    if *reconnecting {
         tracing::debug!(
             packet = packet.id,
             "discarded in-flight input after durable departure"
         );
         return Ok(());
     }
-    ensure!(!*reconnecting, "session is transferring");
+    // Resurrection is alive again, but its old scene must stay inert until the owned RECONNECT.
     if let Some(id) = *player
-        && matches!(packet.id, 7 | 38 | 30 | 65 | 33 | 42 | 3)
         && a.world
             .call(move |w| {
                 let p = w.players.get(&id).context("player missing")?;
-                Ok(p.death_pending || !p.character.alive)
+                Ok(p.native_transferring()
+                    || matches!(packet.id, 7 | 38 | 30 | 65 | 33 | 42 | 3)
+                        && (p.death_pending || !p.character.alive))
             })
             .await?
     {
         tracing::debug!(
             player = id,
             packet = packet.id,
-            "ignored queued command from dying character"
+            "ignored queued command from dying or transferring character"
         );
         return Ok(());
     }
@@ -920,6 +989,10 @@ async fn handle(
         }
         wire::PLAYER_TEXT => {
             let text = player_text(&mut r)?;
+            if text.trim().eq_ignore_ascii_case("/tutorial") {
+                crate::world::validate_chat(&text)?;
+                return reconnect(a, session, tx, Reconnect::Tutorial, received).await;
+            }
             if let Some((kind, name)) = guilds::chat_command(&text) {
                 let id = player.context("guild command before character")?;
                 let mut body = Writer::new();
@@ -1276,7 +1349,7 @@ async fn handle(
             let _guild = a.guild_actions.lock().await;
             let portal = if packet.id == 3 { Some(r.i32()?) } else { None };
             r.done()?;
-            let id = player.context("transfer before character")?;
+            player.context("transfer before character")?;
             let guild_portal = a
                 .world
                 .call(move |w| {
@@ -1292,55 +1365,7 @@ async fn handle(
                     .await?;
                 a.world.directory(move |d| d.guild_instance(guild)).await?;
             }
-            let transfer = a
-                .world
-                .directory(move |d| {
-                    if portal.is_none() && d.location(id)? == -2 {
-                        tracing::debug!(
-                            player = id,
-                            "redundant Nexus escape acknowledged without transfer"
-                        );
-                        return Ok(None);
-                    }
-                    let (account, character, destination) = d.destination(id, portal)?;
-                    let world = &d.worlds[&destination];
-                    if world.players.len() >= world.max_players {
-                        let message = crate::world::chat_info("Destination is full.");
-                        crate::world::send(
-                            &d.worlds[&d.location(id)?].players[&id],
-                            message.id,
-                            message.body,
-                        );
-                        return Ok(None);
-                    }
-                    let (keytime, key, name) = d.issue(account, character, destination)?;
-                    Ok(Some((destination, keytime, key, name)))
-                })
-                .await?;
-            let Some((destination, keytime, key, name)) = transfer else {
-                return Ok(());
-            };
-            depart(a, id).await?;
-            *player = None;
-            let mut o = Writer::new();
-            o.utf(&name)
-                .utf("")
-                .i32(2050)
-                .i32(destination)
-                .i32(keytime)
-                .i16(key.len() as i16);
-            o.0.extend(key);
-            enqueue_reply(tx, Packet { id: 39, body: o.0 })?;
-            *reconnecting = true;
-            account
-                .take()
-                .context("transfer ownership missing")?
-                .release();
-            tracing::info!(
-                player = id,
-                destination,
-                "durable departure acknowledged; reconnect queued"
-            );
+            reconnect(a, session, tx, Reconnect::Portal(portal), received).await?;
         }
         _ => bail!(
             "packet {} is not implemented in this development build",
@@ -1349,6 +1374,82 @@ async fn handle(
     }
     Ok(())
 }
+
+enum Reconnect {
+    Portal(Option<i32>),
+    Tutorial,
+}
+
+async fn reconnect(
+    a: &App,
+    session: &mut Session,
+    tx: &mpsc::Sender<Packet>,
+    request: Reconnect,
+    received: std::time::Instant,
+) -> Result<()> {
+    let id = session.player.context("transfer before character")?;
+    let transfer = a
+        .world
+        .directory(move |d| {
+            let (account, character, destination) = match request {
+                Reconnect::Tutorial => {
+                    d.chat_permit(id, received)?;
+                    let p = &d.worlds[&d.location(id)?].players[&id];
+                    (p.character.account, p.character.id, d.initial(-1)?)
+                }
+                Reconnect::Portal(portal) => {
+                    if portal.is_none() && d.location(id)? == -2 {
+                        tracing::debug!(
+                            player = id,
+                            "redundant Nexus escape acknowledged without transfer"
+                        );
+                        return Ok(None);
+                    }
+                    d.destination(id, portal)?
+                }
+            };
+            let world = &d.worlds[&destination];
+            if world.players.len() >= world.max_players {
+                let message = crate::world::chat_info("Destination is full.");
+                crate::world::send(
+                    &d.worlds[&d.location(id)?].players[&id],
+                    message.id,
+                    message.body,
+                );
+                return Ok(None);
+            }
+            let (keytime, key, name) = d.issue(account, character, destination)?;
+            Ok(Some((destination, keytime, key, name)))
+        })
+        .await?;
+    let Some((destination, keytime, key, name)) = transfer else {
+        return Ok(());
+    };
+    depart(a, id).await?;
+    session.player = None;
+    let mut o = Writer::new();
+    o.utf(&name)
+        .utf("")
+        .i32(2050)
+        .i32(destination)
+        .i32(keytime)
+        .i16(key.len() as i16);
+    o.0.extend(key);
+    enqueue_reply(tx, Packet { id: 39, body: o.0 })?;
+    session.reconnecting = true;
+    session
+        .account
+        .take()
+        .context("transfer ownership missing")?
+        .release();
+    tracing::info!(
+        player = id,
+        destination,
+        "durable departure acknowledged; reconnect queued"
+    );
+    Ok(())
+}
+
 async fn connection(
     socket: WebSocket,
     a: App,
@@ -1802,20 +1903,7 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
                 }
                 let pending = deaths.world.collect(World::pending_deaths).await?;
                 for (id, ch, killer) in pending {
-                    let result = deaths
-                        .store
-                        .death(ch, killer)
-                        .await
-                        .context("death persistence failed");
-                    if let Err(error) = deaths
-                        .world
-                        .for_player(id)
-                        .call(move |w| {
-                            w.committed(id, result)?;
-                            w.finish_death(id)
-                        })
-                        .await
-                    {
+                    if let Err(error) = persist_death(&deaths, id, ch, killer).await {
                         tracing::error!(player=id,error=%format_args!("{error:#}"),"death completion failed");
                     }
                 }

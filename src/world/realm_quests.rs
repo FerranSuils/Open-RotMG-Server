@@ -37,8 +37,7 @@ impl World {
     }
     pub(super) fn quest_members(&self, id: i32, kinds: &[u16]) -> Vec<i32> {
         let tag = self.entities[&id].quest.expect("named quest membership");
-        self.entities
-            .values()
+        self.actors()
             .filter(|e| e.quest == Some(tag) && kinds.contains(&e.kind))
             .map(|e| e.id)
             .collect()
@@ -123,15 +122,10 @@ impl World {
     ) -> Result<()> {
         crate::encounter::validate(&self.content, kind)?;
         let (tag, home, center) = owner;
-        let own = self
-            .entities
-            .values()
-            .filter(|e| e.quest == Some(tag))
-            .count()
-            + self.pending_named(tag, None);
+        let own =
+            self.actors().filter(|e| e.quest == Some(tag)).count() + self.pending_named(tag, None);
         let live = self
-            .entities
-            .values()
+            .actors()
             .filter(|e| e.quest == Some(tag) && e.kind == kind)
             .count()
             + self.pending_named(tag, Some(kind));
@@ -150,8 +144,7 @@ impl World {
             return Ok(());
         }
         ensure!(
-            self.entities
-                .values()
+            self.actors()
                 .filter(|e| e.parent.is_some() || e.quest.is_some())
                 .count()
                 + self.named_births.len()

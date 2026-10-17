@@ -559,7 +559,7 @@ mod tests {
     }
     #[test]
     fn replenishing_boss_waves_never_refresh_existing_child_lifetimes() {
-        let d = super::super::tests::directory();
+        let mut d = super::super::tests::directory();
         let mut w = d
             .make(finale::CHAMBER, "Oryx's Chamber", false, None)
             .unwrap();
@@ -602,11 +602,13 @@ mod tests {
     }
     #[test]
     fn oryx_minion_wanders_and_fires_both_xml_volleys_only_at_close_range() {
-        let d = super::super::tests::directory();
+        let mut d = super::super::tests::directory();
         let mut w = d
             .make(finale::CHAMBER, "Oryx's Chamber", false, None)
             .unwrap();
-        w.entities.clear();
+        for id in w.entities.keys().copied().collect::<Vec<_>>() {
+            w.remove_entity(id);
+        }
         let id = player(&mut w, Pos { x: 60., y: 50. });
         let minion = w
             .spawn_entity(0x1749, Pos { x: 60., y: 56. }, vec![])
@@ -702,7 +704,7 @@ mod tests {
             .unwrap()
             .id;
         assert!(d.worlds[&50].entities[&portal].published);
-        let chamber = d.portals[&portal].destination;
+        let chamber = d.portals[&portal].destination.unwrap();
         for _ in 0..3 {
             d.step();
         }
@@ -727,7 +729,7 @@ mod tests {
     }
     #[test]
     fn actor_oryx_phases_spawn_bounded_parented_fields_and_cellar_rage_waits_ten_seconds() {
-        let d = super::super::tests::directory();
+        let mut d = super::super::tests::directory();
         let mut w = d
             .make(finale::CHAMBER, "Oryx's Chamber", false, None)
             .unwrap();
@@ -827,7 +829,7 @@ mod tests {
     }
     #[test]
     fn oryx_dance_preserves_all_ring_shots_without_overflowing_native_output() {
-        let d = super::super::tests::directory();
+        let mut d = super::super::tests::directory();
         let mut w = d
             .make(finale::CHAMBER, "Oryx's Chamber", false, None)
             .unwrap();
@@ -893,7 +895,7 @@ mod tests {
     }
     #[test]
     fn authored_castle_summoners_can_place_each_complete_bounded_family() {
-        let d = super::super::tests::directory();
+        let mut d = super::super::tests::directory();
         let mut w = d
             .make(finale::CASTLE, "Oryx's Castle", false, None)
             .unwrap();

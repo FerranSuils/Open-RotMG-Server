@@ -9,9 +9,6 @@ mod dungeon;
 mod encounter;
 mod endgame;
 mod loot;
-#[cfg(test)]
-#[path = "../examples/testing/prepared-state.rs"]
-mod prepared_state_example;
 mod quest;
 mod server;
 mod store;
@@ -139,6 +136,7 @@ async fn main() -> Result<()> {
         behind_proxy: config.behind_proxy,
         shore_bots: config.shore_bots,
         dialogue,
+        society: Arc::default(),
         requests: Arc::default(),
         connections: Arc::new(tokio::sync::Semaphore::new(config.max_players * 2)),
         control,
