@@ -28,7 +28,13 @@ impl World {
         }
         Ok(())
     }
-    pub(super) fn finale_mechanics(&mut self, id: i32, target: Pos, elapsed: u64) -> Result<()> {
+    pub(super) fn finale_mechanics(
+        &mut self,
+        id: i32,
+        target: impl Into<Option<Pos>>,
+        elapsed: u64,
+    ) -> Result<()> {
+        let target = target.into();
         let e = &self.entities[&id];
         let (kind, hp, pos) = (e.kind, e.hp, e.pos);
         if GUARDIANS.contains(&kind) {
@@ -38,7 +44,7 @@ impl World {
                 .any(|e| e.id != id && GUARDIANS.contains(&e.kind) && e.hp > 0);
             let idle = peer
                 && self.entities[&id].stage.is_none_or(|s| s == 0)
-                && pos.distance(target) > 10.;
+                && target.is_none_or(|p| pos.distance(p) > 10.);
             let facts = if idle {
                 None
             } else {
@@ -133,12 +139,13 @@ impl World {
             self.finale_wave(id, *wave)?;
         }
         match kind {
-            ORYX if matches!(
-                self.finale.bosses[&id].phase(),
-                Some(OryxPhase::Artifacts | OryxPhase::Rage)
-            ) =>
+            ORYX if target.is_some()
+                && matches!(
+                    self.finale.bosses[&id].phase(),
+                    Some(OryxPhase::Artifacts | OryxPhase::Rage)
+                ) =>
             {
-                self.throw_grenade(id, target, 4., 120)?
+                self.throw_grenade(id, target.unwrap(), 4., 120)?
             }
             ORYX2 if self.finale.bosses[&id].phase() == Some(OryxPhase::Rage) => self.finale_wave(
                 id,
@@ -149,7 +156,7 @@ impl World {
                     lifetime: 10_000,
                 },
             )?,
-            0xde2 if pos.distance(target) < 2. => {
+            0xde2 if target.is_some_and(|p| pos.distance(p) < 2.) => {
                 self.area_damage(
                     kind,
                     pos,
@@ -158,7 +165,9 @@ impl World {
                 )?;
                 self.entities.get_mut(&id).unwrap().expires = Some(self.now + 50);
             }
-            0xdf1 if pos.distance(target) < 2. => self.area_damage(kind, pos, 2., 40)?,
+            0xdf1 if target.is_some_and(|p| pos.distance(p) < 2.) => {
+                self.area_damage(kind, pos, 2., 40)?
+            }
             _ => {}
         }
         Ok(())

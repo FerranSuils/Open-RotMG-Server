@@ -2,7 +2,6 @@ use super::*;
 use crate::{condition, encounter};
 
 pub(super) struct Grenade {
-    owner: i32,
     kind: u16,
     position: Pos,
     radius: f32,
@@ -47,11 +46,13 @@ impl World {
         &self,
         id: i32,
         anchor: encounter::Anchor,
-        player: Pos,
+        player: impl Into<Option<Pos>>,
     ) -> Result<Pos> {
         let e = self.entities.get(&id).context("orbiting entity missing")?;
         match anchor {
-            encounter::Anchor::Player => Ok(player),
+            encounter::Anchor::Player => player
+                .into()
+                .context("player-relative movement lacks a visible target"),
             encounter::Anchor::QuestMember(kind) => {
                 let tag = e.quest.context("quest anchor lacks encounter ownership")?;
                 self.entities
@@ -151,7 +152,13 @@ impl World {
         Ok(())
     }
 
-    pub(super) fn encounter_mechanics(&mut self, id: i32, target: Pos, elapsed: u64) -> Result<()> {
+    pub(super) fn encounter_mechanics(
+        &mut self,
+        id: i32,
+        target: impl Into<Option<Pos>>,
+        elapsed: u64,
+    ) -> Result<()> {
+        let target = target.into();
         if crate::dungeon::abyss::ROSTER.contains(&self.entities[&id].kind) {
             return self.abyss_mechanics(id, target, elapsed);
         }
@@ -172,10 +179,36 @@ impl World {
         let (kind, hp, pos, home) = (e.kind, e.hp, e.pos, e.home);
         let stage = encounter::stage(kind, hp, elapsed);
         let changed = e.stage != Some(stage);
+        if kind == 0xd06 {
+            if stage % 5 == 4 && hp < self.content.objects[&kind].hp / 5 {
+                let e = self.entities.get_mut(&id).unwrap();
+                e.activated = Some(self.now);
+                e.stage = None;
+                return self.encounter_mechanics(id, target, 0);
+            }
+            let e = self.entities.get_mut(&id).unwrap();
+            if stage % 5 != 2 {
+                e.blocked_since = None;
+                e.reaction_until = 0;
+            } else if self.now >= e.reaction_until {
+                if e.last_step.x.hypot(e.last_step.y) >= 0.001 {
+                    e.blocked_since = None;
+                } else if self.now >= *e.blocked_since.get_or_insert(self.now) + 500 {
+                    e.blocked_since = None;
+                    e.reaction_until = self.now + 1000;
+                    tracing::debug!(
+                        entity = id,
+                        until = e.reaction_until,
+                        "blocked Limon entered shielded burst"
+                    );
+                }
+            }
+        }
         let shield = match kind {
             0x917 => elapsed % 6000 >= 2000,
             0xd06 => {
                 elapsed % 43300 < 2000
+                    || self.entities[&id].reaction_until > self.now
                     || (12300..32300).contains(&(elapsed % 43300))
                         && (elapsed % 43300 - 12300) % 5000 >= 1500
             }
@@ -252,25 +285,32 @@ impl World {
                 _ => {}
             }
         }
+        if kind == 0xdae
+            && self.entities[&id].conditions(self.now) & condition::bit(condition::STUNNED) != 0
+        {
+            return Ok(());
+        }
         if self.now < self.entities[&id].next_aux {
             return Ok(());
         }
         self.entities.get_mut(&id).unwrap().next_aux = self.now
             + match kind {
                 0x173 | 0xdae => 5000,
-                0x953 => 2500,
                 0x654 => 3000,
                 0x917 => 500,
                 _ => 1000,
             };
         match kind {
-            0x953 => self.throw_grenade(id, target, 2., 12)?,
             0x173 => {
                 self.spawn_children(id, 0x223, 2, 1.5)?;
                 self.spawn_children(id, 0x224, 2, 2.)?;
             }
-            0x654 if pos.distance(target) < 8. => self.throw_grenade(id, target, 4., 150)?,
-            0x917 if stage == 2 => self.throw_grenade(id, target, 5., 100)?,
+            0x654 if target.is_some_and(|p| pos.distance(p) < 8.) => {
+                self.throw_grenade(id, target.unwrap(), 4., 150)?
+            }
+            0x917 if stage == 2 && target.is_some_and(|p| pos.distance(p) <= 10.) => {
+                self.throw_grenade(id, target.unwrap(), 5., 100)?
+            }
             0xd06 if stage % 5 == 4 => {
                 self.spawn_children(id, 0x625, 1, 2.)?;
                 self.spawn_children(id, 0x626, 2, 3.)?;
@@ -280,14 +320,8 @@ impl World {
                     self.spawn_children(id, kind, 2, 2.)?;
                 }
             }
-            0xda2 | 0xda3 if pos.distance(target) < 3. => {
+            0xda2 | 0xda3 if target.is_some_and(|p| pos.distance(p) < 3.) => {
                 self.entities.get_mut(&id).unwrap().expires = Some(self.now + 50);
-            }
-            0xd99 | 0xd9a if pos.distance(target) < 3. => {
-                let amount = self.content.objects[&kind].projectiles[&0].min;
-                self.area_damage(kind, pos, 3., amount)?;
-                let e = self.entities.get_mut(&id).unwrap();
-                e.hp = (e.hp + amount).min(self.content.objects[&kind].hp);
             }
             0xdae => {
                 let allies: Vec<_> = self
@@ -297,8 +331,8 @@ impl World {
                     .map(|e| e.id)
                     .collect();
                 for ally in allies {
-                    let e = self.entities.get_mut(&ally).unwrap();
-                    e.hp = (e.hp + 100).min(self.content.objects[&e.kind].hp);
+                    let amount = self.content.objects[&self.entities[&ally].kind].hp;
+                    self.heal_enemy(id, ally, amount)?;
                 }
             }
             _ => {}
@@ -329,7 +363,6 @@ impl World {
             send(p, wire::SHOW_EFFECT, out.0.clone());
         }
         self.grenades.push(Grenade {
-            owner,
             kind: self.entities[&owner].kind,
             position,
             radius,
@@ -389,9 +422,6 @@ impl World {
     pub(super) fn grenade_step(&mut self) {
         let grenades = std::mem::take(&mut self.grenades);
         for grenade in grenades {
-            if !self.entities.contains_key(&grenade.owner) {
-                continue;
-            }
             if grenade.deadline > self.now {
                 self.grenades.push(grenade);
                 continue;
