@@ -246,6 +246,7 @@ impl World {
             .cell(pos.x, pos.y)
             .is_some_and(|c| c.terrain == terrain && c.object.is_none())
             && self.walkable(pos)
+            && self.outside_setpieces(pos)
     }
     fn place_member(&mut self, camp: usize, slot: usize, pos: Pos) -> Result<()> {
         let kind = if matches!(self.population[slot].kind, 0x6d2..=0x6d4) {

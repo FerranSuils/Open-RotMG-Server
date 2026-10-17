@@ -34,6 +34,7 @@ pub(crate) fn fixture() -> (PathBuf, App) {
         discord_link_token: Some("a".repeat(64)),
         owners: Arc::default(),
         authentication: Arc::default(),
+        guild_actions: Arc::default(),
         bots: Arc::default(),
         quarantined: Arc::default(),
         shutdown: tokio::sync::watch::channel(false).0,
