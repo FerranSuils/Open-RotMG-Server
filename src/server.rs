@@ -140,6 +140,7 @@ impl App {
 use tokio::sync::mpsc;
 mod account_actions;
 pub(crate) mod diagnostics;
+mod guilds;
 mod hiscores;
 pub(crate) mod testing;
 mod updates;
@@ -167,6 +168,7 @@ pub struct App {
     pub discord_link_token: Option<String>,
     pub owners: Arc<Mutex<BTreeMap<i32, Option<SessionControl>>>>,
     pub authentication: Arc<tokio::sync::RwLock<()>>,
+    pub guild_actions: Arc<tokio::sync::Mutex<()>>,
     pub bots: Arc<Mutex<BTreeMap<i32, Owner>>>,
     pub quarantined: Arc<Mutex<Vec<Owner>>>,
     pub shutdown: tokio::sync::watch::Sender<bool>,
@@ -726,6 +728,7 @@ async fn handle(
             );
         }
         wire::CREATE | wire::LOAD => {
+            let _guild = a.guild_actions.lock().await;
             ensure!(player.is_none(), "character already loaded");
             let account = account
                 .as_ref()
@@ -782,6 +785,10 @@ async fn handle(
                     })
                     .await?,
             );
+            if expected.is_none() {
+                let id = player.context("guild sign-on player missing")?;
+                a.world.directory(move |d| d.guild_sign_on(id)).await?;
+            }
             if let Some(testing) = &a.testing {
                 testing.native_entered(account)?;
             }
@@ -857,8 +864,43 @@ async fn handle(
                 })
                 .await?;
         }
+        wire::CREATE_GUILD
+        | wire::GUILD_INVITE
+        | wire::JOIN_GUILD
+        | wire::CHANGE_GUILD_RANK
+        | wire::GUILD_REMOVE => {
+            let id = player.context("guild action before character")?;
+            guilds::native(a, id, packet.id, &mut r, tx, received).await?;
+        }
+        50 if guilds::merchant(
+            a,
+            player.context("purchase before character")?,
+            &packet.body,
+        )
+        .await? =>
+        {
+            let id = player.context("guild purchase before character")?;
+            guilds::native(a, id, packet.id, &mut r, tx, received).await?;
+        }
         wire::PLAYER_TEXT => {
             let text = player_text(&mut r)?;
+            if let Some((kind, name)) = guilds::chat_command(&text) {
+                let id = player.context("guild command before character")?;
+                let mut body = Writer::new();
+                body.utf(name);
+                guilds::native(a, id, kind, &mut Reader::new(&body.0), tx, received).await?;
+                return Ok(());
+            }
+            let guild_chat = text
+                .split_whitespace()
+                .next()
+                .is_some_and(|s| s.eq_ignore_ascii_case("/g") || s.eq_ignore_ascii_case("/guild"));
+            // A revoked member must not receive chat between the database commit and cache publication.
+            let _guild = if guild_chat {
+                Some(a.guild_actions.lock().await)
+            } else {
+                None
+            };
             let id = player.context("chat before character")?;
 
             if let Some(message) = text
@@ -1195,9 +1237,25 @@ async fn handle(
             enqueue_reply(tx, Packet { id: 20, body: o.0 })?;
         }
         42 | 3 => {
+            let _guild = a.guild_actions.lock().await;
             let portal = if packet.id == 3 { Some(r.i32()?) } else { None };
             r.done()?;
             let id = player.context("transfer before character")?;
+            let guild_portal = a
+                .world
+                .call(move |w| {
+                    Ok(portal
+                        .and_then(|p| w.entities.get(&p))
+                        .is_some_and(|e| e.kind == 0x72f))
+                })
+                .await?;
+            if guild_portal {
+                let guild = a
+                    .store
+                    .guild(account.as_ref().context("guild portal before HELLO")?.id)
+                    .await?;
+                a.world.directory(move |d| d.guild_instance(guild)).await?;
+            }
             let transfer = a
                 .world
                 .directory(move |d| {
@@ -1743,6 +1801,7 @@ pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
         .route("/legacy-api/char/delete", post(delete_character))
         .route("/legacy-api/account/{operation}", post(account_request))
         .route("/legacy-api/fame/list", post(legends))
+        .route("/legacy-api/guild/{operation}", post(guilds::request))
         .nest_service("/sfx", tower_http::services::ServeDir::new(a.sfx.clone()))
         .route("/client.swf", get(swf))
         .route("/game", get(websocket))

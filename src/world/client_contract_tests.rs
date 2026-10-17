@@ -48,6 +48,7 @@ fn player_status_distinguishes_name_boosts_wallet_character_fame_and_history() {
         .map(|(i, n)| (crate::content::STATS[i].0, n))
         .collect();
     let presentation = AccountPresentation {
+        guild: None,
         credits: 73,
         fame: 27,
         best_fame: BTreeMap::from([(crate::content::WIZARD, 40), (crate::content::PRIEST, 150)]),

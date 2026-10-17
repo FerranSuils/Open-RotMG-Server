@@ -299,7 +299,7 @@ mod tests {
         let account = store.list("existing-schema-six".into()).await.unwrap();
         drop(store);
         let db = Connection::open(&path).unwrap();
-        db.execute_batch("DROP TABLE update_feed; PRAGMA user_version=6")
+        db.execute_batch("DROP TABLE guild_members; DROP TABLE guilds; DROP TABLE update_feed; PRAGMA user_version=6")
             .unwrap();
         let store = Store::open(&path, &content).unwrap();
         assert_eq!(
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))
                 .unwrap(),
-            8
+            9
         );
         store.sync_updates(snapshot()).await.unwrap();
         let mut invalid = snapshot();
