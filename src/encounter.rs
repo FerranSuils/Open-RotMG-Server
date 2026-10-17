@@ -3,6 +3,7 @@ use anyhow::{Result, ensure};
 
 pub(crate) mod attacks;
 pub(crate) mod fauna;
+pub(crate) mod landmarks;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Anchor {
@@ -74,6 +75,9 @@ pub(crate) fn nr_speed(rate: f32) -> f32 {
     (5.55 * rate + 0.74) * 1.5
 }
 pub fn profile(kind: u16) -> Option<Profile> {
+    if landmarks::ROSTER.contains(&kind) {
+        return Some(landmarks::profile(kind));
+    }
     if fauna::ROSTER.contains(&kind) {
         return Some(fauna::profile(kind));
     }

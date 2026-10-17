@@ -33,6 +33,20 @@ impl World {
             endgame::{ORYX, ORYX2, OryxPhase},
         };
         let e = &self.entities[&id];
+        if crate::encounter::landmarks::ROSTER.contains(&e.kind) {
+            let state = e.stage.context("landmark attack phase missing")?;
+            let script = e
+                .script
+                .as_ref()
+                .context("landmark attack script missing")?;
+            return Ok(Some(crate::encounter::landmarks::schedule(
+                e.kind,
+                e.hp,
+                state,
+                script.choice,
+                elapsed,
+            )));
+        }
         if e.kind == ORYX2 {
             let brain = self
                 .finale

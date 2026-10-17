@@ -161,6 +161,9 @@ impl Schedule {
     }
 }
 pub(crate) fn schedule(kind: u16, hp: i32, elapsed: u64) -> Option<Schedule> {
+    if super::landmarks::ROSTER.contains(&kind) {
+        return Some(super::landmarks::schedule(kind, hp, 0, 0, elapsed));
+    }
     if super::fauna::ROSTER.contains(&kind) {
         return Some(super::fauna::schedule(kind, hp, elapsed));
     }

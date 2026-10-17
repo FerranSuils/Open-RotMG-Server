@@ -155,6 +155,7 @@ impl World {
                 .values()
                 .filter(|e| e.parent.is_some() || e.quest.is_some())
                 .count()
+                + self.named_births.len()
                 + missing
                 <= 256,
             "summon budget exhausted"
@@ -195,6 +196,9 @@ impl World {
         elapsed: u64,
     ) -> Result<()> {
         let target = target.into();
+        if crate::encounter::landmarks::ROSTER.contains(&self.entities[&id].kind) {
+            return self.landmark_mechanics(id, target, elapsed);
+        }
         if crate::dungeon::abyss::ROSTER.contains(&self.entities[&id].kind) {
             return self.abyss_mechanics(id, target, elapsed);
         }
@@ -489,6 +493,7 @@ impl World {
 
     pub(super) fn mechanic_expiry(&mut self) {
         self.fauna_birth_step();
+        self.named_birth_step();
         let expired: Vec<_> = self
             .entities
             .values()
@@ -500,7 +505,7 @@ impl World {
             .map(|e| e.id)
             .collect();
         for id in expired {
-            if matches!(self.entities[&id].kind, 0x91a | 0x900)
+            if matches!(self.entities[&id].kind, 0x91a | 0x900 | 0xd50)
                 && self.entities[&id]
                     .expires
                     .is_some_and(|deadline| deadline <= self.now)

@@ -30,6 +30,7 @@ mod families;
 mod fauna;
 mod fauna_births;
 mod fauna_special;
+mod ghost_ship;
 mod gods;
 #[cfg(test)]
 mod gods_tests;
@@ -41,9 +42,14 @@ mod guilds;
 #[cfg(test)]
 mod key_tests;
 mod lair;
+mod landmark_ai;
+#[cfg(test)]
+mod landmark_tests;
+mod lost_lands;
 mod midlands;
 #[cfg(test)]
 mod midlands_tests;
+mod named_births;
 #[cfg(test)]
 mod player_position_tests;
 mod population;
@@ -147,6 +153,8 @@ pub struct Entity {
     following: Following,
     #[serde(skip)]
     charge: Option<charges::Charge>,
+    #[serde(skip)]
+    script: Option<landmark_ai::Script>,
     last_step: Pos,
     phase: f32,
     orbit: Option<realm_events::Orbit>,
@@ -413,6 +421,7 @@ pub struct World {
     pub bullets: Vec<Bullet>,
     grenades: Vec<mechanics::Grenade>,
     fauna_births: Vec<fauna_births::Birth>,
+    named_births: Vec<named_births::Birth>,
     lava_patches: BTreeMap<usize, (u64, u8)>,
     ability_state: abilities::State,
     finale: endgame_ai::Actors,
@@ -1201,6 +1210,7 @@ impl World {
                         motion: None,
                         following: Following::Unknown,
                         charge: None,
+                        script: None,
                         last_step: Pos { x: 0., y: 0. },
                         phase: 0.,
                         orbit: None,
@@ -1283,6 +1293,7 @@ impl World {
             bullets: Vec::new(),
             grenades: Vec::new(),
             fauna_births: Vec::new(),
+            named_births: Vec::new(),
             lava_patches: BTreeMap::new(),
             ability_state: abilities::State::default(),
             finale: endgame_ai::Actors::default(),
@@ -1410,6 +1421,7 @@ impl World {
                 motion: None,
                 following: Following::Unknown,
                 charge: None,
+                script: None,
                 last_step: Pos { x: 0., y: 0. },
                 phase: 0.,
                 orbit: None,
@@ -3228,7 +3240,9 @@ impl World {
         let e = self.remove_entity(id);
         let definition = &self.content.objects[&e.kind];
         // Reference Reproduce suppresses follower XP; Pentaract Spawn explicitly allows eye XP.
-        let reward = if e.quest.is_some() && matches!(e.kind, 0xd57 | 0xd58 | 0xd5a..=0xd5c) {
+        let reward = if e.script.as_ref().is_some_and(|script| script.no_experience)
+            || (e.quest.is_some() && matches!(e.kind, 0xd57 | 0xd58 | 0xd5a..=0xd5c))
+        {
             0
         } else {
             (definition.hp as f32 * definition.xp_multiplier / 10.).ceil() as i32
@@ -3567,6 +3581,14 @@ impl World {
             let flags = current.conditions(self.now);
             let (mut motion, mut speed) = if kind == 0x909 && current.stage == Some(1) {
                 (Motion::Stationary, 0.)
+            } else if crate::encounter::landmarks::ROSTER.contains(&kind) {
+                match self.landmark_movement(id, target, elapsed) {
+                    Ok(movement) => movement,
+                    Err(error) => {
+                        tracing::error!(entity=id,%error,"landmark movement refused");
+                        continue;
+                    }
+                }
             } else if current.quest.is_some() {
                 self.quest_movement(id, target, elapsed)
             } else if crate::encounter::fauna::ROSTER.contains(&kind) {

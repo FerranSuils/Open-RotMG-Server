@@ -215,8 +215,9 @@ impl World {
                 continue;
             }
             let birth = self.fauna_births.remove(i);
+            let (owner, kind, position) = (birth.owner, birth.kind, birth.position);
             if let Err(error) = self.land_fauna(birth) {
-                tracing::error!(%error,"admitted fauna birth refused");
+                tracing::error!(owner,kind,x=position.x,y=position.y,%error,"admitted fauna birth refused");
             }
         }
     }

@@ -127,12 +127,14 @@ impl World {
             .entities
             .values()
             .filter(|e| e.quest == Some(tag))
-            .count();
+            .count()
+            + self.pending_named(tag, None);
         let live = self
             .entities
             .values()
             .filter(|e| e.quest == Some(tag) && e.kind == kind)
-            .count();
+            .count()
+            + self.pending_named(tag, Some(kind));
         let count = count.min(maximum.saturating_sub(live));
         if count == 0 {
             return Ok(());
@@ -152,6 +154,7 @@ impl World {
                 .values()
                 .filter(|e| e.parent.is_some() || e.quest.is_some())
                 .count()
+                + self.named_births.len()
                 + count
                 <= 256,
             "shared summon budget exhausted"
