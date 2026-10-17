@@ -2,7 +2,7 @@ use super::{tests, *};
 
 #[test]
 fn ground_potions_reserve_the_source_and_leave_full_backpacks_unchanged() {
-    for kind in [0xa22, 0xa23, 0xa1f, 0xa3f] {
+    for kind in [0xa22, 0xa23, 0xa1f, 0xa3f, 0xc12, 0xae9, 0xaea, 0xb16] {
         let mut w = tests::world();
         let mut ch = tests::ch(&w);
         ch.items[4..].fill(0xa22);
@@ -11,7 +11,24 @@ fn ground_potions_reserve_the_source_and_leave_full_backpacks_unchanged() {
         ch.base[2] = 10;
         let id = w.enter(ch, None).unwrap();
         let before = w.players[&id].character.clone();
-        let bag = w.loot_bag(w.players[&id].pos, None, vec![kind]).unwrap();
+        let next = match &w.content.get(kind as u16).unwrap().successor {
+            Some(name) => i32::from(
+                w.content
+                    .objects
+                    .values()
+                    .find(|item| &item.name == name)
+                    .unwrap()
+                    .kind,
+            ),
+            None => -1,
+        };
+        let owner = w
+            .content
+            .get(kind as u16)
+            .unwrap()
+            .soulbound
+            .then_some(before.account);
+        let bag = w.loot_bag(w.players[&id].pos, owner, vec![kind]).unwrap();
         let slot = Slot {
             object: bag,
             slot: 0,
@@ -20,7 +37,7 @@ fn ground_potions_reserve_the_source_and_leave_full_backpacks_unchanged() {
         let plan = w.use_item(id, slot, w.players[&id].pos).unwrap().unwrap();
         assert!(w.entities[&bag].reserved && w.players[&id].pending);
         assert_eq!(plan.items, before.items);
-        assert_eq!(plan.bag.as_ref().unwrap().1[0], -1);
+        assert_eq!(plan.bag.as_ref().unwrap().1[0], next);
         assert_eq!(w.entities[&bag].items[0], kind);
         assert!(w.use_item(id, slot, w.players[&id].pos).is_err());
         let mut other = tests::ch(&w);
@@ -29,12 +46,17 @@ fn ground_potions_reserve_the_source_and_leave_full_backpacks_unchanged() {
         assert!(w.use_item(other, slot, w.players[&id].pos).is_err());
         w.finish_inventory(plan, Ok(before.revision + 1)).unwrap();
         assert_eq!(w.players[&id].character.items, before.items);
-        assert_eq!(w.entities[&bag].items[0], -1);
+        assert_eq!(w.entities[&bag].items[0], next);
         assert!(!w.entities[&bag].reserved);
         match kind {
-            0xa22 | 0xa3f => assert!(w.players[&id].character.hp > before.hp),
+            0xa22 | 0xa3f | 0xb16 => assert!(w.players[&id].character.hp > before.hp),
             0xa23 => assert!(w.players[&id].character.mp > before.mp),
             0xa1f => assert_eq!(w.players[&id].character.base[2], before.base[2] + 1),
+            0xc12 => assert!(
+                w.players[&id].character.hp > before.hp && w.players[&id].character.mp > before.mp
+            ),
+            0xae9 => assert_eq!(w.players[&id].character.base[0], before.base[0] + 5),
+            0xaea => assert_eq!(w.players[&id].character.base[1], before.base[1] + 5),
             _ => unreachable!(),
         }
     }
@@ -68,6 +90,38 @@ fn failed_ground_consumption_keeps_source_reserved_and_quarantines_owner() {
         assert_eq!(w.entities[&bag].items[0], 0xa22);
         assert!(w.entities[&bag].reserved);
         assert!(w.players[&id].pending && w.players[&id].persistence_failure.is_some());
+    }
+}
+
+#[test]
+fn inventory_only_shop_activations_reject_ground_sources_without_mutation() {
+    for kind in [0x1175, 0xaa9, 0x1513, 0x705] {
+        let mut w = tests::world();
+        let id = w.enter(tests::ch(&w), None).unwrap();
+        let before = w.players[&id].character.items.clone();
+        let owner = w
+            .content
+            .get(kind as u16)
+            .unwrap()
+            .soulbound
+            .then_some(w.players[&id].character.account);
+        let bag = w.loot_bag(w.players[&id].pos, owner, vec![kind]).unwrap();
+        let source = w.entities[&bag].items.clone();
+        assert!(
+            w.use_item(
+                id,
+                Slot {
+                    object: bag,
+                    slot: 0,
+                    kind
+                },
+                w.players[&id].pos
+            )
+            .is_err()
+        );
+        assert_eq!(w.players[&id].character.items, before);
+        assert_eq!(w.entities[&bag].items, source);
+        assert!(!w.entities[&bag].reserved && !w.players[&id].pending);
     }
 }
 

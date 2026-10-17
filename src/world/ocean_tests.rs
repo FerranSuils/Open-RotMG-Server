@@ -217,14 +217,14 @@ fn wounded_response_is_nearby_known_once_and_not_a_second_boss_clear() {
 
 #[test]
 fn coastal_landmark_preserves_water_and_credits_one_original_not_its_children() {
-    let mut d = Directory::prepared(
+    let mut d = Directory::test_prepared(
         std::path::Path::new("data"),
         tests::world().content,
         16,
         12351,
     )
     .unwrap();
-    let raw = d.templates["realm-shore"].clone();
+    let raw = crate::terrain::generate(&d.content, 12351, 512).unwrap();
     let w = d.worlds.get_mut(&-3).unwrap();
     assert_eq!(w.hero_identities().len(), 14);
     let roots: Vec<_> = w

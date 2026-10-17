@@ -41,8 +41,7 @@ impl World {
         );
     }
     fn ocean_children(&self, id: i32, kind: u16) -> Vec<i32> {
-        self.entities
-            .values()
+        self.actors()
             .filter(|e| e.parent == Some(id) && e.kind == kind)
             .map(|e| e.id)
             .collect()
@@ -51,8 +50,7 @@ impl World {
         crate::encounter::validate(&self.content, kind)?;
         crate::loot::validate(&self.content, kind)?;
         ensure!(
-            self.entities
-                .values()
+            self.actors()
                 .filter(|e| e.parent.is_some() || e.quest.is_some())
                 .count()
                 < 256,
@@ -103,8 +101,7 @@ impl World {
             "Hermit requires its eight owned tentacle spawners"
         );
         ensure!(
-            self.entities
-                .values()
+            self.actors()
                 .filter(|e| e.parent.is_some() || e.quest.is_some())
                 .count()
                 + positions.len()
@@ -176,8 +173,7 @@ impl World {
             positions.push(destination);
         }
         ensure!(
-            self.entities
-                .values()
+            self.actors()
                 .filter(|e| e.parent.is_some() || e.quest.is_some())
                 .count()
                 + count
@@ -667,8 +663,7 @@ impl World {
         }
         let p = &self.players[&speaker];
         let wounded: Vec<_> = self
-            .entities
-            .values()
+            .actors()
             .filter(|e| {
                 e.kind == 0x1704
                     && e.stage == Some(0)
