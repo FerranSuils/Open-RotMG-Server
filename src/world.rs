@@ -115,6 +115,8 @@ mod native_hits;
 mod native_hits_tests;
 mod npc_attacks;
 #[cfg(test)]
+mod quest_completion_tests;
+#[cfg(test)]
 mod quiver_tests;
 mod reconciliation;
 #[cfg(test)]
@@ -3811,6 +3813,13 @@ impl World {
                     .expect("experience queue overflow");
                 if amount > 0 {
                     tracing::debug!(player = id, enemy = e.kind, amount, "experience queued");
+                }
+                if p.quest == Some(e.id) {
+                    // This exact notification also starts the native client's quest-arrow completion delay.
+                    let mut out = Writer::new();
+                    out.i32(*id).utf("Quest Complete!").u32(0xff00ff00);
+                    send(p, wire::NOTIFICATION, out.0);
+                    tracing::debug!(player = id, enemy = e.id, "native quest completed");
                 }
             }
         }
