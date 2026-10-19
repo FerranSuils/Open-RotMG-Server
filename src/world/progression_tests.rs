@@ -566,6 +566,37 @@ fn capped_potion_is_retained_and_failed_commit_quarantines_without_stat_gain() {
 }
 
 #[test]
+fn abyss_instances_have_distinct_reproducible_layouts() {
+    let content = tests::world().content;
+    let mut first = Directory::test_with_seed(Path::new("data"), content.clone(), 16, 222).unwrap();
+    first.prepared_seed = Some(222);
+    let a = first.instance("abyss-of-demons", None).unwrap();
+    let b = first.instance("abyss-of-demons", None).unwrap();
+    let layout = |map: &Map| serde_json::to_vec(map).expect("serializable Abyss layout");
+    assert_ne!(
+        layout(&first.worlds[&a].map),
+        layout(&first.worlds[&b].map),
+        "new portals reuse one Abyss layout"
+    );
+    let mut repeated = Directory::test_with_seed(Path::new("data"), content, 16, 222).unwrap();
+    repeated.prepared_seed = Some(222);
+    let c = repeated.instance("abyss-of-demons", None).unwrap();
+    assert_eq!(
+        layout(&first.worlds[&a].map),
+        layout(&repeated.worlds[&c].map)
+    );
+    assert_eq!(first.worlds[&a].name, "Abyss of Demons");
+    assert_eq!(
+        first.worlds[&a]
+            .entities
+            .values()
+            .filter(|e| e.kind == crate::dungeon::abyss::MALPHAS)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn undead_lair_instances_have_distinct_reproducible_layouts() {
     let content = tests::world().content;
     let mut first = Directory::test_with_seed(Path::new("data"), content.clone(), 16, 222).unwrap();
