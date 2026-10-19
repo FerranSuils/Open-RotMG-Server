@@ -275,6 +275,41 @@ fn medusa_defeat_earns_an_abyss_portal_only_in_the_realm() {
 }
 
 #[test]
+fn each_earned_abyss_portal_opens_its_own_map() {
+    let mut d = tests::directory();
+    let (player, _rx) = tests::receive(&mut d, -3, 1, crate::content::WIZARD);
+    let seeds: Vec<u64> = (0..64)
+        .filter(|seed| rand::rngs::StdRng::seed_from_u64(*seed).gen_bool(0.1))
+        .collect();
+    let mut maps = Vec::new();
+    for seed in seeds.into_iter().take(2) {
+        let before: BTreeSet<i32> = d.portals.keys().copied().collect();
+        let w = d.worlds.get_mut(&-3).unwrap();
+        let pos = w.players[&player].pos;
+        let medusa = w.spawn_entity(0x654, pos, vec![]).unwrap();
+        let hp = w.entities[&medusa].hp;
+        w.rng = rand::rngs::StdRng::seed_from_u64(seed);
+        w.damage_enemy(player, medusa, hp, true, &[], None).unwrap();
+        assert_eq!(w.portal_requests.len(), 1);
+        d.step();
+        let fresh: Vec<i32> = d
+            .portals
+            .keys()
+            .copied()
+            .filter(|id| !before.contains(id))
+            .collect();
+        assert_eq!(fresh.len(), 1);
+        let destination = d.portals[&fresh[0]].destination.unwrap();
+        assert_eq!(d.worlds[&destination].name, "Abyss of Demons");
+        maps.push(serde_json::to_vec(&d.worlds[&destination].map).unwrap());
+    }
+    assert_ne!(
+        maps[0], maps[1],
+        "two earned Abyss portals opened the same layout"
+    );
+}
+
+#[test]
 fn admitted_grenades_are_telegraphed_delayed_and_survive_owner_death() {
     let mut w = arena();
     let (tx, mut rx) = mpsc::channel(128);
