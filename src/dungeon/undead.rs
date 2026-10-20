@@ -23,6 +23,18 @@ impl Room {
     }
 }
 
+// A lair room holds one enemy group, as in the map this server shipped before the
+// procedural generator (data/undead-lair.wmap): skeletons, mummies, constructs, slimes,
+// reapers and vampires each keep their own rooms.
+const FAMILIES: [&[u16]; 6] = [
+    &[0xd91, 0xd92, 0xd93, 0xd94, 0xd95],
+    &[0xd96, 0xd97, 0xd98],
+    &[0xd99, 0xd9a],
+    &[0xd9b, 0xd9e],
+    &[0xda4],
+    &[0xda5, 0xda6],
+];
+
 // Period guides establish the room shapes, not the lost official generator's distributions.
 pub fn generate(content: &Content, seed: u64) -> Result<Map> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
@@ -149,6 +161,7 @@ pub fn generate(content: &Content, seed: u64) -> Result<Map> {
                     continue;
                 }
                 let i = (y * width + x) as usize;
+                map.cells[i].region = number as u8 + 2; // room identity, region 1 marks the spawn
                 map.cells[i].ground = if number == 0 && (16..=25).contains(&(dx * dx + dy * dy)) {
                     0x61
                 } else if rng.gen_ratio(1, 32) {
@@ -163,13 +176,10 @@ pub fn generate(content: &Content, seed: u64) -> Result<Map> {
         }
         if number != 0 && number != entrance {
             sites.shuffle(&mut rng);
-            let roster = [
-                0xd91, 0xd92, 0xd93, 0xd94, 0xd95, 0xd96, 0xd97, 0xd98, 0xd99, 0xd9a, 0xd9b, 0xd9e,
-                0xda4, 0xda5, 0xda6,
-            ];
+            let family = *FAMILIES.choose(&mut rng).unwrap();
             for _ in 0..rng.gen_range(6..=10) {
                 let i = sites.pop().context("Undead Lair room has no enemy site")?;
-                map.cells[i].object = Some(*roster.choose(&mut rng).unwrap());
+                map.cells[i].object = Some(*family.choose(&mut rng).unwrap());
             }
             for kind in [0xda2, 0xda3, 0x1801, 0x1802, 0x1803] {
                 if rng.gen_bool(0.5) {
@@ -233,7 +243,46 @@ pub fn generate(content: &Content, seed: u64) -> Result<Map> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeSet, path::Path};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::Path,
+    };
+
+    #[test]
+    fn lair_rooms_hold_one_enemy_group() {
+        let content = Content::load(Path::new("data")).unwrap();
+        let mut seen = BTreeSet::new();
+        for seed in 0..64 {
+            let map = generate(&content, seed).unwrap();
+            let mut rooms: BTreeMap<u8, BTreeSet<u16>> = BTreeMap::new();
+            for cell in &map.cells {
+                let Some(kind) = cell.object else { continue };
+                if !content.objects[&kind].enemy
+                    || !FAMILIES.iter().any(|family| family.contains(&kind))
+                {
+                    continue;
+                }
+                rooms.entry(cell.region).or_default().insert(kind);
+            }
+            assert!(
+                rooms.len() > 8,
+                "seed {seed}: {} populated rooms",
+                rooms.len()
+            );
+            for (region, kinds) in rooms {
+                let family = FAMILIES
+                    .iter()
+                    .find(|family| family.contains(kinds.iter().next().unwrap()))
+                    .unwrap();
+                assert!(
+                    kinds.iter().all(|kind| family.contains(kind)),
+                    "seed {seed}: room {region} mixes {kinds:?}"
+                );
+                seen.extend(kinds);
+            }
+        }
+        assert_eq!(seen.len(), 15, "not every lair enemy appears");
+    }
 
     #[test]
     fn lairs_vary_geometry_and_keep_safe_connected_selected_era_encounters() {
