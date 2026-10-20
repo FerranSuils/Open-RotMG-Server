@@ -47,6 +47,8 @@ mod lair;
 mod landmark_ai;
 
 mod lost_lands;
+mod manor;
+mod manor_entry;
 mod midlands;
 #[cfg(test)]
 mod movement_tests;
@@ -547,6 +549,7 @@ pub struct World {
     grenades: Vec<mechanics::Grenade>,
     fauna_births: Vec<fauna_births::Birth>,
     named_births: Vec<named_births::Birth>,
+    manor_births: Vec<manor::Toss>,
     lava_patches: BTreeMap<usize, (u64, u8)>,
     ability_state: abilities::State,
     companions: companions::State,
@@ -720,7 +723,8 @@ impl Directory {
         seed: u64,
         prepared_seed: Option<u64>,
     ) -> Result<Self> {
-        let map = Arc::new(crate::terrain::generate(&content, seed, 512)?);
+        // The fixture must fit both finite 65-tile graveyards alongside the other setpieces.
+        let map = Arc::new(crate::terrain::generate(&content, seed, 768)?);
         Self::configured(
             path,
             content,
@@ -862,6 +866,11 @@ impl Directory {
                     None => rand::random(),
                 };
                 Arc::new(crate::dungeon::abyss::generate(&self.content, seed)?)
+            } else if template == "manor-of-the-immortals" {
+                let seed = self
+                    .prepared_seed
+                    .map_or_else(rand::random, |s| s ^ self.next_world as u64);
+                Arc::new(crate::dungeon::manor::generate(&self.content, seed)?)
             } else if template == "ocean-trench" {
                 let seed = self
                     .prepared_seed
@@ -927,6 +936,7 @@ impl Directory {
             world.populate_named_quests()?;
             world.populate_realm_events()?;
             world.populate_hermit()?;
+            world.populate_manor_entry()?;
             world.populate_realm_population()?;
             tracing::info!(
                 layout = world.realm_layout,
@@ -1645,7 +1655,8 @@ impl World {
                             orbit: None,
                             hp: o.hp,
                             size: o.size,
-                            condition: crate::dungeon::abyss::initial_condition(kind)
+                            condition: crate::dungeon::manor::initial_condition(kind)
+                                | crate::dungeon::abyss::initial_condition(kind)
                                 | crate::dungeon::spider::initial_condition(kind)
                                 | crate::dungeon::snake::initial_condition(kind)
                                 | crate::dungeon::jungle::initial_condition(kind)
@@ -1764,6 +1775,7 @@ impl World {
             grenades: Vec::new(),
             fauna_births: Vec::new(),
             named_births: Vec::new(),
+            manor_births: Vec::new(),
             lava_patches: BTreeMap::new(),
             ability_state: abilities::State::default(),
             companions: companions::State::default(),
@@ -1973,7 +1985,8 @@ impl World {
                     orbit: None,
                     hp: definition.hp,
                     size: definition.size,
-                    condition: crate::dungeon::abyss::initial_condition(kind)
+                    condition: crate::dungeon::manor::initial_condition(kind)
+                        | crate::dungeon::abyss::initial_condition(kind)
                         | crate::dungeon::spider::initial_condition(kind)
                         | crate::dungeon::snake::initial_condition(kind)
                         | crate::dungeon::jungle::initial_condition(kind)
@@ -3833,6 +3846,7 @@ impl World {
                     .chain(std::iter::once(&mut snapshot.trenches))
                     .chain(std::iter::once(&mut snapshot.spider_dens))
                     .chain(std::iter::once(&mut snapshot.jungles))
+                    .chain(std::iter::once(&mut snapshot.manors))
                     .zip(p.clears_queued)
                 {
                     *count = count
@@ -3871,7 +3885,8 @@ impl World {
             || snapshot.jungles > p.character.jungles
             || snapshot.abysses > p.character.abysses
             || snapshot.trenches > p.character.trenches
-            || snapshot.spider_dens > p.character.spider_dens;
+            || snapshot.spider_dens > p.character.spider_dens
+            || snapshot.manors > p.character.manors;
         let leveled = snapshot.level > p.character.level;
         p.character.exp = snapshot.exp;
         p.character.xp_boost = snapshot.xp_boost;
@@ -3890,6 +3905,7 @@ impl World {
         p.character.jungles = snapshot.jungles;
         p.character.trenches = snapshot.trenches;
         p.character.spider_dens = snapshot.spider_dens;
+        p.character.manors = snapshot.manors;
         if leveled && !p.death_pending {
             let values = p.effective(&self.content, self.now)?;
             p.character.hp = values[0];
@@ -4255,7 +4271,27 @@ impl World {
                 } else {
                     0x71d
                 };
-                let exit = self.spawn_exit(kind, defeated.pos)?;
+                let pos = if defeated.kind == crate::dungeon::manor::BOSS {
+                    let sites: Vec<_> = self
+                        .map
+                        .cells
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.object == Some(crate::dungeon::manor::BOSS))
+                        .map(|(i, _)| Pos {
+                            x: (i % self.map.width as usize) as f32 + 0.5,
+                            y: (i / self.map.width as usize) as f32 + 0.5,
+                        })
+                        .collect();
+                    ensure!(
+                        sites.len() == 1,
+                        "Manor completion requires one authored arena marker"
+                    );
+                    sites[0]
+                } else {
+                    defeated.pos
+                };
+                let exit = self.spawn_exit(kind, pos)?;
                 self.entities.get_mut(&exit).unwrap().published = false;
                 self.clear_exit = Some(exit);
             }
@@ -4277,6 +4313,10 @@ impl World {
             0xd5a | 0xd60 | crate::dungeon::trench::HERMIT | 0x1705
         ) {
             self.content.objects[&defeated.kind].hp / 100
+        } else if defeated.kind == crate::dungeon::manor::BOSS {
+            100
+        } else if defeated.kind == crate::dungeon::manor::COFFIN {
+            800
         } else if defeated.kind == 0x927 {
             100
         } else {
@@ -4539,7 +4579,7 @@ impl World {
             // Self-destruction is a deadline, not target acquisition or a weapon cooldown.
             let shield_burst = self.shield_burst(id);
             let burst = shield_burst
-                || (kind == 0x91a
+                || (matches!(kind, 0x91a | crate::dungeon::manor::MINE)
                     && entity.expires == Some(self.now + 50)
                     && self.now >= entity.next_shot);
             if !burst
@@ -4557,7 +4597,7 @@ impl World {
                         && !p.death_pending
                         && !p.departing
                         && !p.paused
-                        && (kind == 0x6d8
+                        && (matches!(kind, 0x6d8 | crate::dungeon::manor::MINE)
                             || p.conditions(self.now)
                                 & crate::condition::bit(crate::condition::INVISIBLE)
                                 == 0)
@@ -4566,6 +4606,11 @@ impl World {
                 .chain(self.decoy_positions())
                 .min_by(|a, b| pos.distance(*a).total_cmp(&pos.distance(*b)));
             let wake = match kind {
+                crate::dungeon::manor::KAGE
+                | crate::dungeon::manor::BAT
+                | crate::dungeon::manor::CHASER
+                | crate::dungeon::manor::DECOY
+                | 0x1727 => 20.,
                 0x953 | 0x954 => 6.,
                 0x619 => 8.,
                 0x609 | 0xd06 | crate::dungeon::abyss::MALPHAS => 11.,
@@ -4581,7 +4626,9 @@ impl World {
             // Activated enemies keep the same sight radius; they do not keep
             // shooting once the player leaves that radius.
             let radius = wake;
-            let target = if burst {
+            let target = if burst && kind == crate::dungeon::manor::MINE {
+                nearest.filter(|p| pos.distance(*p) < 60.)
+            } else if burst {
                 Some(pos)
             } else {
                 nearest.filter(|p| pos.distance(*p) < radius)
@@ -4593,7 +4640,9 @@ impl World {
                     && !p.paused
                     && pos.distance(p.pos) < radius
             });
-            if !burst && target.is_none() && !nearby {
+            let manor_clock =
+                crate::dungeon::manor::ROSTER.contains(&kind) && entity.activated.is_some();
+            if !burst && target.is_none() && !nearby && !manor_clock {
                 self.suspend_npc(id, delta);
                 continue;
             }
@@ -4643,6 +4692,8 @@ impl World {
                     current.stage.expect("Jungle movement phase"),
                     current.parent.is_some(),
                 )
+            } else if crate::dungeon::manor::ROSTER.contains(&kind) {
+                self.manor_movement(id, target, elapsed)
             } else if crate::dungeon::trench::ROSTER.contains(&kind) {
                 self.ocean_movement(id, target, elapsed)
             } else if crate::encounter::landmarks::ROSTER.contains(&kind) {
@@ -5548,6 +5599,8 @@ mod cover_example;
 mod timing_example;
 
 #[cfg(test)]
+mod manor_tests;
+#[cfg(test)]
 mod view_navigation_tests;
 
 #[cfg(test)]
@@ -5624,6 +5677,7 @@ mod tests {
             abysses: 0,
             trenches: 0,
             spider_dens: 0,
+            manors: 0,
         }
     }
 
