@@ -64,6 +64,7 @@ impl App {
 }
 use tokio::sync::mpsc;
 mod account_actions;
+pub(crate) mod browser_link;
 pub(crate) mod diagnostics;
 mod gold;
 mod guilds;
@@ -94,6 +95,7 @@ pub struct App {
     pub connections: Arc<tokio::sync::Semaphore>,
     pub control: Option<String>,
     pub discord_link_token: Option<String>,
+    pub(crate) browser_links: Arc<browser_link::Service>,
     pub owners: Arc<Mutex<BTreeMap<i32, lifecycle::Claim>>>,
     pub authentication: Arc<tokio::sync::RwLock<()>>,
     pub guild_actions: Arc<tokio::sync::Mutex<()>>,
@@ -170,6 +172,7 @@ async fn chars(
     State(a): State<App>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     match admit(&a, &headers, peer) {
@@ -177,7 +180,8 @@ async fn chars(
         Ok(false) => return limited(),
         Err(e) => return error(e),
     }
-    let result: Result<String> = async {
+    let result: Result<(String, Option<String>)> = async {
+        let mut browser = browser_link::native(&a, &headers, &query).await?;
         let guid = form.get("guid").context("guid is required")?.clone();
         ensure!(
             form.get("secret").is_none_or(|s| s.is_empty()),
@@ -185,13 +189,22 @@ async fn chars(
         );
         let password = form.get("password").context("password required")?.clone();
         let _authentication = a.authentication.read().await;
+        let registered = !password.is_empty();
         let account = a.store.characters(guid, password).await?;
+        if registered && let Some(browser) = browser.as_mut() {
+            browser.authenticate(a.store.browser_identity(account.id).await?);
+        }
         let feed = a.store.updates().await?;
-        Ok(account.xml(&feed.news_xml(&a.origin), a.server_usage()?))
+        let xml = account.xml(&feed.news_xml(&a.origin), a.server_usage()?);
+        Ok((xml, browser.and_then(|b| b.cookie)))
     }
     .await;
     match result {
-        Ok(xml) => ([("content-type", "application/xml")], xml).into_response(),
+        Ok((xml, cookie)) => browser_link::with_cookie(
+            &a,
+            ([("content-type", "application/xml")], xml).into_response(),
+            cookie,
+        ),
         Err(e) if e.is::<crate::store::InvalidCredentials>() => {
             tracing::info!("legacy character-list credentials rejected");
             (
@@ -1306,10 +1319,7 @@ async fn handle_inner(
                             a.store.disable_recovery(owner).await?;
                             "Discord password recovery disabled. All recovery codes and reset links revoked.".into()
                         }
-                        _ => {
-                            let code = a.store.issue_discord_code(owner).await?;
-                            format!("Use /link code:{code} with the official Discord bot within five minutes. This makes your Discord identity visible on hiscores. Keep this code private.")
-                        }
+                        _ => "Use /link in Discord to link your game account.".into(),
                     };
                     lifecycle::stage(Stage::Settled);
                     Ok::<_, anyhow::Error>(reply)
@@ -2562,6 +2572,12 @@ fn routes(a: &App, client: PathBuf) -> Router {
         .route("/api/collection/{account}", get(collection))
         .route("/internal/discord/announce", post(discord_announce))
         .route("/internal/discord/link", post(discord_link))
+        .route("/internal/discord/link/start", post(browser_link::issue))
+        .route("/api/account/browser", post(browser_link::browser))
+        .route("/api/account/browser/close", post(browser_link::close))
+        .route("/api/account/link/start", post(browser_link::start))
+        .route("/api/account/link/complete", post(browser_link::complete))
+        .route("/api/account/link/callback", get(browser_link::callback))
         .route("/internal/discord/kick", post(discord_kick))
         .route("/internal/discord/recover", post(discord_recover))
         .route("/api/account/recover", post(reset_password));

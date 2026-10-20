@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 
 mod account_actions;
 mod accounts;
+pub(crate) mod browser_link;
 mod character_slots;
 mod vaults;
 pub use vaults::{VAULT_CHESTS, VAULT_PRICE};

@@ -67,6 +67,7 @@ impl Store {
             ensure!(!conflict, "a game or Discord account is already linked; links are never silently replaced");
             tx.execute("INSERT INTO discord_links(account,discord_id) VALUES(?1,?2)", params![account,discord])?;
             tx.execute("DELETE FROM discord_codes WHERE account=?1", [account])?;
+            tx.execute("INSERT INTO discord_recovery(account,enabled_at,last_issued_at) VALUES(?1,?2,0) ON CONFLICT(account) DO NOTHING", params![account,time])?;
             let rewarded = gold::grant(&tx, account, gold::DISCORD)?;
             tx.commit()?;
             tracing::info!(account, rewarded, reward=gold::DISCORD, "Discord account linked");

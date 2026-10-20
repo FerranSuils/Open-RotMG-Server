@@ -34,6 +34,7 @@ pub(crate) fn fixture() -> (PathBuf, App) {
         connections: Arc::new(tokio::sync::Semaphore::new(32)),
         control: None,
         discord_link_token: Some("a".repeat(64)),
+        browser_links: Arc::default(),
         owners: Arc::default(),
         admission: Arc::default(),
         authentication: Arc::default(),
