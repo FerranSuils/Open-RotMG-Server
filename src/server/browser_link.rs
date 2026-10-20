@@ -678,6 +678,12 @@ pub(super) async fn complete(
                 *expected == hash(&request.token) && pending.used.load(Ordering::SeqCst) == 3,
                 "link completion receipt rejected"
             );
+            let _authentication = a.authentication.read().await;
+            ensure!(
+                a.store.linked_account(pending.discord.clone()).await?
+                    == pending.account.load(Ordering::SeqCst),
+                "account was unlinked; run /link again"
+            );
             let (_, name, _) = browser.completion.take().unwrap();
             Ok(serde_json::json!({"name":name}))
         }

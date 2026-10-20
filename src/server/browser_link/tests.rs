@@ -409,9 +409,33 @@ async fn automatic_link_requires_both_identities_and_enables_recovery_without_an
     );
     assert!(finish(&a, &cookie, &auth).await["error"].is_string());
     assert_eq!(link_status(&a, &token).await["state"], "linked");
+    let new_grant = grant(&a, "12345678901234567").await;
+    let auth = begin(&a, &cookie, &new_grant).await;
+    let response = authorization_response(&a, &cookie, &auth).await;
+    let location = reqwest::Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
+    let receipt = location
+        .fragment()
+        .unwrap()
+        .strip_prefix("result=")
+        .unwrap()
+        .to_owned();
+    // The browser can retain its receipt after the expired grant registry was pruned.
+    a.browser_links.registry.lock().unwrap().pending.clear();
     assert_eq!(
         unlink_caller(&a, "12345678901234567").await["unlinked"],
         true
+    );
+    assert!(
+        value(
+            complete(
+                State(a.clone()),
+                headers(&a, Some(&cookie)),
+                Json(StartRequest { token: receipt })
+            )
+            .await
+        )
+        .await["error"]
+            .is_string()
     );
     assert_eq!(link_status(&a, &token).await["state"], "expired");
     assert!(
