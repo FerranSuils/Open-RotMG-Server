@@ -123,6 +123,7 @@ mod tests {
             State(app.clone()),
             ConnectInfo(peer),
             HeaderMap::new(),
+            Query(HashMap::new()),
             Form(form),
         )
         .await;

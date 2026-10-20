@@ -22,6 +22,7 @@ async fn list(a: &App, guid: &str, password: &str, extra: &[(&str, &str)]) -> (S
             State(a.clone()),
             ConnectInfo("127.0.0.1:1234".parse().unwrap()),
             HeaderMap::new(),
+            Query(HashMap::new()),
             Form(form),
         )
         .await,
@@ -99,6 +100,7 @@ async fn chars_origin_and_rate_denials_do_not_masquerade_as_credentials() {
             State(a.clone()),
             ConnectInfo("127.0.0.1:1234".parse().unwrap()),
             headers,
+            Query(HashMap::new()),
             Form(HashMap::new()),
         )
         .await,

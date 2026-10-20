@@ -21,12 +21,14 @@ async fn linked(store: &Store, guid: &str, email: &str, discord: &str) -> i32 {
     account
 }
 #[tokio::test]
-async fn recovery_requires_scoped_consent_revokes_replays_and_changes_only_owner() {
+async fn linking_enables_recovery_and_revocation_replays_and_resets_stay_owner_scoped() {
     let (dir, content, s) = fixture();
     let discord = "1558662335076376578";
     let other_discord = "1558662335076376579";
     let account = linked(&s, "owner", "owner@example.org", discord).await;
     let other = linked(&s, "other", "other@example.org", other_discord).await;
+    assert!(s.issue_reset(discord.into(), None).await.is_ok());
+    s.disable_recovery(account).await.unwrap();
     assert!(s.issue_reset(discord.into(), None).await.is_err());
     let code = s.issue_recovery_code(account).await.unwrap();
     assert!(s.issue_recovery_code(account).await.is_err());

@@ -62,6 +62,18 @@ async fn boundary(kind: &str, fault: &str) {
             a.store.list("boundary-owner".into()).await.unwrap().id,
         )
     };
+    if registered {
+        let code = a.store.issue_discord_code(account).await.unwrap();
+        a.store
+            .redeem_discord_code(code, "12345678901234567".into())
+            .await
+            .unwrap();
+        // This fixture exercises recovery-store faults, not a previous linking notification.
+        a.store
+            .gold_notified(account, vec![crate::store::gold::DISCORD.into()])
+            .await
+            .unwrap();
+    }
     let ch = a
         .store
         .create(account, a.content.get(WIZARD).unwrap())
@@ -163,7 +175,7 @@ async fn boundary(kind: &str, fault: &str) {
     }
     if fault == "sql" {
         let table = if kind == "discord" {
-            "discord_codes"
+            "recovery_codes"
         } else {
             "account_lists"
         };
@@ -178,12 +190,12 @@ async fn boundary(kind: &str, fault: &str) {
         None
     };
     if kind == "discord" && fault == "ordinary" {
-        socket.send(text_packet("/discord")).await;
+        socket.send(text_packet("/discord recovery")).await;
         let response = socket.receive(wire::TEXT).await;
         assert_eq!(Reader::new(&response.body).utf().unwrap(), "*Discord*");
         assert_eq!(
             db.query_row(
-                "SELECT count(*) FROM discord_codes WHERE account=?1",
+                "SELECT count(*) FROM recovery_codes WHERE account=?1",
                 [account],
                 |r| r.get::<_, i32>(0)
             )
@@ -224,7 +236,7 @@ async fn boundary(kind: &str, fault: &str) {
                 body: body.0,
             }
         }
-        "discord" => text_packet("/discord"),
+        "discord" => text_packet("/discord recovery"),
         "move" => {
             let mut body = Writer::new();
             body.i32(0)
@@ -286,7 +298,7 @@ async fn boundary(kind: &str, fault: &str) {
     }
     if fault == "lost_store" {
         let table = if kind == "discord" {
-            "discord_codes"
+            "recovery_codes"
         } else {
             "account_lists"
         };
@@ -438,7 +450,7 @@ async fn boundary(kind: &str, fault: &str) {
         if kind == "discord" {
             assert_eq!(
                 db.query_row(
-                    "SELECT count(*) FROM discord_codes WHERE account=?1",
+                    "SELECT count(*) FROM recovery_codes WHERE account=?1",
                     [account],
                     |r| r.get::<_, i32>(0)
                 )
