@@ -184,11 +184,13 @@ mod tests {
     #[test]
     fn explicit_state_does_not_change_client_or_origin() {
         let (original, _) = Config::load(&[]).unwrap();
-        let (isolated, _) = Config::load(&["--state".into(), "/tmp/qa-state".into()]).unwrap();
+        let qa = std::env::temp_dir().join("qa-state");
+        let (isolated, _) =
+            Config::load(&["--state".into(), qa.to_string_lossy().into_owned()]).unwrap();
         assert_eq!(
             (isolated.state, isolated.client, isolated.origin),
             (
-                PathBuf::from("/tmp/qa-state"),
+                qa,
                 original.client,
                 original.origin
             )
@@ -196,10 +198,11 @@ mod tests {
     }
     #[test]
     fn prepared_sessions_require_an_explicitly_disabled_automatic_roster() {
-        assert!(Config::load(&["--test-state".into(), "/tmp/explicit-qa".into()]).is_err());
+        let qa = std::env::temp_dir().join("explicit-qa").to_string_lossy().into_owned();
+        assert!(Config::load(&["--test-state".into(), qa.clone()]).is_err());
         let (prepared, control) = Config::load(&[
             "--test-state".into(),
-            "/tmp/explicit-qa".into(),
+            qa,
             "--no-shore-bots".into(),
         ])
         .unwrap();

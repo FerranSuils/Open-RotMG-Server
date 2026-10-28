@@ -1950,4 +1950,114 @@
     </Texture>
     <NoWalk />
   </Ground>
+  <!-- custom content: pixel-art/inject.py -->
+  <Ground type="0x08" id="Forgotten Crypt Floor">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x241</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x0d" id="Forgotten Crypt Floor 2">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x242</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x09" id="Lava Forge Floor">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x24e</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x0e" id="Lava Forge Floor 2">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x24f</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x0a" id="Jungle Temple Floor">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x25b</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x0f" id="Jungle Temple Floor 2">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x25c</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x0b" id="Frozen Cavern Floor">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x268</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x10" id="Frozen Cavern Floor 2">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x269</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x27" id="Dreamscape Labyrinth Floor 2">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x276</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x20" id="Kitchen Floor">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x282</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x29" id="Kitchen Floor 2">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x283</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x28" id="Candyland Floor">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x28f</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x2b" id="Candyland Floor 2">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x290</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x2a" id="Haunted Cemetery Floor">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x29c</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x38" id="Haunted Cemetery Floor 2">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x29d</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x37" id="Cave of a Thousand Treasures Floor">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x2a9</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x39" id="Cave of a Thousand Treasures Floor 2">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x2aa</Index>
+    </Texture>
+  </Ground>
+  <Ground type="0x11" id="Lair of Shaitan Floor">
+    <Texture>
+      <File>lofiObj3</File>
+      <Index>0x2b1</Index>
+    </Texture>
+  </Ground>
+  <!-- /custom content -->
 </GroundTypes>

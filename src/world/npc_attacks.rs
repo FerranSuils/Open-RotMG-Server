@@ -61,6 +61,23 @@ impl World {
             }
             return Ok(Some(schedule));
         }
+        if crate::dungeon::tomb::ROSTER.contains(&e.kind) {
+            return Ok(Some(attacks::tomb_schedule(
+                e.kind,
+                e.stage.unwrap_or(0),
+                elapsed,
+            )));
+        }
+        if crate::dungeon::shaitan::ROSTER.contains(&e.kind) {
+            return Ok(Some(self.shaitan_schedule(id)));
+        }
+        if crate::dungeon::lab::ROSTER.contains(&e.kind) {
+            return Ok(Some(attacks::lab_schedule(
+                e.kind,
+                e.stage.unwrap_or(0),
+                elapsed,
+            )));
+        }
         if crate::encounter::landmarks::ROSTER.contains(&e.kind) {
             let state = e.stage.context("landmark attack phase missing")?;
             let script = e
@@ -205,13 +222,19 @@ impl World {
                 }
             };
             match attack.action {
-                Action::Grenade { radius, damage } => {
-                    self.throw_grenade(
-                        id,
-                        target.context("targeted grenade has no target")?,
-                        radius,
-                        damage,
-                    )?;
+                Action::Grenade {
+                    radius,
+                    damage,
+                    scatter,
+                } => {
+                    let mut at = target.context("targeted grenade has no target")?;
+                    if scatter > 0. {
+                        let reach = scatter * self.rng.gen_range(0f32..1.).sqrt();
+                        let angle = self.rng.gen_range(0f32..std::f32::consts::TAU);
+                        at.x += reach * angle.cos();
+                        at.y += reach * angle.sin();
+                    }
+                    self.throw_grenade(id, at, radius, damage)?;
                 }
                 Action::Shoot { projectile, choice } => {
                     let projectile = match choice {

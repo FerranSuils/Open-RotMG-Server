@@ -181,6 +181,8 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     file.write_all(&serde_json::to_vec(value)?)?;
     file.sync_all()?;
     fs::rename(&temp, path)?;
+    // Windows cannot open a directory handle for syncing; NTFS renames are durable enough there.
+    #[cfg(not(windows))]
     fs::File::open(path.parent().context("artifact directory missing")?)?.sync_all()?;
     Ok(())
 }
@@ -700,6 +702,22 @@ pub(crate) async fn spawn(a: &App, t: &Testing, spec: Spawn) -> Result<Value> {
         manors: 0,
         beaches: 0,
         davy_lockers: 0,
+        tombs: 0,
+        mad_labs: 0,
+        shaitans: 0,
+        themed_more: [0; 5],
+        themed_dungeons: [0; 4],
+        augments: Vec::new(),
+        augment_offer: Vec::new(),
+        augment_panel: false,
+        autoshot: Default::default(),
+        potions: 0,
+        abilities: 0,
+        teleports: 0,
+        god_kills: 0,
+        cube_kills: 0,
+        oryx_kills: 0,
+        level_assists: 0,
     };
     preview.gain_experience(
         &a.content,

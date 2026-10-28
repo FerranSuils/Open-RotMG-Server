@@ -53,7 +53,7 @@ impl Store {
             let mut xml = format!("<FameList timespan=\"{span}\">");
             let mut mine_listed = false;
             {
-                let mut q = tx.prepare("SELECT snapshot,equipment_fame FROM deaths WHERE died_at>?1 AND died_at<=?2 ORDER BY json_extract(snapshot,'$.fame')+equipment_fame DESC,died_at ASC,character ASC LIMIT 20")?;
+                let mut q = tx.prepare("SELECT snapshot,bonus_fame FROM deaths WHERE died_at>?1 AND died_at<=?2 ORDER BY json_extract(snapshot,'$.fame')+bonus_fame DESC,died_at ASC,character ASC LIMIT 20")?;
                 for row in q.query_map(params![cutoff,now],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i32>(1)?)))? {
                     let (raw, equipment) = row?;
                     let c = decode_character(&raw,legacy_base)?;
@@ -62,7 +62,7 @@ impl Store {
                 }
             }
             if !mine_listed && account > 0 && character > 0 {
-                let mut q = tx.prepare("SELECT snapshot,equipment_fame FROM deaths JOIN characters ON characters.id=deaths.character WHERE characters.account=?1 AND deaths.character=?2 AND died_at>?3 AND died_at<=?4")?;
+                let mut q = tx.prepare("SELECT snapshot,bonus_fame FROM deaths JOIN characters ON characters.id=deaths.character WHERE characters.account=?1 AND deaths.character=?2 AND died_at>?3 AND died_at<=?4")?;
                 for row in q.query_map(params![account,character,cutoff,now],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i32>(1)?)))? {
                     let (raw, equipment) = row?;
                     xml.push_str(&entry("MyFameListElem",&decode_character(&raw,legacy_base)?,equipment)?);

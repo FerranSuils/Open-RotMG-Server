@@ -502,7 +502,7 @@ async fn launch(
                     let decision = brain.decide(&view, &app.content)?;
                     let timings={let mut p=brain.performance.lock().expect("bot timings poisoned");p.work("decision",deciding);p.report()};
                     if let Some(timings)=timings {
-                        tracing::info!(name=profile.name,world=%view.map.name,world_id=view.session.world,player=view.session.player,known_tiles=view.tiles.len(),
+                        tracing::debug!(name=profile.name,world=%view.map.name,world_id=view.session.world,player=view.session.player,known_tiles=view.tiles.len(),
                             cover_tiles=brain.cover.len(),visited_tiles=brain.visits.len(),
                             blocked_routes=brain.blocked.len(),tracks=brain.tracks.len(),contacts=brain.contacts.len(),
                             navigation_rebuilds=brain.navigation_rebuilds,navigation_reuses=brain.navigation_reuses,
@@ -517,7 +517,7 @@ async fn launch(
                         }
                     }
                     if decision.goal != brain.goal {
-                        tracing::info!(player=id,name=profile.name,tick=view.tick,hp=view.character.hp,
+                        tracing::debug!(player=id,name=profile.name,tick=view.tick,hp=view.character.hp,
                             experience=view.character.experience,x=view.position.x,y=view.position.y,
                             goal=?decision.goal,"autonomous decision");
                     }
@@ -540,7 +540,7 @@ async fn launch(
                         Ok(()) => {},
                         Err(error) => {
                             if let Some(pos) = brain.destination { brain.blocked.insert(tile(pos), view.tick + 100); }
-                            tracing::warn!(player=id,%error,actions=diagnostic,"autonomous commands rejected; route excluded and will reassess");
+                            tracing::debug!(player=id,%error,actions=diagnostic,"autonomous commands rejected; route excluded and will reassess");
                             continue;
                         }
                     }

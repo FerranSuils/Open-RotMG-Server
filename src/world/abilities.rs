@@ -114,6 +114,7 @@ impl World {
             .context("ability cooldown overflow")?;
         let p = self.players.get_mut(&id).unwrap();
         p.character.mp -= item.mana_cost;
+        p.character.abilities += 1;
         p.ability_ready_ms = ability_ready_ms;
         tracing::info!(
             player = id,

@@ -124,7 +124,11 @@ async fn native_password_change_is_durable_atomic_and_preserves_account_state() 
     funding.hp = 0;
     funding.alive = false;
     app.store
-        .death(funding, "prepared password fixture funding".into())
+        .death(
+            funding,
+            "prepared password fixture funding".into(),
+            serde_json::json!({}),
+        )
         .await
         .unwrap();
     let mut character = app
@@ -293,7 +297,7 @@ async fn native_password_change_is_durable_atomic_and_preserves_account_state() 
         "repairing the SQL trigger must not clear the fence"
     );
     server.abort();
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -436,7 +440,7 @@ async fn native_password_change_rejects_invalid_requests_and_all_existing_owners
             == verifier
     );
     server.abort();
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 async fn until(mut predicate: impl FnMut() -> bool) {
@@ -619,6 +623,6 @@ async fn native_password_changes_serialize_with_reset_and_hello_ownership() {
         }
         assert!(app.owners.lock().unwrap().is_empty());
         server.abort();
-        std::fs::remove_dir_all(dir).unwrap();
+        crate::test_fs::remove_dir_all(&dir);
     }
 }

@@ -440,12 +440,12 @@ impl Brain {
             && let Some(destination) = self.destination
         {
             self.blocked.insert(tile(destination), v.tick + 100);
-            tracing::warn!(player=v.session.player,tick=v.tick,goal=?self.goal,x=destination.x,y=destination.y,"autonomous route made no progress; temporarily excluded");
+            tracing::debug!(player=v.session.player,tick=v.tick,goal=?self.goal,x=destination.x,y=destination.y,"autonomous route made no progress; temporarily excluded");
             self.heading = self.rng.gen_range(0.0..std::f32::consts::TAU);
             self.stationary = v.tick;
         }
         self.previous = v.position;
-        self.visits.insert(tile(v.position), v.tick);
+        remember_visit(&mut self.visits, tile(v.position), v.tick);
         let mut decision = Decision {
             goal: Goal::Wait,
             movement: None,
@@ -1186,6 +1186,18 @@ fn angle(a: Pos, b: Pos) -> f32 {
 }
 fn tile(p: Pos) -> (i16, i16) {
     (p.x.floor() as i16, p.y.floor() as i16)
+}
+/// Exploration only compares recent nearby visits; a bot roaming one Realm for hours must not keep
+/// every tile it ever stood on, so past this size only the newest half is kept.
+const VISIT_MEMORY: usize = 8192;
+fn remember_visit(visits: &mut BTreeMap<TilePoint, u64>, at: TilePoint, tick: u64) {
+    visits.insert(at, tick);
+    if visits.len() > VISIT_MEMORY {
+        let mut ticks: Vec<u64> = visits.values().copied().collect();
+        let keep = VISIT_MEMORY / 2;
+        let cutoff = *ticks.select_nth_unstable(visits.len() - keep).1;
+        visits.retain(|_, t| *t >= cutoff);
+    }
 }
 fn center(t: (i16, i16)) -> Pos {
     Pos {

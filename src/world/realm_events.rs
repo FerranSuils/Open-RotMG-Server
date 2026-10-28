@@ -27,31 +27,48 @@ impl World {
         }
         for kind in quest::EVENTS {
             let pos = self.place_named_setpiece(kind, &[1])?;
-            let root = self.spawn_entity(kind, pos, vec![])?;
-            let e = self.entities.get_mut(&root).unwrap();
-            e.quest = Some(root);
-            e.stage = Some(0);
-            e.next_aux = match kind {
+            let root = self.spawn_event_root(kind, pos)?;
+            tracing::info!(entity = root, kind, "finite Realm event placed");
+        }
+        Ok(())
+    }
+    /// An event boss with its ownership and, for the Pentaract, its five towers.
+    pub(super) fn spawn_event_root(&mut self, kind: u16, pos: Pos) -> Result<i32> {
+        let root = self.spawn_entity(kind, pos, vec![])?;
+        let e = self.entities.get_mut(&root).unwrap();
+        e.quest = Some(root);
+        e.stage = Some(0);
+        e.next_aux = self.now
+            + match kind {
                 0xd56 => 500,
                 0xd59 => 1500,
                 _ => 0,
             };
-            if kind == 0xd5f {
-                e.condition |= condition::bit(condition::INVINCIBLE);
-                for n in 0..5 {
-                    let a = n as f32 * std::f32::consts::TAU / 5.;
-                    let tower = Pos {
-                        x: pos.x + ((a.cos() * 15. + 17.) as i32 - 17) as f32,
-                        y: pos.y + ((a.sin() * 15. + 17.) as i32 - 17) as f32,
-                    };
-                    let id = self.spawn_entity(0xd5e, tower, vec![])?;
-                    let e = self.entities.get_mut(&id).unwrap();
-                    e.quest = Some(root);
-                    e.home = tower;
-                    e.stage = Some(0);
+        if kind == 0xd5f {
+            e.condition |= condition::bit(condition::INVINCIBLE);
+            // A blocked tower would leave an invincible clock that refuses every tick: undo the set-piece.
+            if let Err(error) = self.spawn_pentaract_towers(root, pos) {
+                for tower in self.quest_members(root, &[0xd5e]) {
+                    self.remove_entity(tower);
                 }
+                self.remove_entity(root);
+                return Err(error);
             }
-            tracing::info!(entity = root, kind, "finite Realm event placed");
+        }
+        Ok(root)
+    }
+    fn spawn_pentaract_towers(&mut self, root: i32, pos: Pos) -> Result<()> {
+        for n in 0..5 {
+            let a = n as f32 * std::f32::consts::TAU / 5.;
+            let tower = Pos {
+                x: pos.x + ((a.cos() * 15. + 17.) as i32 - 17) as f32,
+                y: pos.y + ((a.sin() * 15. + 17.) as i32 - 17) as f32,
+            };
+            let id = self.spawn_entity(0xd5e, tower, vec![])?;
+            let e = self.entities.get_mut(&id).unwrap();
+            e.quest = Some(root);
+            e.home = tower;
+            e.stage = Some(0);
         }
         Ok(())
     }

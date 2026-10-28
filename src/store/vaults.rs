@@ -99,7 +99,7 @@ pub(super) fn migrate(db: &Connection, version: i32) -> Result<()> {
         &["account", "items", "revision"]
     };
     ensure!(
-        (0..=15).contains(&version)
+        (0..=18).contains(&version)
             && mask == (version >= 13)
             && columns
                 .iter()
@@ -212,7 +212,7 @@ impl Store {
 pub(super) fn legacy_fixture(db: &Connection) -> Result<()> {
     ensure!(
         !db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM deaths WHERE equipment_fame<>0)",
+            "SELECT EXISTS(SELECT 1 FROM deaths WHERE bonus_fame<>0)",
             [],
             |r| r.get::<_, bool>(0)
         )?,
@@ -223,7 +223,7 @@ pub(super) fn legacy_fixture(db: &Connection) -> Result<()> {
             .get::<_, bool>(0))?,
         "legacy fixture cannot discard saved pictures"
     );
-    db.execute_batch("DROP TABLE pictures; DROP TABLE picture_sequence; ALTER TABLE deaths DROP COLUMN equipment_fame")?;
+    db.execute_batch("DROP TABLE pictures; DROP TABLE picture_sequence; ALTER TABLE deaths DROP COLUMN bonuses; ALTER TABLE deaths DROP COLUMN bonus_fame")?;
     let current: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('vaults') WHERE name='chest')",
         [],

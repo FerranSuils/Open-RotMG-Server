@@ -224,7 +224,7 @@ async fn migration_does_not_backfill_and_reopen_preserves_claims_and_notificatio
         .await
         .unwrap();
     assert!(Store::open(&path, &content).is_err());
-    std::fs::remove_file(path).unwrap();
+    crate::test_fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -270,7 +270,7 @@ async fn bug_reward_preserves_v10_claims_and_is_once_across_concurrency_and_rest
     assert_eq!(s.gold(account).await.unwrap().balance, 350);
     assert!(s.gold(account).await.unwrap().rewards.is_empty());
     drop(s);
-    std::fs::remove_file(path).unwrap();
+    crate::test_fs::remove_file(&path);
 }
 
 #[tokio::test]

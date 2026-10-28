@@ -3,6 +3,24 @@ use super::*;
 pub(super) struct ChatBudget {
     updated: Instant,
     tokens: f32,
+    last: String,
+    repeats: u8,
+}
+
+/// Levenshtein distance, for the repeated-message filter (messages are at most 128 characters).
+fn distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let next = row[j + 1];
+            row[j + 1] = (row[j] + 1).min(next + 1).min(previous + usize::from(ca != cb));
+            previous = next;
+        }
+    }
+    row[b.len()]
 }
 
 pub(crate) const ANNOUNCEMENT: &str = "@ANNOUNCEMENT";
@@ -159,6 +177,8 @@ impl Directory {
         let budget = self.chat_budgets.entry(account).or_insert(ChatBudget {
             updated: now,
             tokens: 3.,
+            last: String::new(),
+            repeats: 0,
         });
         let elapsed = now
             .checked_duration_since(budget.updated)
@@ -170,6 +190,28 @@ impl Directory {
             controller("Chat rate limit: wait one second before sending again.")
         );
         budget.tokens -= 1.;
+        Ok(())
+    }
+
+    /// Three near-identical messages in a row (within the budget's three-second memory) are spam.
+    fn chat_repeat(&mut self, account: i32, message: &str) -> Result<()> {
+        let normalized = message
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        let budget = self
+            .chat_budgets
+            .get_mut(&account)
+            .context("chat budget missing after permit")?;
+        let similar = !budget.last.is_empty()
+            && distance(&normalized, &budget.last) <= normalized.chars().count() / 5;
+        budget.repeats = if similar { budget.repeats.saturating_add(1) } else { 0 };
+        budget.last = normalized;
+        ensure!(
+            budget.repeats < 2,
+            controller("Stop repeating yourself.")
+        );
         Ok(())
     }
 
@@ -187,6 +229,10 @@ impl Directory {
         let tell = command.eq_ignore_ascii_case("/tell") || command.eq_ignore_ascii_case("/t");
         let guild_chat =
             command.eq_ignore_ascii_case("/g") || command.eq_ignore_ascii_case("/guild");
+        let augment =
+            command.eq_ignore_ascii_case("/augment") || command.eq_ignore_ascii_case("/augments");
+        let pet = command.eq_ignore_ascii_case("/pet") || command.eq_ignore_ascii_case("/pets");
+        let autoshot = command.eq_ignore_ascii_case("/autoshot");
         ensure!(
             !trimmed.starts_with('/')
                 || tell
@@ -196,6 +242,9 @@ impl Directory {
                 || trade
                 || yell
                 || guild_chat
+                || augment
+                || pet
+                || autoshot
                 || trimmed.eq_ignore_ascii_case("/pause"),
             controller("Unknown chat command.")
         );
@@ -234,6 +283,21 @@ impl Directory {
             controller("Choose a name before using /tell.")
         );
         self.chat_permit(id, now)?;
+        if pet {
+            return self
+                .resolve(Target::Player(id))?
+                .pet_command(id, rest.trim());
+        }
+        if autoshot {
+            return self
+                .resolve(Target::Player(id))?
+                .autoshot_command(id, rest.trim());
+        }
+        if augment {
+            return self
+                .resolve(Target::Player(id))?
+                .augment_command(id, rest.trim());
+        }
         if server {
             ensure!(rest.trim().is_empty(), controller("Usage: /server"));
             let world = self.resolve(Target::Player(id))?;
@@ -283,6 +347,7 @@ impl Directory {
             tracing::info!(player=id, account, world=%world.name, players=names.len(), "who roster sent");
             return Ok(());
         }
+        self.chat_repeat(account, if guild_chat || tell || yell { rest } else { trimmed })?;
         if guild_chat {
             let guild = guild.ok_or_else(|| controller("You are not in a guild."))?;
             let message = rest.trim();
@@ -374,5 +439,27 @@ impl Directory {
         }
         tracing::info!(player=id, account, world=%world.name, yell, recipients, bytes=text.len(), "local chat delivered");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_messages_are_refused_after_two_near_copies() {
+        let mut d = super::super::tests::directory();
+        let world = d.worlds.keys().next().copied().unwrap();
+        let character = super::super::tests::ch(&d.worlds[&world]);
+        let id = d.worlds.get_mut(&world).unwrap().enter(character, None).unwrap();
+        let account = d.worlds[&world].players[&id].character.account;
+        let now = Instant::now();
+        d.chat_permit(id, now).unwrap();
+        d.chat_repeat(account, "Buy  my sword").unwrap();
+        d.chat_repeat(account, "buy my sword!").unwrap();
+        let error = d.chat_repeat(account, "BUY MY SWORD").unwrap_err();
+        assert!(error.to_string().contains("repeating"), "{error}");
+        d.chat_repeat(account, "something else entirely").unwrap();
+        assert_eq!(distance("kitten", "sitting"), 3);
     }
 }

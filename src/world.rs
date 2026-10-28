@@ -17,6 +17,7 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 mod abilities;
+mod autoshot;
 
 mod cell_index;
 mod charges;
@@ -67,6 +68,10 @@ mod population_density;
 mod quest_tests;
 
 mod realm_events;
+mod oryx;
+mod tomb;
+mod lab;
+mod shaitan;
 
 mod realm_portal;
 mod realm_quests;
@@ -80,13 +85,18 @@ mod tracked;
 pub(crate) use chat::{chat_error, chat_info, chat_private, validate as validate_chat};
 pub use endgame::ForcedTransfer;
 mod abyss;
+mod augments;
 mod beach;
+mod bosses;
 mod coil;
 mod jungle;
 #[cfg(test)]
 mod jungle_tests;
+mod pets;
+mod regalia;
 
 mod cooperative;
+mod admin;
 
 mod mechanics;
 
@@ -106,9 +116,11 @@ mod progression;
 
 pub(crate) mod shop;
 mod trade;
+mod travel;
 pub(crate) mod view;
 
 pub use trade::{TradeAction, TradePlan};
+pub use travel::Travel;
 #[derive(Clone)]
 pub struct Output {
     pub packets: mpsc::Sender<Packet>,
@@ -328,6 +340,28 @@ pub struct Player {
     mp_fraction: f32,
     pub pending: bool,
     pub experience_queued: i32,
+    /// Offer slot chosen with /augment, applied by the next progress save.
+    augment_choice: Option<usize>,
+    /// Pending /augment panel preference, persisted by the next progress save.
+    augment_panel_toggle: Option<bool>,
+    /// Pending /pet choice (None inside = no pet), persisted by the next progress save.
+    pet_choice: Option<Option<u16>>,
+    /// /autoshot is switched on (not saved: it starts off every login).
+    autoshot_on: bool,
+    /// Earliest world ms of the next autoshot volley.
+    autoshot_at: u64,
+    /// Bullet id of the next autoshot bullet (128..=255; the client counts 0..127 itself).
+    autoshot_bullet: u8,
+    /// Pending /autoshot settings, persisted by the next progress save.
+    autoshot_choice: Option<crate::autoshot::Settings>,
+    /// Earliest world ms of the pet's next timed ability (heal, mana, fireball).
+    pet_at: u64,
+    /// The card overlay is showing; the player is invulnerable meanwhile.
+    pub(crate) panel_open: bool,
+    /// Last tick with a hostile enemy nearby; the overlay waits for calm after this.
+    last_combat_at: u64,
+    /// When an overlay page last polled for this player (world ms); none for overlay-less clients.
+    panel_seen_at: Option<u64>,
     clears_queued: [u64; crate::dungeon::DUNGEONS.len()],
     pub(crate) progress_started: bool,
     pub death_pending: bool,
@@ -405,7 +439,14 @@ impl Player {
         }
     }
     fn progress_queued(&self) -> bool {
-        self.experience_queued != 0 || self.clears_queued != [0; crate::dungeon::DUNGEONS.len()]
+        self.experience_queued != 0
+            || self.clears_queued != [0; crate::dungeon::DUNGEONS.len()]
+            || self.augment_choice.is_some()
+            || self.augment_panel_toggle.is_some()
+            || self.pet_choice.is_some()
+            || self.autoshot_choice.is_some()
+            || (crate::augments::pending(&self.character) > 0
+                && self.character.augment_offer.is_empty())
     }
     fn active(&self) -> bool {
         self.character.alive
@@ -555,6 +596,7 @@ pub struct World {
     named_births: Vec<named_births::Birth>,
     manor_births: Vec<manor::Toss>,
     lava_patches: BTreeMap<usize, (u64, u8)>,
+    shaitan: Option<shaitan::Fight>,
     locker: Option<davy::Locker>,
     ability_state: abilities::State,
     companions: companions::State,
@@ -571,6 +613,15 @@ pub struct World {
     pub(crate) prepared_seed: Option<u64>,
     pub tick: u64,
     ids: Arc<AtomicI32>,
+    /// Live fame standings, refreshed by the directory every tick.
+    pub standings: Arc<crate::regalia::Standings>,
+    regalia: regalia::Followers,
+    /// Worst simulation stall (execution or lateness) in the last five seconds, stamped by the directory.
+    pub server_stall_ms: u64,
+    /// Last announced bullet-hell phase (index, enraged) per custom boss.
+    boss_phases: BTreeMap<i32, (usize, bool)>,
+    /// Minions each boss has summoned and that are still alive.
+    boss_minions: BTreeMap<i32, Vec<i32>>,
     pub name: String,
     pub safe: bool,
     pub owner: Option<i32>,
@@ -592,6 +643,8 @@ pub struct World {
     closed_vaults: BTreeMap<i32, i32>,
     trades: BTreeMap<i32, trade::Trade>,
     trade_requests: BTreeMap<i32, (i32, u64)>,
+    /// Landing cell per character id for a pending transfer (/glands), consumed on entry.
+    arrivals: BTreeMap<i32, Pos>,
 }
 fn allocate_id(ids: &AtomicI32) -> Result<i32> {
     let mut id = ids.load(Ordering::Relaxed);
@@ -647,6 +700,7 @@ pub struct Directory {
     performance: crate::performance::Window,
     max_players: usize,
     prepared_seed: Option<u64>,
+    pub standings: Arc<crate::regalia::Standings>,
 }
 impl Directory {
     pub fn bug_context(&self, player: i32) -> Result<serde_json::Value> {
@@ -824,6 +878,7 @@ impl Directory {
             performance: crate::performance::Window::default(),
             max_players,
             prepared_seed,
+            standings: Arc::default(),
         };
         for (id, template, name, safe) in [
             (-1, "tutorial", "Tutorial", false),
@@ -910,6 +965,30 @@ impl Directory {
                     .prepared_seed
                     .map_or_else(rand::random, |s| s ^ self.next_world as u64);
                 Arc::new(crate::dungeon::davy::generate(&self.content, seed)?)
+            } else if template == crate::dungeon::tomb::TEMPLATE {
+                let seed = self
+                    .prepared_seed
+                    .map_or_else(rand::random, |s| s ^ self.next_world as u64);
+                Arc::new(crate::dungeon::tomb::generate(&self.content, seed)?)
+            } else if template == crate::dungeon::lab::TEMPLATE {
+                let seed = self
+                    .prepared_seed
+                    .map_or_else(rand::random, |s| s ^ self.next_world as u64);
+                Arc::new(crate::dungeon::lab::generate(&self.content, seed)?)
+            } else if template == crate::dungeon::shaitan::TEMPLATE {
+                let seed = self
+                    .prepared_seed
+                    .map_or_else(rand::random, |s| s ^ self.next_world as u64);
+                Arc::new(crate::dungeon::shaitan::generate(&self.content, seed)?)
+            } else if let Some(theme) = crate::dungeon::procedural::theme(template) {
+                let seed = self
+                    .prepared_seed
+                    .map_or_else(rand::random, |s| s ^ self.next_world as u64);
+                Arc::new(crate::dungeon::procedural::generate(
+                    &self.content,
+                    theme,
+                    seed,
+                )?)
             } else if template == "undead-lair" {
                 let seed = self
                     .prepared_seed
@@ -1176,7 +1255,7 @@ impl Directory {
         let destination = match kind {
             0x712 if origin == -2 && portal == Some(self.realm_portal) => self.initial(-3)?,
             0x703 if world.name == "Snake Pit" => self.initial(-3)?,
-            0x703 | 0x70d | 0x712 | 0x71d => -2,
+            0x703 | 0x70d | 0x712 | 0x71d | crate::dungeon::tomb::COWARDICE => -2,
             0x704 | 0x70e | 0x71c => self.initial(-3)?,
             0x720 => self.instance("vault", Some(account))?,
             0x72f => {
@@ -1351,8 +1430,18 @@ impl Directory {
                         .values()
                         .any(|p| p.character.account == g.account && p.character.id == g.character))
         });
+        let stall_ms = self
+            .diagnostic_ticks
+            .iter()
+            .rev()
+            .take_while(|(at, _, _)| at.elapsed().as_secs() < 5)
+            .map(|(_, execution, late)| (*execution).max(*late) / 1000)
+            .max()
+            .unwrap_or(0);
         for (id, world) in &mut self.worlds {
             let _context = crate::supervision::world(*id, self.tick);
+            world.standings = self.standings.clone();
+            world.server_stall_ms = stall_ms;
             world.step();
             world.report_performance(*id);
             if *id > 0 && *id != self.endgame.active {
@@ -1469,7 +1558,8 @@ impl Handle {
                         directory.performance.record("scheduling_lateness", std::time::Duration::from_micros(late));
                         directory.diagnostic_ticks.push_back((start, us, late));
                         while directory.diagnostic_ticks.front().is_some_and(|(t, _, _)| t.elapsed().as_secs() > 120) { directory.diagnostic_ticks.pop_front(); }
-                        if us>25_000 {tracing::warn!(tick=directory.tick,elapsed_us=us,"slow aggregate simulation tick");}
+                        // Only over-budget ticks are worth a warning; production logs grew by gigabytes a day at 25 ms.
+                        if us>50_000 {tracing::warn!(tick=directory.tick,elapsed_us=us,"slow aggregate simulation tick");} else if us>25_000 {tracing::debug!(tick=directory.tick,elapsed_us=us,"slow aggregate simulation tick");}
                         if directory.tick.is_multiple_of(100) { directory.max_tick_us=0; }
                         if let Some(timings)=directory.performance.report() {
                             tracing::info!(tick=directory.tick,worlds=directory.worlds.len(),
@@ -1706,6 +1796,9 @@ impl World {
                                 | crate::dungeon::snake::initial_condition(kind)
                                 | crate::dungeon::jungle::initial_condition(kind)
                                 | crate::dungeon::davy::initial_condition(kind)
+                                | crate::dungeon::tomb::initial_condition(kind)
+                                | crate::dungeon::lab::initial_condition(kind)
+                                | crate::dungeon::shaitan::initial_condition(kind)
                                 | if o.stasis_immune {
                                     crate::condition::bit(crate::condition::STASIS_IMMUNE)
                                 } else {
@@ -1823,6 +1916,7 @@ impl World {
             named_births: Vec::new(),
             manor_births: Vec::new(),
             lava_patches: BTreeMap::new(),
+            shaitan: None,
             locker: None,
             ability_state: abilities::State::default(),
             companions: companions::State::default(),
@@ -1840,6 +1934,11 @@ impl World {
             prepared_seed: None,
             tick: 0,
             ids,
+            standings: Arc::default(),
+            regalia: regalia::Followers::default(),
+            server_stall_ms: 0,
+            boss_phases: BTreeMap::new(),
+            boss_minions: BTreeMap::new(),
             name: "Development tutorial".into(),
             safe: false,
             owner: None,
@@ -1861,6 +1960,7 @@ impl World {
             closed_vaults: BTreeMap::new(),
             trades: BTreeMap::new(),
             trade_requests: BTreeMap::new(),
+            arrivals: BTreeMap::new(),
         };
         world.jungle_initialize()?;
         Ok(world)
@@ -2038,6 +2138,9 @@ impl World {
                         | crate::dungeon::snake::initial_condition(kind)
                         | crate::dungeon::jungle::initial_condition(kind)
                         | crate::dungeon::davy::initial_condition(kind)
+                        | crate::dungeon::tomb::initial_condition(kind)
+                        | crate::dungeon::lab::initial_condition(kind)
+                        | crate::dungeon::shaitan::initial_condition(kind)
                         | (if kind == 0x91a {
                             crate::condition::bit(crate::condition::INVULNERABLE)
                         } else {
@@ -2232,7 +2335,8 @@ impl World {
             "account already in this world"
         );
         let id = allocate_id(&self.ids)?;
-        let pos = if let Some(pos) = position {
+        let arrival = (self.arrivals.remove(&ch.id)).filter(|pos| self.walkable(*pos));
+        let pos = if let Some(pos) = position.or(arrival) {
             pos
         } else {
             let &(x, y) = self
@@ -2281,6 +2385,17 @@ impl World {
                 mp_fraction: 0.,
                 pending: false,
                 experience_queued: 0,
+                augment_choice: None,
+                augment_panel_toggle: None,
+                pet_choice: None,
+                autoshot_on: false,
+                autoshot_at: 0,
+                autoshot_bullet: 128,
+                autoshot_choice: None,
+                pet_at: 0,
+                panel_open: false,
+                last_combat_at: 0,
+                panel_seen_at: None,
                 clears_queued: [0; crate::dungeon::DUNGEONS.len()],
                 progress_started: false,
                 death_pending: false,
@@ -2326,6 +2441,13 @@ impl World {
             y = pos.y,
             "player entered development world"
         );
+        if self.name == "Realm" {
+            let p = &self.players[&id];
+            let welcome = chat::chat_info("Welcome to Monetary's Realm");
+            send(p, welcome.id, welcome.body);
+            let oryx = chat::text_packet("Oryx the Mad God", -1, 0, "You are food for my minions!");
+            send(p, oryx.id, oryx.body);
+        }
         Ok(id)
     }
 
@@ -2354,7 +2476,8 @@ impl World {
             for (k, v) in [
                 (0, values[0]),
                 (1, p.character.hp),
-                (2, 100),
+                // Drawn size: the class object's Size (32x32 frames use 25, see pixel-art/inject.py).
+                (2, self.content.get(p.character.class)?.size),
                 (3, values[1]),
                 (4, p.character.mp),
                 (5, crate::store::experience_goal(p.character.level)?),
@@ -3184,15 +3307,8 @@ impl World {
         p.character.shots += 1;
         let multiplier = if ability {
             1.
-        } else if condition & crate::condition::bit(crate::condition::WEAK) != 0 {
-            0.5
         } else {
-            (0.5 + (f64::from(p.effective(&self.content, self.now)?[2]) / 75.) * (2. - 0.5))
-                * if condition & crate::condition::bit(crate::condition::DAMAGING) != 0 {
-                    1.5
-                } else {
-                    1.
-                }
+            autoshot::damage_multiplier(p, &self.content, self.now, condition)?
         };
         let damage = (f64::from(draw) * multiplier) as i32;
         self.bullets.push(Bullet {
@@ -3245,6 +3361,42 @@ impl World {
                 Some((slot.kind as u16, time, plan.is_ok(), 0));
         }
         plan
+    }
+    /// `/pot hp|mp` (the client's potion boxes and hotkeys): drinks the first health or magic potion in the
+    /// backpack slots, smallest first, exactly as if the player had used it from that slot.
+    pub fn drink(&mut self, id: i32, magic: bool) -> Result<Option<InventoryPlan>> {
+        const HEALTH: [i32; 3] = [0xab0, 0xa22, 0xaeb];
+        const MAGIC: [i32; 3] = [0xadd, 0xa23, 0xaec];
+        let kinds = if magic { MAGIC } else { HEALTH };
+        let p = self.players.get(&id).context("player missing")?;
+        let (slot, kind) = kinds
+            .iter()
+            .find_map(|k| {
+                p.character
+                    .items
+                    .iter()
+                    .enumerate()
+                    .skip(4)
+                    .find(|(_, item)| *item == k)
+                    .map(|(slot, item)| (slot, *item))
+            })
+            .ok_or_else(|| {
+                controller(if magic {
+                    "No magic potions in your inventory."
+                } else {
+                    "No health potions in your inventory."
+                })
+            })?;
+        let pos = p.pos;
+        self.use_item(
+            id,
+            Slot {
+                object: id,
+                slot,
+                kind,
+            },
+            pos,
+        )
     }
     pub fn use_item(&mut self, id: i32, slot: Slot, pos: Pos) -> Result<Option<InventoryPlan>> {
         self.cancel_trade(id, "Trade cancelled by inventory mutation.");
@@ -3309,6 +3461,10 @@ impl World {
             self.activate_ability(id, slot, &item, pos)?;
             return Ok(None);
         }
+        if slot.object == id && matches!(item.kind, 0xab0 | 0xa22 | 0xaeb | 0xadd | 0xa23 | 0xaec) {
+            self.players.get_mut(&id).unwrap().character.potions += 1;
+        }
+        let p = &self.players[&id];
         if matches!(
             item.activate.as_str(),
             "Pet" | "PermaPet" | "Create" | "UnlockPortal"
@@ -3909,7 +4065,8 @@ impl World {
             let mut snapshot = p.character.clone();
             let result = (|| -> Result<()> {
                 snapshot.gain_experience(&self.content, p.experience_queued, &mut self.rng)?;
-                for (count, queued) in std::iter::once(&mut snapshot.pirate_caves)
+                // One persisted counter per DUNGEONS entry, in the same order.
+                let counters: Vec<&mut u64> = std::iter::once(&mut snapshot.pirate_caves)
                     .chain(snapshot.dungeons.iter_mut())
                     .chain(std::iter::once(&mut snapshot.abysses))
                     .chain(std::iter::once(&mut snapshot.trenches))
@@ -3918,11 +4075,30 @@ impl World {
                     .chain(std::iter::once(&mut snapshot.manors))
                     .chain(std::iter::once(&mut snapshot.beaches))
                     .chain(std::iter::once(&mut snapshot.davy_lockers))
-                    .zip(p.clears_queued)
-                {
+                    .chain(snapshot.themed_dungeons.iter_mut())
+                    .chain(std::iter::once(&mut snapshot.tombs))
+                    .chain(std::iter::once(&mut snapshot.mad_labs))
+                    .chain(std::iter::once(&mut snapshot.shaitans))
+                    .chain(snapshot.themed_more.iter_mut())
+                    .collect();
+                ensure!(
+                    counters.len() == p.clears_queued.len(),
+                    "dungeon clear counters do not match registered dungeons"
+                );
+                for (count, queued) in counters.into_iter().zip(p.clears_queued) {
                     *count = count
                         .checked_add(queued)
                         .context("dungeon clear counter overflow")?;
+                }
+                crate::augments::advance(&mut snapshot, p.augment_choice.take(), &mut self.rng)?;
+                if let Some(pet) = p.pet_choice.take() {
+                    snapshot.pet_kind = pet;
+                }
+                if let Some(settings) = p.autoshot_choice.take() {
+                    snapshot.autoshot = settings;
+                }
+                if let Some(enabled) = p.augment_panel_toggle.take() {
+                    snapshot.augment_panel = enabled;
                 }
                 Ok(())
             })();
@@ -3959,7 +4135,12 @@ impl World {
             || snapshot.spider_dens > p.character.spider_dens
             || snapshot.manors > p.character.manors
             || snapshot.beaches > p.character.beaches
-            || snapshot.davy_lockers > p.character.davy_lockers;
+            || snapshot.davy_lockers > p.character.davy_lockers
+            || snapshot.themed_dungeons != p.character.themed_dungeons
+            || snapshot.tombs > p.character.tombs
+            || snapshot.mad_labs > p.character.mad_labs
+            || snapshot.shaitans > p.character.shaitans
+            || snapshot.themed_more != p.character.themed_more;
         let leveled = snapshot.level > p.character.level;
         p.character.exp = snapshot.exp;
         p.character.xp_boost = snapshot.xp_boost;
@@ -3981,6 +4162,26 @@ impl World {
         p.character.manors = snapshot.manors;
         p.character.beaches = snapshot.beaches;
         p.character.davy_lockers = snapshot.davy_lockers;
+        p.character.themed_dungeons = snapshot.themed_dungeons;
+        p.character.tombs = snapshot.tombs;
+        p.character.mad_labs = snapshot.mad_labs;
+        p.character.shaitans = snapshot.shaitans;
+        p.character.themed_more = snapshot.themed_more;
+        let previous_augments = std::mem::replace(&mut p.character.augments, snapshot.augments);
+        let previous_offer =
+            std::mem::replace(&mut p.character.augment_offer, snapshot.augment_offer);
+        augments::announce(p, &previous_augments, &previous_offer);
+        if std::mem::replace(&mut p.character.augment_panel, snapshot.augment_panel)
+            != snapshot.augment_panel
+        {
+            augments::announce_panel(p);
+        }
+        p.character.autoshot = snapshot.autoshot;
+        let pet_changed =
+            std::mem::replace(&mut p.character.pet_kind, snapshot.pet_kind) != snapshot.pet_kind;
+        if pet_changed {
+            pets::announce(p);
+        }
         if leveled && !p.death_pending {
             let values = p.effective(&self.content, self.now)?;
             p.character.hp = values[0];
@@ -3990,6 +4191,15 @@ impl World {
         }
         p.pending = false;
         p.progress_started = false;
+        let pos = p.pos;
+        if leveled {
+            for (other, p) in &mut self.players {
+                if *other != id && p.character.alive && p.pos.distance(pos) < 25. {
+                    p.character.level_assists += 1;
+                }
+            }
+        }
+        let p = &self.players[&id];
         tracing::info!(
             player = id,
             level = p.character.level,
@@ -4000,6 +4210,9 @@ impl World {
             xp_boost = p.character.xp_boost.active,
             "progress committed"
         );
+        if pet_changed {
+            self.swap_permanent_pet(id, snapshot.pet_kind)?;
+        }
         if cleared_dungeon && let Some(exit) = self.clear_exit.take() {
             self.entities
                 .get_mut(&exit)
@@ -4014,13 +4227,13 @@ impl World {
         Ok(())
     }
     #[cfg(test)]
-    pub fn pending_deaths(&mut self) -> Vec<(i32, Character, String)> {
+    pub fn pending_deaths(&mut self) -> Vec<(i32, Character, (String, serde_json::Value))> {
         self.pending_deaths_where(|_, _| true)
     }
     pub(crate) fn pending_deaths_where(
         &mut self,
         mut accept: impl FnMut(i32, i32) -> bool,
-    ) -> Vec<(i32, Character, String)> {
+    ) -> Vec<(i32, Character, (String, serde_json::Value))> {
         let dying: Vec<_> = self
             .players
             .iter()
@@ -4041,7 +4254,14 @@ impl World {
                 p.death_started = true;
                 let mut c = p.character.clone();
                 c.alive = false;
-                Some((id, c, p.killer.clone()))
+                // What the server knew at the moment of death; decides later whether it may be reversed.
+                let evidence = serde_json::json!({
+                    "killed_by": p.killer, "world": self.name, "position": [p.pos.x, p.pos.y],
+                    "server_stall_ms": self.server_stall_ms,
+                    "client_input_age_ms": self.now.saturating_sub(p.last_move_at),
+                    "tick": self.tick,
+                });
+                Some((id, c, (p.killer.clone(), evidence)))
             })
             .collect()
     }
@@ -4238,7 +4458,7 @@ impl World {
                 let cap = (crate::store::experience_goal(p.character.level)
                     .expect("validated player level") as f32
                     * if definition.quest { 0.5 } else { 0.1 }) as i32;
-                let amount = reward.min(cap);
+                let amount = crate::pets::experience(p.character.pet_kind, reward.min(cap));
                 p.experience_queued = p
                     .experience_queued
                     .checked_add(amount)
@@ -4295,11 +4515,12 @@ impl World {
             .map(|(id, _)| id);
         // Self-destruction has no final player bullet, so the largest eligible contributor owns its kill statistic.
         if let Some(owner) = owner {
-            let p = self.players.get_mut(&owner).unwrap();
-            p.character.kills += 1;
-            if self.content.objects[&kind].quest {
-                p.character.quests += 1;
-            }
+            let definition = &self.content.objects[&kind];
+            self.players.get_mut(&owner).unwrap().character.record_kill(
+                kind,
+                definition.quest,
+                &definition.group,
+            );
         }
         self.defeat_entity(id)?;
         tracing::info!(entity = id, kind, ?owner, "timed enemy defeat");
@@ -4313,9 +4534,25 @@ impl World {
         {
             self.critical_deaths.push(original);
         }
+        if crate::endgame::HEROES.contains(&defeated.kind)
+            || crate::quest::final_root(defeated.kind)
+            || matches!(defeated.kind, 0x678 | 0xd54 | 0xd50)
+        {
+            self.oryx_guardian_fell(defeated);
+        }
+        // The Tomb clears when the last of its three bosses falls, whichever one it is.
+        let boss_kind = if crate::dungeon::tomb::BOSSES.contains(&defeated.kind)
+            && !self
+                .actors()
+                .any(|e| crate::dungeon::tomb::BOSSES.contains(&e.kind))
+        {
+            crate::dungeon::tomb::DEFENDER
+        } else {
+            defeated.kind
+        };
         if let Some(index) = crate::dungeon::DUNGEONS
             .iter()
-            .position(|(_, _, name, boss)| *name == self.name && *boss == defeated.kind)
+            .position(|(_, _, name, boss)| *name == self.name && *boss == boss_kind)
         {
             ensure!(!self.cleared, "dungeon clear already recorded");
             self.cleared = true;
@@ -4339,11 +4576,12 @@ impl World {
                 let kind = if defeated.kind == crate::dungeon::abyss::MALPHAS {
                     0x71c
                 } else if matches!(
-                    defeated.kind,
+                    boss_kind,
                     crate::dungeon::snake::BOSS
                         | crate::dungeon::jungle::BOSS
                         | crate::dungeon::beach::BOSS
                         | crate::dungeon::davy::BOSS
+                        | crate::dungeon::tomb::DEFENDER
                 ) {
                     0x704
                 } else {
@@ -4395,7 +4633,10 @@ impl World {
             100
         } else if defeated.kind == crate::dungeon::manor::COFFIN {
             800
-        } else if matches!(defeated.kind, 0x927 | crate::dungeon::davy::BOSS) {
+        } else if matches!(
+            defeated.kind,
+            0x927 | crate::dungeon::davy::BOSS | crate::dungeon::shaitan::BALLOON
+        ) {
             100
         } else {
             (self.content.objects[&defeated.kind].hp / 10).max(1)
@@ -4704,6 +4945,7 @@ impl World {
                 })
                 .map(|(_, p)| p);
             let wake = match kind {
+                k if crate::dungeon::shaitan::ROSTER.contains(&k) => 40.,
                 crate::dungeon::manor::KAGE
                 | crate::dungeon::manor::BAT
                 | crate::dungeon::manor::CHASER
@@ -4794,6 +5036,12 @@ impl World {
                 )
             } else if crate::dungeon::manor::ROSTER.contains(&kind) {
                 self.manor_movement(id, target, elapsed)
+            } else if crate::dungeon::tomb::ROSTER.contains(&kind) {
+                self.tomb_movement(id)
+            } else if crate::dungeon::lab::ROSTER.contains(&kind) {
+                self.lab_movement(id)
+            } else if crate::dungeon::shaitan::ROSTER.contains(&kind) {
+                self.shaitan_movement(id)
             } else if crate::dungeon::trench::ROSTER.contains(&kind) {
                 self.ocean_movement(id, target, elapsed)
             } else if crate::encounter::landmarks::ROSTER.contains(&kind) {
@@ -5330,6 +5578,7 @@ impl World {
         let started = crate::performance::Measure::start();
         self.now += 50;
         self.tick += 1;
+        self.oryx_step();
         self.expire_consumable_boosts();
         self.companion_step()
             .expect("validated companion simulation");
@@ -5670,11 +5919,20 @@ impl World {
                 p.tick += 1;
             }
         }
+        if let Err(error) = self.regalia_step() {
+            tracing::error!(%error, "prestige visuals failed");
+        }
+        self.boss_phase_step();
+        self.autoshot_step();
+        self.pet_step();
+        if let Err(error) = self.augments_step() {
+            tracing::error!(%error, "fame augments failed");
+        }
         self.performance.borrow_mut().work("step", started);
     }
     fn report_performance(&self, world_id: i32) {
         if let Some(timings) = self.performance.borrow_mut().report() {
-            tracing::info!(world_id,world=%self.name, entities=self.entities.len(), actors=self.actor_ids.len(),
+            tracing::debug!(world_id,world=%self.name, entities=self.entities.len(), actors=self.actor_ids.len(),
                 bullets=self.bullets.len(),compact_entities=self.entities.shared(),scenery_promotions=self.entities.promotions,spatial_cells=self.cells.len(),known_entities=self.players.values().map(|p|p.known.len()).sum::<usize>(),
                 pending_shoot_acks=self.players.values().map(|p|p.shoot_acks.len()).sum::<usize>(),
                 weapon_tick_records=self.players.values().map(|p|p.weapon_ticks.len()).sum::<usize>(),
@@ -5706,6 +5964,8 @@ mod timing_example;
 mod ground_dye_tests;
 #[cfg(test)]
 mod manor_tests;
+#[cfg(test)]
+mod procedural_tests;
 #[cfg(test)]
 mod view_navigation_tests;
 
@@ -5786,6 +6046,22 @@ mod tests {
             manors: 0,
             beaches: 0,
             davy_lockers: 0,
+            themed_dungeons: [0; 4],
+            tombs: 0,
+            mad_labs: 0,
+            shaitans: 0,
+            themed_more: [0; 5],
+            augments: Vec::new(),
+            augment_offer: Vec::new(),
+            augment_panel: false,
+            autoshot: Default::default(),
+            potions: 0,
+            abilities: 0,
+            teleports: 0,
+            god_kills: 0,
+            cube_kills: 0,
+            oryx_kills: 0,
+            level_assists: 0,
         }
     }
 
@@ -5879,6 +6155,11 @@ mod tests {
         let deaths = w.pending_deaths();
         assert_eq!(deaths.len(), 1);
         assert!(!deaths[0].1.alive);
+        let evidence = &deaths[0].2.1;
+        assert!(
+            evidence["server_stall_ms"].is_u64() && evidence["client_input_age_ms"].is_u64(),
+            "death evidence captured"
+        );
         assert!(w.pending_deaths().is_empty());
         w.finish_death(id).unwrap();
         assert!(!w.players[&id].character.alive);
@@ -6014,6 +6295,24 @@ mod tests {
         assert!(w.entities[&uncertain].reserved);
         assert!(!w.visible(owner).contains(&uncertain));
         assert_eq!(w.players[&other].character.items[5], 0xa22);
+    }
+
+    #[test]
+    fn blocked_pentaract_tower_undoes_the_whole_set_piece() {
+        let mut w = world();
+        let tower = |pos: Pos, n: i32| {
+            let a = n as f32 * std::f32::consts::TAU / 5.;
+            Pos {
+                x: pos.x + ((a.cos() * 15. + 17.) as i32 - 17) as f32,
+                y: pos.y + ((a.sin() * 15. + 17.) as i32 - 17) as f32,
+            }
+        };
+        let pos = (0..w.map.height)
+            .flat_map(|y| (0..w.map.width).map(move |x| Pos { x: x as f32 + 0.5, y: y as f32 + 0.5 }))
+            .find(|p| w.walkable(*p) && (0..5).any(|n| !w.walkable(tower(*p, n))))
+            .unwrap();
+        w.spawn_event_root(0xd5f, pos).unwrap_err();
+        assert!(w.entities.values().all(|e| !matches!(e.kind, 0xd5e | 0xd5f)));
     }
 
     #[test]

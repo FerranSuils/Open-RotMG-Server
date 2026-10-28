@@ -90,7 +90,7 @@ async fn purchase_is_atomic_versioned_and_durable_without_resetting_fame_or_coll
         .unwrap(),
         0
     );
-    std::fs::remove_file(path).unwrap();
+    crate::test_fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -111,7 +111,7 @@ async fn purchase_rolls_back_debit_if_inventory_write_fails() {
         s.load(ch.account, ch.id).await.unwrap().revision,
         ch.revision
     );
-    std::fs::remove_file(path).unwrap();
+    crate::test_fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -139,9 +139,11 @@ async fn purchase_rejects_foreign_dead_guest_invalid_price_and_extra_items_witho
     let mut dead = ch.clone();
     dead.hp = 0;
     dead.alive = false;
-    s.death(dead, "test".into()).await.unwrap();
+    s.death(dead, "test".into(), serde_json::json!({}))
+        .await
+        .unwrap();
     let (write, buy) = offer(&ch, 0, 7);
     assert!(s.purchase(write, buy).await.is_err());
     assert_eq!(s.presentation(ch.account).await.unwrap().credits, 100);
-    std::fs::remove_file(path).unwrap();
+    crate::test_fs::remove_file(&path);
 }

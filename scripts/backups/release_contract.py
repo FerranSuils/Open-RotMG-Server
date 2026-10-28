@@ -51,6 +51,14 @@ def check(binary, data, directory, revision):
     created = next(row for row in paid['characters'] if row['id'] == character)
     expected['characters'].append(created)
     expected['deaths'].append(next(row for row in paid['deaths'] if row['character'] == character))
+    logged = [row for row in paid['fame_log'] if row['character'] == character]
+    if [row['amount'] for row in logged] != [19]:
+        raise RuntimeError('Release restored death did not record its fame history')
+    expected['fame_log'] = sorted(expected['fame_log'] + logged, key=lambda r: (r['account'], r['character'], r['amount'], r['earned_at']))
+    evidence = [row for row in paid['death_evidence'] if row['character'] == character]
+    if [row['award'] for row in evidence] != [20]:
+        raise RuntimeError('Release restored death did not record its evidence and award')
+    expected['death_evidence'] = expected['death_evidence'] + evidence
     account = created['account']
     member = next(row for row in expected['guild_members'] if row['account'] == account)
     wallet = next(row for row in expected['account_fame'] if row['account'] == account)

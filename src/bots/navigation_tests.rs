@@ -101,3 +101,25 @@ fn unseen_terrain_cannot_change_controller_decisions_or_randomness() {
         }
     }
 }
+
+#[test]
+fn visit_memory_stays_bounded_and_keeps_the_newest_tiles() {
+    let mut visits = BTreeMap::new();
+    for tick in 0..3 * VISIT_MEMORY as u64 {
+        remember_visit(
+            &mut visits,
+            ((tick % 1000) as i16, (tick / 1000) as i16),
+            tick,
+        );
+        assert!(visits.len() <= VISIT_MEMORY);
+    }
+    let newest = 3 * VISIT_MEMORY as u64 - 1;
+    assert_eq!(
+        visits.get(&((newest % 1000) as i16, (newest / 1000) as i16)),
+        Some(&newest)
+    );
+    assert!(
+        !visits.contains_key(&(0, 0)),
+        "the oldest visits are forgotten"
+    );
+}

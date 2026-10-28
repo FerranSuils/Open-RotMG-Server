@@ -56,10 +56,11 @@ impl Content {
         ensure!(
             object.class == "Character"
                 && !object.enemy
-                && self.objects.values().any(|item| item
-                    .companion
-                    .as_ref()
-                    .is_some_and(|c| c.permanent && c.object == object.name)),
+                && (crate::pets::is_pet(kind)
+                    || self.objects.values().any(|item| item
+                        .companion
+                        .as_ref()
+                        .is_some_and(|c| c.permanent && c.object == object.name))),
             "unrecognized saved companion"
         );
         Ok(())

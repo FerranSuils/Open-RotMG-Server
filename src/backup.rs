@@ -176,6 +176,7 @@ pub async fn run(args: &[String]) -> Result<bool> {
                 character.pirate_caves = 4;
                 character.abysses = 5;
                 character.trenches = 6;
+                character.themed_dungeons = [7, 8, 9, 10];
                 store.progress(character.clone()).await?;
                 let mut items = character.items.clone();
                 items[4] = 0xa22;
@@ -229,12 +230,19 @@ pub async fn run(args: &[String]) -> Result<bool> {
                     store
                         .create(account.id, content.get(content::WIZARD)?)
                         .await?;
+                    store
+                        .set_crown_reign(Some((account.id, 1_700_000_000)))
+                        .await?;
                 } else {
                     character.fame = 11000;
                     character.alive = false;
                     character.hp = 0;
                     store
-                        .death(character, "Backup contract fixture".into())
+                        .death(
+                            character,
+                            "Backup contract fixture".into(),
+                            serde_json::json!({}),
+                        )
                         .await?;
                     let mut funding = store
                         .create_prepared(
@@ -265,7 +273,13 @@ pub async fn run(args: &[String]) -> Result<bool> {
                     funding.fame = 12500;
                     funding.hp = 0;
                     funding.alive = false;
-                    store.death(funding, "Guild backup fixture".into()).await?;
+                    store
+                        .death(
+                            funding,
+                            "Guild backup fixture".into(),
+                            serde_json::json!({}),
+                        )
+                        .await?;
                     store
                         .change_guild(account.id, store::GuildAction::Upgrade { level: 1 })
                         .await?;
@@ -317,6 +331,8 @@ pub async fn run(args: &[String]) -> Result<bool> {
                 store.picture(*id).await?;
             }
             store.updates().await?;
+            store.fame_board(0, 100).await?;
+            store.crown_reign().await?;
             for (account, id) in &rows {
                 store.vaults(*account).await?;
                 store.load(*account, *id).await?.effective(&content)?;
@@ -545,19 +561,24 @@ async fn exercise_death(database: &Path, data: &Path) -> Result<()> {
     ch.hp = 0;
     ch.alive = false;
     store
-        .death(ch.clone(), "Restored backup contract".into())
+        .death(
+            ch.clone(),
+            "Restored backup contract".into(),
+            serde_json::json!({}),
+        )
         .await?;
     drop(store);
     let reopened = store::Store::open(database, &content)?;
     let archived: (String, i32, i64) = db.query_row(
-        "SELECT snapshot,equipment_fame,died_at FROM deaths WHERE character=?1",
+        "SELECT snapshot,bonus_fame,died_at FROM deaths WHERE character=?1",
         [ch.id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
     ensure!(
-        archived.0 == serde_json::to_string(&ch)? && archived.1 == 1 && archived.2 > 0,
+        archived.0 == serde_json::to_string(&ch)? && archived.1 >= 1 && archived.2 > 0,
         "restored death archive mismatch"
     );
+    let total = 19 + archived.1;
     let after = reopened.presentation(account).await?;
     let after_earned: i32 = db.query_row(
         "SELECT earned FROM account_fame WHERE account=?1",
@@ -571,11 +592,11 @@ async fn exercise_death(database: &Path, data: &Path) -> Result<()> {
         |r| r.get(0),
     )?;
     ensure!(
-        after_earned == earned + 20
-            && after.fame == before.fame + 20
-            && after_guild.fame == guild.fame + 20
-            && after_guild.earned == guild.earned + 20
-            && after_contribution == contribution + 20,
+        after_earned == earned + total
+            && after.fame == before.fame + total
+            && after_guild.fame == guild.fame + total
+            && after_guild.earned == guild.earned + total
+            && after_contribution == contribution + total,
         "restored death payout ledger mismatch"
     );
     let cleared: (bool, String) = db.query_row(
@@ -590,9 +611,8 @@ async fn exercise_death(database: &Path, data: &Path) -> Result<()> {
     let detail = reopened.fame(account, ch.id).await?;
     ensure!(
         detail.contains("<BaseFame>19</BaseFame>")
-            && detail.contains("<TotalFame>20</TotalFame>")
-            && detail
-                .contains("<Bonus id=\"Well Equipped\" desc=\"Bonus for equipment\">1</Bonus>"),
+            && detail.contains(&format!("<TotalFame>{total}</TotalFame>"))
+            && detail.contains("<Bonus id=\"Well Equipped\" desc=\"Bonus for equipment\">"),
         "restored death detail mismatch"
     );
     let legends = reopened.legends("all".into(), account, ch.id).await?;
@@ -601,13 +621,13 @@ async fn exercise_death(database: &Path, data: &Path) -> Result<()> {
         doc.descendants().any(
             |n| n.attribute("charId") == Some(ch.id.to_string().as_str())
                 && n.children()
-                    .any(|c| c.has_tag_name("TotalFame") && c.text() == Some("20"))
+                    .any(|c| c.has_tag_name("TotalFame") && c.text() == Some(total.to_string().as_str()))
         ),
         "restored death Legends mismatch"
     );
     println!(
         "{}",
-        serde_json::json!({"exercised_death": ch.id, "base_fame":19,"equipment_fame":1,"total_fame":20})
+        serde_json::json!({"exercised_death": ch.id, "base_fame":19,"bonus_fame":archived.1,"total_fame":total})
     );
     Ok(())
 }

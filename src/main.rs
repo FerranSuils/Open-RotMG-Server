@@ -1,3 +1,5 @@
+mod augments;
+mod autoshot;
 mod backup;
 mod bots;
 mod clock;
@@ -11,13 +13,39 @@ mod endgame;
 mod loot;
 mod navigation;
 mod performance;
+mod pets;
 mod quest;
+mod regalia;
 mod server;
 mod store;
 mod supervision;
 mod terrain;
 mod wire;
 mod world;
+
+#[cfg(test)]
+pub(crate) mod test_fs {
+    /// Windows keeps SQLite files locked until their connection thread exits; a leaked
+    /// temporary directory is not a test failure.
+    pub fn remove_dir_all(dir: &std::path::Path) {
+        for _ in 0..20 {
+            if std::fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        eprintln!("leaked test directory {}", dir.display());
+    }
+    pub fn remove_file(path: &std::path::Path) {
+        for _ in 0..20 {
+            if std::fs::remove_file(path).is_ok() || !path.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        eprintln!("leaked test file {}", path.display());
+    }
+}
 use anyhow::{Result, ensure};
 use rand::RngCore;
 use std::sync::Arc;
@@ -159,6 +187,8 @@ async fn serve(args: Vec<String>) -> Result<()> {
         picture_reads: Arc::default(),
         connections: Arc::new(tokio::sync::Semaphore::new(config.max_players * 2)),
         control,
+        operator_token: server::operator::token(&state)?,
+        panels: Arc::default(),
         discord_link_token: match std::env::var("DISCORD_LINK_TOKEN_FILE") {
             Ok(path) => {
                 let token = std::fs::read_to_string(path)?;

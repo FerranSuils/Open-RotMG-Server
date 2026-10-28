@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monetary's Realm Leaderboard</title>
+<style>
+  :root { --bg:#0f1016; --panel:#1b1d26; --edge:#262a36; --text:#ecebe4; --muted:#8f97a6; --gold:#f0c43c; --blue:#4a8ae8; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); image-rendering:pixelated;
+    font:bold 13px/1.5 "Courier New", monospace; -webkit-font-smoothing:none; letter-spacing:.5px; }
+  header, main { max-width:980px; margin:auto; padding:16px; }
+  h1 { margin:0 0 4px; font-size:22px; text-transform:uppercase; color:var(--gold); text-shadow:4px 4px 0 #000;
+    display:flex; gap:12px; align-items:center; }
+  .px { width:32px; height:32px; flex:none; }
+  .px.sm { width:16px; height:16px; vertical-align:-3px; }
+  .sub { color:var(--muted); font-size:12px; }
+  nav { display:flex; gap:10px; flex-wrap:wrap; margin:14px 0 0; }
+  nav button { background:var(--panel); color:var(--text); border:0; padding:8px 14px; font:inherit; text-transform:uppercase;
+    cursor:pointer; box-shadow:0 0 0 4px #000, inset 0 0 0 4px var(--edge); }
+  nav button.on { color:#000; background:var(--gold); box-shadow:0 0 0 4px #000, inset 0 0 0 4px #a87a1c; }
+  main { display:grid; grid-template-columns:1fr 280px; gap:20px; padding-top:8px; }
+  @media (max-width:760px) { main { grid-template-columns:1fr; } }
+  .card { background:var(--panel); box-shadow:0 0 0 4px #000, 8px 8px 0 4px #000, inset 0 0 0 4px var(--edge); overflow:hidden; }
+  .king { padding:14px 16px; display:flex; gap:12px; align-items:center; border-bottom:4px solid #000; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { padding:8px 12px; text-align:left; border-bottom:4px solid var(--bg); }
+  th { color:var(--muted); font-size:11px; text-transform:uppercase; }
+  td.num, th.num { text-align:right; }
+  tr:last-child td { border-bottom:0; }
+  .pos { width:56px; color:var(--muted); }
+  .chip { display:inline-block; padding:1px 8px; font-size:11px; color:#000; background:var(--c); box-shadow:2px 2px 0 #000; }
+  .empty { padding:28px 16px; color:var(--muted); text-align:center; text-transform:uppercase; }
+  aside h2 { font-size:13px; margin:0; padding:12px 14px; text-transform:uppercase; color:var(--gold); border-bottom:4px solid #000; }
+  aside ol { list-style:none; margin:0; padding:6px 0; max-height:560px; overflow:auto; }
+  aside li { display:flex; justify-content:space-between; gap:8px; padding:3px 14px; font-size:12px; }
+  aside li span:last-child { color:var(--muted); }
+  /* pixel-scrollbars:start */
+  /* Pixel-art scrollbars (same palette as the game). */
+  /* Firefox only: Chromium ignores ::-webkit-scrollbar when scrollbar-color is set. */
+  @supports not selector(::-webkit-scrollbar) { * { scrollbar-color: #4a8ae8 #0f1016; } }
+  ::-webkit-scrollbar { width: 16px; height: 16px; background: #0f1016; }
+  ::-webkit-scrollbar-track { background: #0f1016; box-shadow: inset 0 0 0 2px #000, inset 0 0 0 4px #262a36; }
+  ::-webkit-scrollbar-thumb { background: #4a8ae8; border-radius: 0;
+    box-shadow: inset 0 0 0 2px #000, inset 4px 4px 0 2px #7fb0ff, inset -4px -4px 0 2px #25407a; }
+  ::-webkit-scrollbar-thumb:hover { background: #f0c43c; box-shadow: inset 0 0 0 2px #000, inset 4px 4px 0 2px #ffe08a, inset -4px -4px 0 2px #a87a1c; }
+  ::-webkit-scrollbar-button:single-button { display: block; width: 16px; height: 16px; background-color: #1b1d26;
+    background-size: 16px 16px; image-rendering: pixelated; box-shadow: inset 0 0 0 2px #000; }
+  ::-webkit-scrollbar-button:single-button:hover { background-color: #262a36; }
+  ::-webkit-scrollbar-button:single-button:vertical:decrement { background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8' shape-rendering='crispEdges' fill='%23ecebe4'><rect x='3' y='2' width='1' height='1'/><rect x='4' y='2' width='1' height='1'/><rect x='2' y='3' width='1' height='1'/><rect x='3' y='3' width='1' height='1'/><rect x='4' y='3' width='1' height='1'/><rect x='5' y='3' width='1' height='1'/><rect x='1' y='4' width='1' height='1'/><rect x='2' y='4' width='1' height='1'/><rect x='3' y='4' width='1' height='1'/><rect x='4' y='4' width='1' height='1'/><rect x='5' y='4' width='1' height='1'/><rect x='6' y='4' width='1' height='1'/></svg>"); }
+  ::-webkit-scrollbar-button:single-button:vertical:increment { background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8' shape-rendering='crispEdges' fill='%23ecebe4'><rect x='3' y='5' width='1' height='1'/><rect x='4' y='5' width='1' height='1'/><rect x='2' y='4' width='1' height='1'/><rect x='3' y='4' width='1' height='1'/><rect x='4' y='4' width='1' height='1'/><rect x='5' y='4' width='1' height='1'/><rect x='1' y='3' width='1' height='1'/><rect x='2' y='3' width='1' height='1'/><rect x='3' y='3' width='1' height='1'/><rect x='4' y='3' width='1' height='1'/><rect x='5' y='3' width='1' height='1'/><rect x='6' y='3' width='1' height='1'/></svg>"); }
+  ::-webkit-scrollbar-button:single-button:horizontal:decrement { background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8' shape-rendering='crispEdges' fill='%23ecebe4'><rect x='2' y='3' width='1' height='1'/><rect x='2' y='4' width='1' height='1'/><rect x='3' y='2' width='1' height='1'/><rect x='3' y='3' width='1' height='1'/><rect x='3' y='4' width='1' height='1'/><rect x='3' y='5' width='1' height='1'/><rect x='4' y='1' width='1' height='1'/><rect x='4' y='2' width='1' height='1'/><rect x='4' y='3' width='1' height='1'/><rect x='4' y='4' width='1' height='1'/><rect x='4' y='5' width='1' height='1'/><rect x='4' y='6' width='1' height='1'/></svg>"); }
+  ::-webkit-scrollbar-button:single-button:horizontal:increment { background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8' shape-rendering='crispEdges' fill='%23ecebe4'><rect x='5' y='3' width='1' height='1'/><rect x='5' y='4' width='1' height='1'/><rect x='4' y='2' width='1' height='1'/><rect x='4' y='3' width='1' height='1'/><rect x='4' y='4' width='1' height='1'/><rect x='4' y='5' width='1' height='1'/><rect x='3' y='1' width='1' height='1'/><rect x='3' y='2' width='1' height='1'/><rect x='3' y='3' width='1' height='1'/><rect x='3' y='4' width='1' height='1'/><rect x='3' y='5' width='1' height='1'/><rect x='3' y='6' width='1' height='1'/></svg>"); }
+  ::-webkit-scrollbar-corner { background: #0f1016; }
+  /* pixel-scrollbars:end */
+</style>
+</head>
+<body>
+<header>
+  <h1><svg class="px" id="cup"></svg>Monetary's Realm Leaderboard</h1>
+  <div class="sub" id="sub">Loading…</div>
+  <nav>
+    <button data-p="realtime" class="on">Live</button>
+    <button data-p="week">Weekly</button>
+    <button data-p="month">Monthly</button>
+    <button data-p="year">Yearly</button>
+  </nav>
+</header>
+<main>
+  <section class="card">
+    <div class="king" id="king" hidden></div>
+    <table>
+      <thead><tr><th class="pos">#</th><th>Player</th><th>Rank</th><th class="num" id="famehead">Living fame</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden>Nobody on this board yet.</div>
+  </section>
+  <aside class="card"><h2>Ranks by position</h2><ol id="ranks"></ol></aside>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+// 8x8 pixel sprites (same palette as the game).
+const PAL = {Y: '#f0c43c', y: '#a87a1c', W: '#ecebe4', R: '#d83a3a', B: '#4a8ae8', E: '#58d070'};
+const SPRITES = {
+  cup: ['Y......Y', 'YYYYYYYY', 'YYYWYYYy', '.YYWYYy.', '..YYYy..', '...Yy...', '..YYYy..', '.yyyyyy.'],
+  crown: ['........', 'Y..Y..Y.', 'Y..Y..Y.', 'YYYYYYY.', 'YEYRYBY.', 'YYYYYYY.', 'yyyyyyy.', '........'],
+};
+const sprite = name => `<svg viewBox="0 0 8 8" shape-rendering="crispEdges">${SPRITES[name].map((row, y) => [...row]
+  .map((c, x) => c === '.' ? '' : `<rect x="${x}" y="${y}" width="1" height="1" fill="${PAL[c]}"/>`).join('')).join('')}</svg>`;
+$('cup').outerHTML = sprite('cup').replace('<svg', '<svg class="px"');
+const LABEL = {realtime: 'Fame of their best living character', week: 'Fame earned this week (since Monday, UTC)',
+  month: 'Fame earned this month (UTC)', year: 'Fame earned this year (UTC)'};
+let period = 'realtime', timer = null;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const span = secs => secs < 3600 ? `${Math.floor(secs / 60)} min` : `${Math.floor(secs / 3600)} h ${Math.floor(secs % 3600 / 60)} min`;
+async function load() {
+  try {
+    const r = await fetch(`/api/ranking?period=${period}`, {cache: 'no-store'});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.status);
+    $('sub').textContent = `${LABEL[period]} · updated ${new Date(d.updated_at * 1000).toLocaleTimeString()}`;
+    $('famehead').textContent = period === 'realtime' ? 'Living fame' : 'Fame earned';
+    const king = d.players.find(p => p.crown);
+    $('king').hidden = !king;
+    if (king) $('king').innerHTML = sprite('crown').replace('<svg', '<svg class="px"') + `<div><b>${esc(king.name)}</b> wears the realm crown` +
+      `<div class="sub">${span(d.reign_secs)} at number 1 · glow ${d.crown_level + 1} of 6</div></div>`;
+    $('rows').innerHTML = d.players.map(p => `<tr><td class="pos">${p.position}</td>` +
+      `<td>${p.crown ? sprite('crown').replace('<svg', '<svg class="px sm"') + ' ' : ''}${esc(p.name)}</td>` +
+      `<td>${p.rank ? `<span class="chip" style="--c:${p.rank_color}">${esc(p.rank)}</span>` : ''}</td>` +
+      `<td class="num">${p.fame.toLocaleString('en')}</td></tr>`).join('');
+    $('empty').hidden = d.players.length > 0;
+    let from = 1;
+    $('ranks').innerHTML = d.ranks.map(k => { const range = k.last > 1e9 ? `${from}+` : from === k.last ? `${from}` : `${from}–${k.last}`;
+      from = k.last + 1; return `<li><span style="color:${k.color}">${esc(k.name)}</span><span>${range}</span></li>`; }).join('');
+  } catch (e) { $('sub').textContent = `Could not load the leaderboard: ${e.message}`; }
+}
+function start() { clearInterval(timer); load(); timer = setInterval(load, period === 'realtime' ? 2000 : 30000); }
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  period = b.dataset.p; start();
+});
+start();
+</script>
+</body>
+</html>

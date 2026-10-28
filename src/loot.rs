@@ -104,6 +104,66 @@ fn table(kind: u16) -> &'static [(f64, Pick)] {
             (0.01, Item(0xc25)),
         ],
         kind if crate::dungeon::davy::ROSTER.contains(&kind) || kind == 0x182e => &[],
+        crate::dungeon::tomb::SUPPORT => &[
+            (1., Item(0xae9)),
+            (0.04, Item(0xba0)),
+            (0.05, Item(0x722)),
+        ],
+        crate::dungeon::tomb::ATTACKER => &[
+            (1., Item(0xae9)),
+            (0.04, Item(0xba1)),
+            (0.05, Item(0x722)),
+        ],
+        crate::dungeon::tomb::DEFENDER => &[
+            (1., Item(0xae9)),
+            (0.04, Item(0xba2)),
+            (0.01, Item(0xc1e)),
+            (0.05, Item(0x722)),
+        ],
+        crate::dungeon::tomb::ACTIVE => &[
+            (0.15, Item(0xa22)),
+            (0.15, Item(0xb0e)),
+            (0.15, Item(0xb0c)),
+            (0.15, Item(0xb0d)),
+        ],
+        kind if crate::dungeon::tomb::ROSTER.contains(&kind) => &[],
+        crate::dungeon::lab::BOSS => &[
+            (1., Item(0xa35)),
+            (0.005, Item(0xc30)),
+            (0.005, Item(0xc32)),
+            (0.01, Item(0xc31)),
+            (0.005, Item(0x722)),
+            (0.2, Tier(8, WEAPONS)),
+            (0.15, Tier(9, WEAPONS)),
+            (0.1, Tier(10, WEAPONS)),
+            (0.05, Tier(11, WEAPONS)),
+            (0.2, Tier(8, ARMOR)),
+            (0.15, Tier(9, ARMOR)),
+            (0.1, Tier(10, ARMOR)),
+            (0.05, Tier(11, ARMOR)),
+            (0.15, Tier(4, ABILITIES)),
+            (0.1, Tier(5, ABILITIES)),
+        ],
+        kind if crate::dungeon::lab::ROSTER.contains(&kind) => &[],
+        crate::dungeon::shaitan::BALLOON => &[
+            (1., Item(0xa1f)),
+            (0.5, Item(0xa20)),
+            (0.5, Item(0xa34)),
+            (0.005, Item(0x722)),
+            (0.3, Tier(8, WEAPONS)),
+            (0.3, Tier(8, ARMOR)),
+            (0.15, Tier(9, WEAPONS)),
+            (0.15, Tier(9, ARMOR)),
+            (0.08, Tier(10, WEAPONS)),
+            (0.08, Tier(10, ARMOR)),
+            (0.03, Tier(11, WEAPONS)),
+            (0.03, Tier(11, ARMOR)),
+            (0.3, Tier(4, ABILITIES)),
+            (0.1, Tier(5, ABILITIES)),
+            (0.2, Tier(4, RINGS)),
+            (0.05, Tier(5, RINGS)),
+        ],
+        kind if crate::dungeon::shaitan::ROSTER.contains(&kind) => &[],
         0x6c4 => &[
             (0.10, Tier(2, WEAPONS)),
             (0.10, Tier(2, ARMOR)),
@@ -463,6 +523,9 @@ fn table(kind: u16) -> &'static [(f64, Pick)] {
             (0.06, Tier(4, RINGS)),
         ],
         kind if crate::endgame::ROSTER.contains(&kind) => crate::endgame::loot(kind),
+        kind if crate::dungeon::procedural::loot(kind).is_some() => {
+            crate::dungeon::procedural::loot(kind).unwrap()
+        }
         _ => panic!("loot requested without encounter profile"),
     }
 }
@@ -562,7 +625,17 @@ pub fn roll(content: &Content, kind: u16, rng: &mut impl Rng) -> Option<u16> {
 }
 pub fn rewards(content: &Content, kind: u16, rng: &mut impl Rng) -> Vec<u16> {
     let mut items = if crate::quest::final_root(kind)
-        || matches!(kind, 0xd60 | 0x1705 | crate::dungeon::trench::THESSAL)
+        || crate::dungeon::procedural::is_boss(kind)
+        || crate::dungeon::tomb::BOSSES.contains(&kind)
+        || matches!(
+            kind,
+            0xd60
+                | 0x1705
+                | crate::dungeon::trench::THESSAL
+                | crate::dungeon::tomb::ACTIVE
+                | crate::dungeon::lab::BOSS
+                | crate::dungeon::shaitan::BALLOON
+        )
         || matches!(
             kind,
             0x917
@@ -605,7 +678,13 @@ pub fn rewards(content: &Content, kind: u16, rng: &mut impl Rng) -> Vec<u16> {
 }
 pub fn private(kind: u16) -> bool {
     crate::quest::final_root(kind)
+        || crate::dungeon::procedural::is_boss(kind)
         || kind == crate::dungeon::davy::BOSS
+        || crate::dungeon::tomb::BOSSES.contains(&kind)
+        || matches!(
+            kind,
+            crate::dungeon::tomb::ACTIVE | crate::dungeon::lab::BOSS | crate::dungeon::shaitan::BALLOON
+        )
         || matches!(
             kind,
             0xd5a | 0xd60 | 0x1705 | crate::dungeon::trench::THESSAL

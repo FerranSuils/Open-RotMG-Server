@@ -22,6 +22,7 @@ class ReleaseContract(unittest.TestCase):
                 value = json.loads(db.execute('SELECT stats FROM characters WHERE alive=1').fetchone()[0])
             self.assertEqual(value['dungeons'], [1, 2, 3])
             self.assertEqual(value['abysses'], 5)
+            self.assertEqual(value['themed_dungeons'], [7, 8, 9, 10])
             with closing(sqlite3.connect(Path(temporary) / 'contract/restored/game.db')) as db:
                 self.assertEqual(db.execute('SELECT name,level,fame,earned,board FROM guilds').fetchone(),
                                  ('Backup Guild', 2, 3270, 13270, 'Welcome & prepare!\n日本語 🧙'))
@@ -31,7 +32,11 @@ class ReleaseContract(unittest.TestCase):
                 self.assertIsNone(rewards[0][1])
                 self.assertIsNone(rewards[1][1])
                 self.assertGreater(rewards[2][1], 0)
-                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 15)
+                self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 17)
+                restored = json.loads(db.execute('SELECT stats FROM characters WHERE alive=1 ORDER BY id').fetchone()[0])
+                self.assertEqual(restored['themed_dungeons'], [7, 8, 9, 10])
+                self.assertEqual(db.execute('SELECT since FROM crown_reign').fetchall(), [(1700000000,)])
+                self.assertEqual(sorted(r[0] for r in db.execute('SELECT amount FROM fame_log')), [19, 11000, 12500])
                 for table, column, default in [('characters', 'revision', '0'), ('characters', 'alive', '1'), ('deaths', 'died_at', 'unixepoch()')]:
                     with self.subTest(default=table + '.' + column):
                         self.assertEqual(db.execute('SELECT dflt_value FROM pragma_table_xinfo(?) WHERE name=?', (table, column)).fetchone(), (default,))
@@ -46,8 +51,27 @@ class ReleaseContract(unittest.TestCase):
                     with self.subTest(row=row), self.assertRaises(sqlite3.IntegrityError):
                         db.execute('INSERT INTO gold_rewards VALUES(?,?,?,?)', row)
             bundle = json.loads(gzip.decompress((Path(temporary) / 'contract/state.json.gz').read_bytes()))
-            self.assertEqual(bundle['schema'], 15)
+            self.assertEqual(bundle['schema'], 17)
             self.assertEqual([r['equipment_fame'] for r in bundle['game']['deaths']], [0, 750])
+            self.assertEqual(sorted(r['amount'] for r in bundle['game']['fame_log']), [11000, 12500])
+            self.assertEqual(len(bundle['game']['crown_reign']), 1)
+            self.assertEqual(sorted(r['award'] for r in bundle['game']['death_evidence']), [11000, 13250])
+            for field, bad in [('award', 7), ('character', 99999), ('evidence', '[]'), ('restored_at', 5)]:
+                malformed = deepcopy(bundle)
+                malformed['game']['death_evidence'][0][field] = bad
+                with self.subTest(death_evidence=(field, bad)), self.assertRaisesRegex(ValueError, 'Death evidence|death evidence|Invalid'):
+                    backup.validate(malformed)
+            for field, bad in [('amount', 0), ('amount', 11001), ('amount', '5'), ('earned_at', 0), ('account', 99999), ('character', 99999)]:
+                malformed = deepcopy(bundle)
+                malformed['game']['fame_log'][0][field] = bad
+                with self.subTest(fame_log=(field, bad)), self.assertRaisesRegex(ValueError, 'Fame history|fame history'):
+                    backup.validate(malformed)
+            for reign in [{'id': 2, 'account': bundle['game']['crown_reign'][0]['account'], 'since': 1},
+                          {'id': 1, 'account': 99999, 'since': 1}, {'id': 1, 'account': bundle['game']['crown_reign'][0]['account'], 'since': 0}]:
+                malformed = deepcopy(bundle)
+                malformed['game']['crown_reign'] = [reign]
+                with self.subTest(reign=reign), self.assertRaisesRegex(ValueError, 'crown'):
+                    backup.validate(malformed)
             for award in [None, True, -1, 1.5, '750', 2147483648, 751]:
                 malformed = deepcopy(bundle)
                 malformed['game']['deaths'][1]['equipment_fame'] = award
@@ -57,12 +81,16 @@ class ReleaseContract(unittest.TestCase):
                 malformed = deepcopy(bundle)
                 malformed['schema'] = version
                 del malformed['game']['pictures'], malformed['game']['picture_sequence']
+                del malformed['game']['fame_log'], malformed['game']['crown_reign']
+                del malformed['game']['death_evidence']
                 del malformed['game']['deaths'][1]['equipment_fame']
                 with self.subTest(missing_award_version=version), self.assertRaisesRegex(ValueError, 'fields'):
                     backup.validate(malformed)
             disguised = deepcopy(bundle)
             disguised['schema'] = 13
             del disguised['game']['pictures'], disguised['game']['picture_sequence']
+            del disguised['game']['fame_log'], disguised['game']['crown_reign']
+            del disguised['game']['death_evidence']
             for row in disguised['game']['deaths']:
                 del row['equipment_fame']
             with self.assertRaisesRegex(ValueError, 'earned fame'):
@@ -98,6 +126,8 @@ class ReleaseContract(unittest.TestCase):
             malformed = deepcopy(bundle)
             malformed['schema'] = 12
             del malformed['game']['pictures'], malformed['game']['picture_sequence']
+            del malformed['game']['fame_log'], malformed['game']['crown_reign']
+            del malformed['game']['death_evidence']
             with self.assertRaisesRegex(ValueError, 'fields'):
                 backup.validate(malformed)
             for field, values in [('character_slots', [True, 0, 15, '2'])]:
@@ -152,7 +182,7 @@ class ReleaseContract(unittest.TestCase):
                     backup.export(malformed_db, Path(temporary) / 'contract/levels.sqlite', Path(temporary) / 'malformed-death.gz', revision, revision, revision)
                 self.assertEqual(malformed_db.read_bytes(), original)
                 self.assertFalse((Path(temporary) / 'malformed-death.gz').exists())
-            for version in [0, 11, 12, 13, 14, 16]:
+            for version in [0, 11, 12, 13, 14, 15, 16, 18]:
                 with closing(sqlite3.connect(Path(temporary) / 'contract/restored/game.db')) as source, closing(sqlite3.connect(Path(temporary) / 'future.db')) as future:
                     source.backup(future)
                     future.execute(f'PRAGMA user_version={version}')
@@ -161,6 +191,8 @@ class ReleaseContract(unittest.TestCase):
                 self.assertFalse((Path(temporary) / 'future.gz').exists())
             legacy = deepcopy(bundle)
             del legacy['game']['pictures'], legacy['game']['picture_sequence']
+            del legacy['game']['fame_log'], legacy['game']['crown_reign']
+            del legacy['game']['death_evidence']
             paid = sum(row.pop('equipment_fame') for row in legacy['game']['deaths'])
             self.assertEqual(paid, 750)
             owner = legacy['game']['guild_members'][0]['account']
@@ -179,6 +211,9 @@ class ReleaseContract(unittest.TestCase):
             migrated13 = backup.snapshot(restored13 / 'game.db', backup.RELOADED_GAME)
             self.assertEqual(migrated13.pop('pictures'), [])
             self.assertEqual(migrated13.pop('picture_sequence'), [{'id': 1, 'next_id': 1}])
+            self.assertEqual(migrated13.pop('fame_log'), [])
+            self.assertEqual(migrated13.pop('crown_reign'), [])
+            self.assertEqual(migrated13.pop('death_evidence'), [])
             for row in migrated13['deaths']:
                 self.assertEqual(row.pop('equipment_fame'), 0)
             self.assertEqual(migrated13, legacy['game'])
@@ -206,6 +241,9 @@ class ReleaseContract(unittest.TestCase):
             migrated12 = backup.snapshot(restored12 / 'game.db', backup.RELOADED_GAME)
             self.assertEqual(migrated12.pop('pictures'), [])
             self.assertEqual(migrated12.pop('picture_sequence'), [{'id': 1, 'next_id': 1}])
+            self.assertEqual(migrated12.pop('fame_log'), [])
+            self.assertEqual(migrated12.pop('crown_reign'), [])
+            self.assertEqual(migrated12.pop('death_evidence'), [])
             for row in migrated12['deaths']:
                 self.assertEqual(row.pop('equipment_fame'), 0)
             for row in migrated12['accounts']:
@@ -234,6 +272,9 @@ class ReleaseContract(unittest.TestCase):
             migrated = backup.snapshot(restored11 / 'game.db', backup.RELOADED_GAME)
             self.assertEqual(migrated.pop('pictures'), [])
             self.assertEqual(migrated.pop('picture_sequence'), [{'id': 1, 'next_id': 1}])
+            self.assertEqual(migrated.pop('fame_log'), [])
+            self.assertEqual(migrated.pop('crown_reign'), [])
+            self.assertEqual(migrated.pop('death_evidence'), [])
             for row in migrated['deaths']:
                 self.assertEqual(row.pop('equipment_fame'), 0)
             self.assertEqual(migrated.pop('character_slot_purchases'), [])

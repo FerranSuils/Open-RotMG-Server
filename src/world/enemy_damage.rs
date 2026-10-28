@@ -49,16 +49,14 @@ impl World {
         let lantern = lethal && e.kind == crate::dungeon::davy::UNLIT && self.locker.is_some();
         let kill = lethal && !transform && !lantern;
 
-        let quest = e.kind == 0x6b1 || self.content.objects[&e.kind].quest;
+        let definition = &self.content.objects[&e.kind];
+        let quest = e.kind == 0x6b1 || definition.quest;
         if let Some(p) = self.players.get_mut(&owner) {
             if damage > 0 && bullet.is_some() {
                 p.character.hits += 1;
             }
             if kill {
-                p.character.kills += 1;
-                if quest {
-                    p.character.quests += 1;
-                }
+                p.character.record_kill(e.kind, quest, &definition.group);
             }
         }
         let mut o = Writer::new();

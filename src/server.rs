@@ -64,6 +64,7 @@ impl App {
 }
 use tokio::sync::mpsc;
 mod account_actions;
+mod admin;
 #[cfg(test)]
 pub(crate) use account_actions::tests::fixture as test_app;
 pub(crate) mod browser_link;
@@ -71,6 +72,9 @@ pub(crate) mod diagnostics;
 mod gold;
 mod guilds;
 mod hiscores;
+pub(crate) mod operator;
+mod panel;
+mod ranking;
 pub(crate) mod testing;
 mod updates;
 use account_actions::{discord_announce, discord_kick, discord_recover, reset_password};
@@ -97,6 +101,10 @@ pub struct App {
     pub connections: Arc<tokio::sync::Semaphore>,
     pub control: Option<String>,
     pub discord_link_token: Option<String>,
+    /// Loopback operator credential from STATE/operator.token.
+    pub operator_token: String,
+    /// Overlay key from the game page's /game socket to that connection's player.
+    pub(crate) panels: Arc<Mutex<HashMap<String, i32>>>,
     pub(crate) browser_links: Arc<browser_link::Service>,
     pub owners: Arc<Mutex<BTreeMap<i32, lifecycle::Claim>>>,
     pub authentication: Arc<tokio::sync::RwLock<()>>,
@@ -127,16 +135,24 @@ fn request_ip(a: &App, headers: &HeaderMap, peer: SocketAddr) -> Result<IpAddr> 
         );
     }
     let ip = if a.behind_proxy {
-        headers
-            .get("x-forwarded-for")
-            .context("proxy must supply X-Forwarded-For")?
-            .to_str()?
-            .parse::<IpAddr>()
-            .context("proxy must supply one client IP")?
+        forwarded_ip(
+            headers
+                .get("x-forwarded-for")
+                .context("proxy must supply X-Forwarded-For")?
+                .to_str()?,
+        )?
     } else {
         peer.ip()
     };
     Ok(ip)
+}
+/// The trusted proxy appends the real client as the last X-Forwarded-For entry, optionally with a
+/// port (IIS ARR adds `ip:port`); earlier entries are client-controlled and ignored.
+fn forwarded_ip(header: &str) -> Result<IpAddr> {
+    let last = header.rsplit(',').next().unwrap_or_default().trim();
+    last.parse::<IpAddr>()
+        .or_else(|_| last.parse::<SocketAddr>().map(|s| s.ip()))
+        .context("proxy must supply one client IP")
 }
 fn admit(a: &App, headers: &HeaderMap, peer: SocketAddr) -> Result<bool> {
     let ip = request_ip(a, headers, peer)?;
@@ -456,11 +472,18 @@ async fn fame(State(a): State<App>, Form(form): Form<HashMap<String, String>>) -
         Err(e) => error(e),
     }
 }
-async fn swf(State(a): State<App>) -> Response {
+async fn swf(State(a): State<App>, headers: HeaderMap) -> Response {
+    // Revalidated on every load, downloaded again only when the served client changed.
+    use sha2::Digest;
+    let etag = format!("\"{:x}\"", sha2::Sha256::digest(a.swf.as_slice()));
+    if headers.get("if-none-match").is_some_and(|v| v.as_bytes() == etag.as_bytes()) {
+        return (StatusCode::NOT_MODIFIED, [("etag", etag)]).into_response();
+    }
     (
         [
-            ("content-type", "application/x-shockwave-flash"),
-            ("cache-control", "no-store"),
+            ("content-type", "application/x-shockwave-flash".to_string()),
+            ("cache-control", "no-cache".to_string()),
+            ("etag", etag),
         ],
         a.swf.as_ref().clone(),
     )
@@ -542,16 +565,19 @@ async fn websocket(
         Ok(entry) => entry,
         Err(error) => return hiscores::json_error(StatusCode::SERVICE_UNAVAILABLE, error),
     };
+    let panel = query.panel.filter(|key| panel::valid_key(key));
+    let ip = request_ip(&a, &headers, peer).ok();
     ws.max_message_size(1_048_576).on_upgrade(move |socket| {
         entry.scope(async move {
             let _permit = permit;
-            connection(socket, a, user_agent, browser).await
+            connection(socket, a, user_agent, browser, panel, ip).await
         })
     })
 }
 #[derive(Deserialize)]
 struct DiagnosticQuery {
     diagnostics: Option<String>,
+    panel: Option<String>,
 }
 fn fail(description: &str) -> Packet {
     let mut o = Writer::new();
@@ -776,7 +802,7 @@ async fn persist_death_inner(
     a: &App,
     id: i32,
     ch: crate::store::Character,
-    killer: String,
+    (killer, evidence): (String, serde_json::Value),
 ) -> Result<()> {
     lifecycle::stage(Stage::Store);
     let slot = ch
@@ -797,7 +823,7 @@ async fn persist_death_inner(
     } else {
         let result = a
             .store
-            .death(ch, killer)
+            .death(ch, killer, evidence)
             .await
             .context("death persistence failed");
         lifecycle::stage(Stage::Publication);
@@ -878,6 +904,7 @@ struct Session {
     transfer: Option<Packet>,
     runtime: Option<tokio::runtime::Handle>,
     diagnostics: diagnostics::ConnectionDiagnostics,
+    ip: Option<IpAddr>,
 }
 fn collision_report(other: bool, r: &mut Reader<'_>) -> Result<()> {
     // Reports cannot grant hits: the actor advances and resolves projectiles itself.
@@ -991,6 +1018,7 @@ async fn handle_inner(
         transfer: _,
         runtime,
         diagnostics,
+        ip,
     } = session;
     if *reconnecting {
         tracing::debug!(
@@ -1051,6 +1079,7 @@ async fn handle_inner(
             let authentication = a.authentication.read().await;
             let registered = !password.is_empty();
             let id = a.store.authenticate(guid, password).await?;
+            a.store.login(id, *ip).await?;
             let mut owner = a.claim_session(id)?;
             if let Some(runtime) = runtime {
                 owner.arm_cleanup(a, runtime.clone());
@@ -1292,6 +1321,27 @@ async fn handle_inner(
                 crate::world::validate_chat(&text)?;
                 return reconnect(a, session, Reconnect::Tutorial, received).await;
             }
+            let pot = text.trim().strip_prefix("/pot ").map(str::trim);
+            if let Some(which @ ("hp" | "mp")) = pot {
+                crate::world::validate_chat(&text)?;
+                let id = player.ok_or_else(|| lifecycle::protocol("potion before character"))?;
+                let magic = which == "mp";
+                if let Err(error) = inventory(a, id, move |w| w.drink(id, magic)).await? {
+                    enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
+                }
+                return Ok(());
+            }
+            if let Some(travel) = crate::world::Travel::parse(&text) {
+                crate::world::validate_chat(&text)?;
+                match reconnect(a, session, Reconnect::Travel(travel), received).await {
+                    Err(error) if lifecycle::rule_rejection(&error) => {
+                        tracing::warn!(?travel, error=%error, "travel rejected");
+                        enqueue_reply(tx, crate::world::chat_error(&error.to_string()))?;
+                    }
+                    result => return result,
+                }
+                return Ok(());
+            }
             if let Some((kind, name)) = guilds::chat_command(&text) {
                 let id =
                     player.ok_or_else(|| lifecycle::protocol("guild command before character"))?;
@@ -1363,6 +1413,19 @@ async fn handle_inner(
                     Err(error) => return Err(error),
                 };
                 enqueue_reply(tx, crate::world::chat_private(&reply))?;
+            } else if admin::is_command(&text) {
+                let owner = account
+                    .as_ref()
+                    .context("authenticated session required")?
+                    .id;
+                let reply = match admin::command(a, owner, id, &text, received).await {
+                    Ok(text) => crate::world::chat_info(&text),
+                    Err(error) if lifecycle::rule_rejection(&error) => {
+                        crate::world::chat_error(&error.to_string())
+                    }
+                    Err(error) => return Err(error),
+                };
+                enqueue_reply(tx, reply)?;
             } else if matches!(
                 text.split_whitespace()
                     .next()
@@ -1409,6 +1472,11 @@ async fn handle_inner(
                     Err(error) => return Err(error),
                 };
                 enqueue_reply(tx, reply)?;
+            } else if let Some(muted) = match account.as_ref() {
+                Some(owner) => admin::muted(a, owner.id).await?,
+                None => None,
+            } {
+                enqueue_reply(tx, crate::world::chat_error(&muted))?;
             } else if let Err(error) = a.world.directory(move |d| d.chat(id, text, received)).await
             {
                 if !lifecycle::rule_rejection(&error) {
@@ -1751,6 +1819,7 @@ async fn handle_inner(
 enum Reconnect {
     Portal(Option<i32>),
     Tutorial,
+    Travel(crate::world::Travel),
 }
 
 async fn reconnect(
@@ -1763,12 +1832,16 @@ async fn reconnect(
     let transfer = a
         .world
         .directory(move |d| {
-            let (account, character, destination) = match request {
+            let (account, character, destination, landing) = match request {
                 Reconnect::Tutorial => {
                     d.chat_permit(id, received)?;
                     let p = &d.worlds[&d.location(id)?].players[&id];
-                    (p.character.account, p.character.id, d.initial(-1)?)
+                    (p.character.account, p.character.id, d.initial(-1)?, None)
                 }
+                Reconnect::Travel(travel) => match d.travel(id, travel, received)? {
+                    Some(transfer) => transfer,
+                    None => return Ok(None),
+                },
                 Reconnect::Portal(portal) => {
                     if portal.is_none() && d.location(id)? == -2 {
                         tracing::debug!(
@@ -1777,7 +1850,8 @@ async fn reconnect(
                         );
                         return Ok(None);
                     }
-                    d.destination(id, portal)?
+                    let (account, character, destination) = d.destination(id, portal)?;
+                    (account, character, destination, None)
                 }
             };
             let world = &d.worlds[&destination];
@@ -1791,6 +1865,9 @@ async fn reconnect(
                 return Ok(None);
             }
             let (keytime, key, name) = d.issue(account, character, destination)?;
+            if let Some(pos) = landing {
+                d.land(destination, character, pos);
+            }
             Ok(Some((destination, keytime, key, name)))
         })
         .await?;
@@ -1819,9 +1896,11 @@ async fn connection(
     a: App,
     user_agent: Option<String>,
     browser: Option<Arc<Mutex<diagnostics::Browser>>>,
+    panel: Option<String>,
+    ip: Option<IpAddr>,
 ) {
     let (wsout, wsin) = socket.split();
-    connection_io(wsout, wsin, a, user_agent, browser).await;
+    connection_io(wsout, wsin, a, user_agent, browser, panel, ip).await;
 }
 async fn send_frame<S: futures_util::Sink<Message> + Unpin>(
     output: &mut S,
@@ -1851,6 +1930,8 @@ async fn connection_io<S, I>(
     mut a: App,
     user_agent: Option<String>,
     browser: Option<Arc<Mutex<diagnostics::Browser>>>,
+    panel: Option<String>,
+    ip: Option<IpAddr>,
 ) where
     S: futures_util::Sink<Message> + Unpin,
     I: futures_util::Stream<Item = std::result::Result<Message, axum::Error>>
@@ -1872,6 +1953,7 @@ async fn connection_io<S, I>(
     let mut codec = Codec::server();
     let mut session = Session {
         runtime: Some(tokio::runtime::Handle::current()),
+        ip,
         ..Session::default()
     };
     session.diagnostics.user_agent = user_agent;
@@ -1984,6 +2066,9 @@ async fn connection_io<S, I>(
             },
             _=transfers.tick(),if session.player.is_some() && !session.reconnecting=>{
                 let player = session.player.expect("guarded loaded player");
+                if let Some(key) = &panel {
+                    a.panels.lock().expect("panel registry poisoned").insert(key.clone(), player);
+                }
                 match automatic_transfer(&a, player).await {
                     Ok(Some(transfer)) => {
                         if transfer.player!=player || !transfer.output.packets.same_channel(&tx) {
@@ -2045,6 +2130,12 @@ async fn connection_io<S, I>(
         .account
         .take()
         .map(|owner| owner.close(&a, close_reason));
+    if let Some(key) = &panel {
+        let mut panels = a.panels.lock().expect("panel registry poisoned");
+        if session.player.is_none_or(|id| panels.get(key) == Some(&id)) {
+            panels.remove(key);
+        }
+    }
     if let Some(id) = session.player {
         let diagnostic = diagnostics::disconnect(
             &a,
@@ -2108,7 +2199,7 @@ pub(crate) async fn depart(a: &App, id: i32) -> Result<()> {
 enum DepartureStep {
     Save(crate::store::Character),
     Progress(crate::store::Character),
-    Death(crate::store::Character, String),
+    Death(crate::store::Character, (String, serde_json::Value)),
     Waiting,
 }
 async fn depart_inner(a: &App, id: i32) -> Result<()> {
@@ -2554,10 +2645,18 @@ fn client_assets(client: &std::path::Path) -> Router<App> {
             tower_http::services::ServeFile::new(client.join(file)),
         );
     }
-    router.nest_service(
-        "/vendor",
-        tower_http::services::ServeDir::new(client.join("vendor")),
-    )
+    // Ruffle's 15 MB wasm: served from the .br/.gz copies next to it and kept in the browser cache.
+    let vendor = Router::new()
+        .fallback_service(
+            tower_http::services::ServeDir::new(client.join("vendor"))
+                .precompressed_br()
+                .precompressed_gzip(),
+        )
+        .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("public, max-age=86400"),
+        ));
+    router.nest("/vendor", vendor)
 }
 
 fn routes(a: &App, client: PathBuf) -> Router {
@@ -2599,6 +2698,13 @@ fn routes(a: &App, client: PathBuf) -> Router {
             post(updates::sync).layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
         )
         .route("/api/hiscores", get(hiscores))
+        .route("/api/ranking", get(ranking::board))
+        .route("/api/augments/panel", get(panel::state).post(panel::choose))
+        .route("/panel.js", get(panel::script))
+        .route("/internal/operator/deaths", get(operator::deaths))
+        .route("/internal/operator/restore-death", post(operator::restore))
+        .route("/internal/operator/rank", post(operator::rank))
+        .route("/ranking", get(ranking::page))
         .route("/api/collection/{account}", get(collection))
         .route("/internal/discord/announce", post(discord_announce))
         .route("/internal/discord/link", post(discord_link))
@@ -2637,6 +2743,9 @@ fn routes(a: &App, client: PathBuf) -> Router {
 }
 
 pub async fn serve(a: App, bind: SocketAddr, client: PathBuf) -> Result<()> {
+    a.world
+        .supervisor
+        .spawn("standings", ranking::standings_task(a.clone()));
     let deaths = a.clone();
     a.world.supervisor.spawn("persistence", async move {
         loop {
@@ -2706,4 +2815,21 @@ async fn shutdown_signal() -> Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod forwarded_tests {
+    #[test]
+    fn proxy_client_ip_is_the_last_entry_with_or_without_port() {
+        let ip = |h| super::forwarded_ip(h).map(|ip| ip.to_string());
+        assert_eq!(ip("203.0.113.9").unwrap(), "203.0.113.9");
+        assert_eq!(ip("203.0.113.9, 203.0.113.9:51234").unwrap(), "203.0.113.9");
+        assert_eq!(
+            ip("6.6.6.6, 198.51.100.4:443").unwrap(),
+            "198.51.100.4",
+            "spoofed first entry ignored"
+        );
+        assert_eq!(ip("[2001:db8::1]:8080").unwrap(), "2001:db8::1");
+        assert!(ip("not-an-ip").is_err());
+    }
 }

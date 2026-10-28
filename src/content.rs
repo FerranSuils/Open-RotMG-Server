@@ -176,6 +176,7 @@ pub struct Object {
     pub spawn_group: Option<SpawnGroup>,
     pub per_realm_max: Option<usize>,
     pub quest: bool,
+    pub group: String,
     pub quest_level: Option<i32>,
     pub quest_window: (u8, u8),
     pub xp_multiplier: f32,
@@ -493,6 +494,7 @@ impl Content {
                     })
                     .transpose()?,
                 quest: child(n, "Quest").is_some(),
+                group: text(n, "Group"),
                 quest_level: child(n, "Level")
                     .map(|_| text(n, "Level").parse())
                     .transpose()?,
@@ -620,8 +622,26 @@ impl Content {
                 "duplicate ground type {id:#x}"
             );
         }
+        // 123.5.1 plus custom content: dungeon roster, wall/breakable/deco/portal and two floors per
+        // theme (minus the portals and floors the client already had), then rank insignias and crowns.
+        let themes: usize = crate::dungeon::procedural::THEMES
+            .iter()
+            .map(|t| 4 - usize::from(t.vanilla_portal))
+            .sum();
+        let floors: usize = crate::dungeon::procedural::THEMES
+            .iter()
+            .map(|t| 2 - usize::from(t.vanilla_floor))
+            .sum();
+        let regalia = crate::regalia::RANKS.len()
+            + crate::regalia::CROWNS.len()
+            + crate::pets::PETS.len()
+            + 5 * crate::encounter::patterns::BOSS_KITS.len();
+        // The Lair of Shaitan adds its roster plus a wall and a portal, and one floor.
+        let lair = crate::dungeon::shaitan::ROSTER.len() + 2;
         ensure!(
-            objects.len() == 2201 && grounds.len() == 173,
+            objects.len()
+                == 2201 + crate::dungeon::procedural::ROSTER.len() + themes + regalia + lair
+                && grounds.len() == 173 + floors + 1,
             "unexpected 123.5.1 content counts"
         );
         let out = Self {

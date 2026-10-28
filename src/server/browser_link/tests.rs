@@ -341,7 +341,7 @@ async fn native_login_logout_switch_and_close_bind_only_verified_browser_account
             .unwrap()
             .is_none()
     );
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -445,7 +445,7 @@ async fn automatic_link_requires_both_identities_and_enables_recovery_without_an
             .is_err()
     );
     provider.abort();
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -479,7 +479,7 @@ async fn forwarded_link_cannot_give_the_issuers_discord_recovery_of_a_victims_ga
             .is_err()
     );
     provider.abort();
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -523,7 +523,7 @@ async fn logout_reset_cookie_state_and_challenge_rotation_invalidate_approval() 
             .is_err()
     );
     provider.abort();
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -571,7 +571,7 @@ async fn expired_grants_cross_origin_posts_and_forged_completion_are_rejected() 
             .expires = Instant::now();
     }
     assert!(begin(&a, &cookie, &token).await["error"].is_string());
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -645,7 +645,7 @@ async fn superseded_in_flight_oauth_cannot_link_the_previous_discord_identity() 
         .await
         .unwrap();
     provider.abort();
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -755,6 +755,6 @@ async fn unlink_fences_a_delayed_oauth_callback_and_private_routes_reject_public
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
         provider.abort();
-        std::fs::remove_dir_all(dir).unwrap();
+        crate::test_fs::remove_dir_all(&dir);
     }
 }

@@ -124,7 +124,7 @@ async fn ground_dye_server_commits_both_channels_and_cloths_with_full_inventory(
             .await
             .unwrap();
         app.shutdown.send_replace(true);
-        std::fs::remove_dir_all(dir).unwrap();
+        crate::test_fs::remove_dir_all(&dir);
     }
 }
 
@@ -151,7 +151,7 @@ async fn ground_dye_preserves_a_nonzero_other_channel_across_successive_ground_u
     assert_eq!(live["character"]["tex2"], saved.tex2);
     assert_eq!(live["bag"][0], -1);
     app.shutdown.send_replace(true);
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 fn packet_stats(bytes: &[u8]) -> BTreeMap<u8, i32> {
@@ -265,7 +265,7 @@ async fn ground_dye_pending_reservation_blocks_duplicate_use_and_pickup_and_stal
     assert_eq!(stale["quarantined"], true);
     assert_eq!(app.store.load(1, 1).await.unwrap().revision, saved.revision);
     app.shutdown.send_replace(true);
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -303,7 +303,7 @@ async fn ground_dye_lost_publication_reply_never_refunds_committed_source_or_app
             .unwrap()
     );
     app.shutdown.send_replace(true);
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -359,7 +359,7 @@ async fn ground_dye_reconnect_reloads_committed_appearance_without_returning_the
         .await
         .unwrap();
     app.shutdown.send_replace(true);
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -427,7 +427,7 @@ async fn ground_dye_caller_preserves_legacy_inventory_dye_and_cloth_semantics() 
             .await
             .unwrap();
         app.shutdown.send_replace(true);
-        std::fs::remove_dir_all(dir).unwrap();
+        crate::test_fs::remove_dir_all(&dir);
     }
 }
 
@@ -562,7 +562,7 @@ async fn ground_dye_refusals_validate_actual_container_slot_access_range_owner_a
             "{denial}"
         );
         app.shutdown.send_replace(true);
-        std::fs::remove_dir_all(dir).unwrap();
+        crate::test_fs::remove_dir_all(&dir);
     }
 }
 
@@ -608,7 +608,7 @@ async fn ground_dye_revalidates_character_and_source_revisions_before_store_disp
             serde_json::to_value(saved).unwrap()
         );
         app.shutdown.send_replace(true);
-        std::fs::remove_dir_all(dir).unwrap();
+        crate::test_fs::remove_dir_all(&dir);
     }
 }
 
@@ -645,7 +645,7 @@ async fn ground_dye_stale_durable_character_revision_does_not_consume_source() {
         serde_json::to_value(saved).unwrap()
     );
     app.shutdown.send_replace(true);
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -673,7 +673,7 @@ async fn ground_dye_sql_abort_rolls_back_and_quarantines_without_refund_or_retry
     );
     assert!(use_ground(&app, id, bag, 0x1300).await.is_err());
     app.shutdown.send_replace(true);
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -765,6 +765,6 @@ async fn ground_dye_uncertain_store_result_and_postcommit_source_fault_keep_comm
         );
         assert!(use_ground(&app, id, bag, 0x1200).await.is_err());
         app.shutdown.send_replace(true);
-        std::fs::remove_dir_all(dir).unwrap();
+        crate::test_fs::remove_dir_all(&dir);
     }
 }

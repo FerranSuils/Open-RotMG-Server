@@ -86,7 +86,7 @@ async fn ground_dyes_and_cloths_preserve_full_inventory_and_other_channel_durabl
         assert_eq!(saved.items, inventory);
         ch = saved;
     }
-    std::fs::remove_file(path).unwrap();
+    crate::test_fs::remove_file(&path);
 }
 
 #[tokio::test]

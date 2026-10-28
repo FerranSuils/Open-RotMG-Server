@@ -19,6 +19,11 @@ impl Player {
                     .context("temporary stat overflow")?;
             }
         }
+        if let Some((crate::pets::Ability::Stat(index, amount), _)) =
+            crate::pets::ability(self.character.pet_kind)
+        {
+            values[index] += amount;
+        }
         Ok(values)
     }
 }

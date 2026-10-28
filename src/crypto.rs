@@ -134,7 +134,7 @@ fn patch_abc(abc: &[u8], replacement: &[String; 4]) -> Result<(Vec<u8>, usize, u
             out.extend(path);
             music += 1;
         } else if gold && s == b"Buy Realm Gold" {
-            let title = b"Open RotMG Gold";
+            let title = b"Monetary's Realm Gold";
             put_u30(&mut out, title.len() as u32);
             out.extend(title);
         } else {
@@ -171,7 +171,66 @@ fn patch_loading(data: &mut [u8]) -> Result<usize> {
     }
     Ok(positions.len())
 }
+/// Custom textures and object/ground XML (pixel-art/inject.py): replacement tag bodies keyed by
+/// (tag code, character id) for the pinned client.
+const OVERLAY: &[u8] = include_bytes!("../data/client-overlay.bin");
+fn overlay() -> Result<std::collections::BTreeMap<(u16, u16), &'static [u8]>> {
+    let mut tags = std::collections::BTreeMap::new();
+    let mut p = 0;
+    while p < OVERLAY.len() {
+        let head = OVERLAY.get(p..p + 6).context("truncated client overlay")?;
+        let n = u32::from_le_bytes(head[2..6].try_into()?) as usize;
+        let body = OVERLAY
+            .get(p + 6..p + 6 + n)
+            .context("truncated client overlay tag")?;
+        ensure!(body.len() >= 2, "client overlay tag lacks a character id");
+        let key = (
+            u16::from_le_bytes([head[0], head[1]]),
+            u16::from_le_bytes([body[0], body[1]]),
+        );
+        ensure!(
+            tags.insert(key, body).is_none(),
+            "duplicate client overlay tag {key:?}"
+        );
+        p += 6 + n;
+    }
+    Ok(tags)
+}
+/// DefineBits, DefineBitsJPEG2, DefineBitsJPEG3, DefineBitsLossless, DefineBitsJPEG4.
+const BITMAPS: [u16; 5] = [6, 21, 35, 20, 90];
+/// DefineBitsLossless2: the tag kind custom bitmaps are written as.
+const LOSSLESS_ALPHA: u16 = 36;
+/// Client mods (client-mods/build.py): sha256 of the pinned client's main ABC, then the modified ABC that replaces
+/// it; the key, music and gold patches below then apply to the modified one.
+const CLIENT_ABC: &[u8] = include_bytes!("../data/client-abc.bin");
+/// Body of an extra DoABC tag (the compiled mod helper) placed right after the main ABC; may be empty.
+const CLIENT_HELPER: &[u8] = include_bytes!("../data/client-helper.bin");
+/// Development only: OPENROTMG_CLIENT_MODS=<dir> reads client-abc.bin and client-helper.bin from that directory
+/// at start-up instead of the copies built in, so client-mods changes need a restart rather than a rebuild.
+fn client_mod(name: &str, built_in: &'static [u8]) -> &'static [u8] {
+    match std::env::var_os("OPENROTMG_CLIENT_MODS") {
+        Some(dir) => std::fs::read(std::path::Path::new(&dir).join(name))
+            .map(|bytes| &*Box::leak(bytes.into_boxed_slice()))
+            .unwrap_or(built_in),
+        None => built_in,
+    }
+}
+fn client_abc() -> &'static [u8] {
+    static ABC: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+    ABC.get_or_init(|| client_mod("client-abc.bin", CLIENT_ABC))
+}
+fn client_helper() -> &'static [u8] {
+    static HELPER: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+    HELPER.get_or_init(|| client_mod("client-helper.bin", CLIENT_HELPER))
+}
+/// The modified main ABC when `abc` is the original it was built from.
+fn modded_abc(abc: &[u8]) -> Option<&'static [u8]> {
+    let (hash, modded) = client_abc().split_at_checked(32)?;
+    (Sha256::digest(abc).as_slice() == hash).then_some(modded)
+}
 fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
+    let mut overlay = overlay()?;
+    let overlaid = overlay.len();
     ensure!(source.len() >= 9, "truncated reference SWF");
     let mut body = Vec::new();
     match &source[..3] {
@@ -190,6 +249,7 @@ fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
     let mut loading = 0;
     let mut music = 0;
     let mut gold = 0;
+    let mut modded = 0;
     while p < body.len() {
         let h = u16::from_le_bytes(
             body.get(p..p + 2)
@@ -197,7 +257,7 @@ fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
                 .try_into()?,
         );
         p += 2;
-        let tag = h >> 6;
+        let mut tag = h >> 6;
         let n = if h & 63 == 63 {
             let n = u32::from_le_bytes(
                 body.get(p..p + 4)
@@ -217,7 +277,15 @@ fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
                 .iter()
                 .position(|b| *b == 0)
                 .context("unterminated DoABC name")?;
-            let (mut abc, c, m, g) = patch_abc(&data[offset..], replacement)?;
+            let original = &data[offset..];
+            let source_abc = match modded_abc(original) {
+                Some(abc) => {
+                    modded += 1;
+                    abc
+                }
+                None => original,
+            };
+            let (mut abc, c, m, g) = patch_abc(source_abc, replacement)?;
             changed += c;
             music += m;
             gold += g;
@@ -225,6 +293,19 @@ fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
             let mut d = data[..offset].to_vec();
             d.extend(abc);
             d
+        } else if let Some(body) = data
+            .get(..2)
+            .and_then(|id| overlay.remove(&(tag, u16::from_le_bytes([id[0], id[1]]))))
+        {
+            body.to_vec()
+        } else if let Some(body) = data
+            .get(..2)
+            .filter(|_| BITMAPS.contains(&tag))
+            .and_then(|id| overlay.remove(&(LOSSLESS_ALPHA, u16::from_le_bytes([id[0], id[1]]))))
+        {
+            // A lossless bitmap with alpha may replace any bitmap kind (e.g. a JPEG) of the same id.
+            tag = LOSSLESS_ALPHA;
+            body.to_vec()
         } else {
             data.to_vec()
         };
@@ -234,8 +315,19 @@ fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
             out.extend(((tag << 6) | 63).to_le_bytes());
             out.extend((patched.len() as u32).to_le_bytes())
         }
+        let main_abc = tag == 82 && modded == 1 && patched.len() > 600_000;
         out.extend(patched);
+        let helper = client_helper();
+        if main_abc && !helper.is_empty() {
+            out.extend(((82u16 << 6) | 63).to_le_bytes());
+            out.extend((helper.len() as u32).to_le_bytes());
+            out.extend(helper);
+        }
     }
+    ensure!(
+        modded == 1,
+        "expected the pinned client's main ABC for the client mods, matched {modded}"
+    );
     ensure!(
         changed == 4,
         "expected four public-key string fragments, found {changed}"
@@ -249,16 +341,19 @@ fn patch_swf(source: &[u8], replacement: &[String; 4]) -> Result<Vec<u8>> {
         loading == 1,
         "expected one exact loading-readiness method, found {loading}"
     );
+    ensure!(
+        overlay.is_empty(),
+        "client overlay tags absent from the pinned client: {:?}",
+        overlay.keys().collect::<Vec<_>>()
+    );
+    tracing::info!(tags = overlaid, "applied custom content overlay to client");
+    // Always served compressed: the uncompressed movie is twice the download.
     let mut result = source[..8].to_vec();
+    result[..3].copy_from_slice(b"CWS");
     result[4..8].copy_from_slice(&((out.len() + 8) as u32).to_le_bytes());
-    if &source[..3] == b"CWS" {
-        let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
-        z.write_all(&out)?;
-        result.extend(z.finish()?);
-    } else {
-        result.extend(out);
-    }
-    Ok(result)
+    let mut z = ZlibEncoder::new(result, Compression::best());
+    z.write_all(&out)?;
+    Ok(z.finish()?)
 }
 #[cfg(test)]
 mod tests {

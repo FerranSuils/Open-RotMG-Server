@@ -255,6 +255,24 @@ impl World {
             self.remove_entity(entity);
         }
     }
+    /// Replaces the owner's permanent companion (cosmetic /pet choice).
+    pub(super) fn swap_permanent_pet(&mut self, owner: i32, kind: Option<u16>) -> Result<()> {
+        let old: Vec<_> = self
+            .companions
+            .active
+            .iter()
+            .filter(|(_, p)| p.owner == owner && p.permanent)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in old {
+            self.remove_companion(id);
+        }
+        if let Some(kind) = kind {
+            let pos = self.players.get(&owner).context("pet owner missing")?.pos;
+            self.attach_companion(owner, kind, pos)?;
+        }
+        Ok(())
+    }
     pub(super) fn clear_companions(&mut self, owner: i32) {
         let ids: Vec<_> = self
             .companions

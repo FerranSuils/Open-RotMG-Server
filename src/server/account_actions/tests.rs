@@ -33,6 +33,8 @@ pub(crate) fn fixture() -> (PathBuf, App) {
         picture_reads: Arc::default(),
         connections: Arc::new(tokio::sync::Semaphore::new(32)),
         control: None,
+        operator_token: "b".repeat(64),
+        panels: Default::default(),
         discord_link_token: Some("a".repeat(64)),
         browser_links: Arc::default(),
         owners: Arc::default(),

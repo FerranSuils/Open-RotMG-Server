@@ -99,7 +99,7 @@ async fn explicit_spawn_idempotency_and_compact_observations() {
         "failed"
     );
     app.shutdown.send_replace(true);
-    fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 #[tokio::test]
 async fn ordinary_equipment_action_is_committed_and_pause_is_stable() {
@@ -159,7 +159,7 @@ async fn ordinary_equipment_action_is_committed_and_pause_is_stable() {
         "failed"
     );
     app.shutdown.send_replace(true);
-    fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -192,7 +192,7 @@ async fn actual_gameplay_controller_can_run_a_bounded_time_goal() {
     assert_eq!(result["paused"], true);
     assert_eq!(result["result"]["state"]["lifecycle"]["output"], "live");
     app.shutdown.send_replace(true);
-    fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 #[tokio::test]
 async fn controls_do_not_enable_the_testing_interface_on_ordinary_state() {
@@ -208,7 +208,7 @@ async fn controls_do_not_enable_the_testing_interface_on_ordinary_state() {
     );
     assert!(valid_id("../control.token").is_err());
     app.shutdown.send_replace(true);
-    fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -242,7 +242,7 @@ async fn native_input_acknowledgement_is_bound_to_the_exact_session() {
     testing.acknowledge_native(-1, 42);
     assert!(testing.native_pings.lock().unwrap().is_empty());
     assert!(app.world.clock.paused());
-    std::fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -284,7 +284,7 @@ async fn native_lease_expiry_is_independent_terminal_and_cannot_be_renewed_by_an
     );
     assert!(app.world.clock.paused());
     app.shutdown.send_replace(true);
-    fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -376,7 +376,11 @@ async fn committed_native_death_is_not_reconnect_and_halts_the_owned_cohort() {
     ch.alive = false;
     ch.hp = 0;
     app.store
-        .death(ch, "native lifecycle regression".into())
+        .death(
+            ch,
+            "native lifecycle regression".into(),
+            serde_json::json!({}),
+        )
         .await
         .unwrap();
     app.world
@@ -418,7 +422,7 @@ async fn committed_native_death_is_not_reconnect_and_halts_the_owned_cohort() {
             .is_err()
     );
     app.shutdown.send_replace(true);
-    fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -540,5 +544,5 @@ async fn dropped_native_renewal_keeps_deadline_and_traces_late_read() {
         assert_eq!(event["fields"]["receiver_closed"], true);
     }
     app.shutdown.send_replace(true);
-    fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }

@@ -35,10 +35,24 @@ pub(super) fn effect(kind: u8, target: i32, position: Pos) -> Vec<u8> {
 
 impl Directory {
     pub fn teleport(&mut self, id: i32, target: i32, received: Instant) -> Result<TeleportReceipt> {
+        let position = self
+            .resolve(Target::Player(id))?
+            .teleport_destination(id, target)?;
+        self.teleport_to(id, target, position, received)
+    }
+
+    /// Moves a teleport-ready player within its world, behind the shared ten-second cooldown.
+    pub(super) fn teleport_to(
+        &mut self,
+        id: i32,
+        target: i32,
+        position: Pos,
+        received: Instant,
+    ) -> Result<TeleportReceipt> {
         let scope = self.location(id)?;
-        let world = self.resolve(Target::Player(id))?;
-        let position = world.teleport_destination(id, target)?;
-        let account = world.players[&id].character.account;
+        let account = self.resolve(Target::Player(id))?.players[&id]
+            .character
+            .account;
         if let Some(last) = self.teleports.get(&account) {
             ensure!(
                 received
@@ -61,6 +75,7 @@ impl Directory {
             .as_millis() as u64;
         let p = world.players.get_mut(&id).unwrap();
         p.pos = position;
+        p.character.teleports += 1;
         p.movement_credit = 0.78;
         // Server-driven motors budget against simulation time, not native packet arrival time.
         p.last_move_at = if p.controller == Controller::Human {
@@ -101,7 +116,7 @@ impl World {
         )
     }
 
-    fn teleport_destination(&self, id: i32, target: i32) -> Result<Pos> {
+    pub(super) fn teleport_ready(&self, id: i32) -> Result<()> {
         ensure!(
             self.allow_teleport(),
             controller("Cannot teleport in this world.")
@@ -123,6 +138,12 @@ impl World {
             controller("Position correction awaits GOTO acknowledgement.")
         );
         ensure!(!p.paused, controller("Cannot teleport while paused."));
+        Ok(())
+    }
+
+    fn teleport_destination(&self, id: i32, target: i32) -> Result<Pos> {
+        self.teleport_ready(id)?;
+        let p = &self.players[&id];
         ensure!(id != target, controller("You are already at yourself."));
         let q = self
             .players

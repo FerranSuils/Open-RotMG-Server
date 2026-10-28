@@ -31,7 +31,12 @@ FAME_GAME = {**VAULTS_GAME, 'deaths': (*LEGACY_GAME['deaths'], 'equipment_fame')
 PICTURES_GAME = {**FAME_GAME, 'pictures': ('id', 'account', 'name', 'data_type', 'tags', 'png'), 'picture_sequence': ('id', 'next_id')}
 PICTURES_SQL = "CREATE TABLE pictures(id INTEGER PRIMARY KEY CHECK(id BETWEEN 1 AND 2147483647),account INTEGER NOT NULL REFERENCES accounts(id),name TEXT NOT NULL,data_type INTEGER NOT NULL CHECK(data_type BETWEEN 1 AND 7),tags TEXT NOT NULL,png BLOB NOT NULL CHECK(typeof(png)='blob' AND length(png)<=16384),UNIQUE(account,name))"
 PICTURE_SEQUENCE_SQL = "CREATE TABLE picture_sequence(id INTEGER PRIMARY KEY CHECK(id=1),next_id INTEGER NOT NULL CHECK(typeof(next_id)='integer' AND next_id BETWEEN 1 AND 2147483648))"
-GAME_SCHEMAS = {1: LEGACY_GAME, 2: GAME, 3: SHORE_GAME, 4: HISCORES_GAME, 5: ACTIONS_GAME, 6: SOCIAL_GAME, 7: UPDATES_GAME, 8: GOLD_GAME, 9: GUILDS_GAME, 10: REWARDS_GAME, 11: REWARDS_GAME, 12: SLOTS_GAME, 13: VAULTS_GAME, 14: FAME_GAME, 15: PICTURES_GAME}
+RANKINGS_GAME = {**PICTURES_GAME, 'fame_log': ('account', 'character', 'amount', 'earned_at'), 'crown_reign': ('id', 'account', 'since')}
+FAME_LOG_SQL = "CREATE TABLE fame_log(account INTEGER NOT NULL REFERENCES accounts(id),character INTEGER NOT NULL REFERENCES characters(id),amount INTEGER NOT NULL CHECK(amount>0),earned_at INTEGER NOT NULL)"
+CROWN_REIGN_SQL = "CREATE TABLE crown_reign(id INTEGER PRIMARY KEY CHECK(id=1),account INTEGER NOT NULL REFERENCES accounts(id),since INTEGER NOT NULL)"
+RESTORATION_GAME = {**RANKINGS_GAME, 'death_evidence': ('id', 'character', 'died_at', 'award', 'guild', 'evidence', 'restored_at', 'restored_reason')}
+DEATH_EVIDENCE_SQL = "CREATE TABLE death_evidence(id INTEGER PRIMARY KEY,character INTEGER NOT NULL REFERENCES characters(id),died_at INTEGER NOT NULL,award INTEGER NOT NULL CHECK(award>=0),guild INTEGER REFERENCES guilds(id),evidence TEXT NOT NULL CHECK(json_valid(evidence)),restored_at INTEGER,restored_reason TEXT)"
+GAME_SCHEMAS = {1: LEGACY_GAME, 2: GAME, 3: SHORE_GAME, 4: HISCORES_GAME, 5: ACTIONS_GAME, 6: SOCIAL_GAME, 7: UPDATES_GAME, 8: GOLD_GAME, 9: GUILDS_GAME, 10: REWARDS_GAME, 11: REWARDS_GAME, 12: SLOTS_GAME, 13: VAULTS_GAME, 14: FAME_GAME, 15: PICTURES_GAME, 16: RANKINGS_GAME, 17: RESTORATION_GAME}
 AUTH_GAME = {**GAME, 'credentials': ('account', 'email', 'password_hash')}
 AUTH_SHORE_GAME = {**SHORE_GAME, 'credentials': AUTH_GAME['credentials']}
 AUTH_HISCORES_GAME = {**HISCORES_GAME, 'credentials': AUTH_GAME['credentials'], 'discord_codes': ('account', 'hash', 'issued_at', 'expires_at')}
@@ -45,7 +50,9 @@ AUTH_REWARDS_GAME = {**AUTH_GUILDS_GAME, 'gold_rewards': REWARDS_GAME['gold_rewa
 AUTH_SLOTS_GAME = {**AUTH_REWARDS_GAME, 'accounts': SLOTS_GAME['accounts'], 'character_slot_purchases': SLOTS_GAME['character_slot_purchases']}
 AUTH_VAULTS_GAME = {**AUTH_SLOTS_GAME, 'accounts': VAULTS_GAME['accounts'], 'vaults': VAULTS_GAME['vaults']}
 RELOADED_FAME_GAME = {**AUTH_VAULTS_GAME, 'deaths': FAME_GAME['deaths']}
-RELOADED_GAME = {**RELOADED_FAME_GAME, 'pictures': PICTURES_GAME['pictures'], 'picture_sequence': PICTURES_GAME['picture_sequence']}
+RELOADED_PICTURES_GAME = {**RELOADED_FAME_GAME, 'pictures': PICTURES_GAME['pictures'], 'picture_sequence': PICTURES_GAME['picture_sequence']}
+RELOADED_RANKINGS_GAME = {**RELOADED_PICTURES_GAME, 'fame_log': RANKINGS_GAME['fame_log'], 'crown_reign': RANKINGS_GAME['crown_reign']}
+RELOADED_GAME = {**RELOADED_RANKINGS_GAME, 'death_evidence': RESTORATION_GAME['death_evidence']}
 DISCORD = {'levels': ('guild_id', 'user_id', 'username', 'xp', 'last_xp_at', 'last_message_id')}
 
 
@@ -154,12 +161,18 @@ def snapshot(path, schema, *, include_schema=False):
             for table, expected in [('pictures', PICTURES_SQL), ('picture_sequence', PICTURE_SEQUENCE_SQL)]:
                 if db.execute("SELECT sql FROM sqlite_schema WHERE type='table' AND name=?", (table,)).fetchone() != (expected,):
                     raise ValueError('Unsupported canonical picture metadata: ' + table)
+        if 'fame_log' in schema:
+            for table, expected in [('fame_log', FAME_LOG_SQL), ('crown_reign', CROWN_REIGN_SQL)] + ([('death_evidence', DEATH_EVIDENCE_SQL)] if 'death_evidence' in schema else []):
+                if db.execute("SELECT sql FROM sqlite_schema WHERE type='table' AND name=?", (table,)).fetchone() != (expected,):
+                    raise ValueError('Unsupported canonical ranking metadata: ' + table)
         result = {}
         for table, columns in schema.items():
             if table in {'credentials', 'discord_codes', 'recovery_codes', 'password_resets'}:
                 continue
             selected = tuple(c for c in columns if c != 'guid')
-            rows = db.execute('SELECT ' + ','.join(selected) + ' FROM ' + table + ' ORDER BY ' + ','.join(selected[:2])).fetchall()
+            # Fame history may repeat (account, character); every column orders it deterministically.
+            order = selected if table == 'fame_log' else selected[:2]
+            rows = db.execute('SELECT ' + ','.join(selected) + ' FROM ' + table + ' ORDER BY ' + ','.join(order)).fetchall()
             result[table] = [dict(zip(selected, row)) for row in rows]
             if table == 'pictures':
                 for row in result[table]:
@@ -282,6 +295,49 @@ def validate_deaths(game, version):
             raise ValueError('Guild contribution or earnings exceed account earned fame')
 
 
+def validate_rankings(game):
+    """Fame history belongs to its character's account and never exceeds the fame that character earned."""
+    accounts = {row['id'] for row in game['accounts']}
+    owners = {row['id']: (row['account'], json.loads(row['stats'])['fame']) for row in game['characters']}
+    for row in game['deaths']:
+        owners[row['character']] = (owners[row['character']][0], json.loads(row['snapshot'])['fame'])
+    logged = {}
+    for row in game['fame_log']:
+        if (any(type(row[key]) is not int for key in ('account', 'character', 'amount', 'earned_at'))
+                or row['character'] not in owners or owners[row['character']][0] != row['account']
+                or not 0 < row['amount'] <= 2147483647 or row['earned_at'] <= 0):
+            raise ValueError('Invalid fame history entry')
+        logged[row['character']] = logged.get(row['character'], 0) + row['amount']
+    if any(total > owners[character][1] for character, total in logged.items()):
+        raise ValueError('Fame history exceeds the character fame it records')
+    reign = game['crown_reign']
+    if len(reign) > 1 or any(row['id'] != 1 or type(row['account']) is not int or row['account'] not in accounts
+                             or type(row['since']) is not int or row['since'] <= 0 for row in reign):
+        raise ValueError('Invalid crown reign')
+
+
+def validate_restorations(game):
+    """Each death keeps the evidence and exact award it paid; a reversed death records when and why."""
+    alive = {row['id']: row['alive'] for row in game['characters']}
+    guilds = {row['id'] for row in game.get('guilds', [])}
+    awards = {row['character']: json.loads(row['snapshot'])['fame'] + row['equipment_fame'] for row in game['deaths']}
+    ids, open_deaths = set(), set()
+    for row in game['death_evidence']:
+        if (any(type(row[key]) is not int for key in ('id', 'character', 'died_at', 'award')) or row['id'] <= 0 or row['id'] in ids
+                or row['character'] not in alive or row['died_at'] <= 0 or row['award'] < 0
+                or (row['guild'] is not None and row['guild'] not in guilds) or type(row['evidence']) is not str
+                or not isinstance(json.loads(row['evidence']), dict)
+                or (row['restored_at'] is None) != (row['restored_reason'] is None)
+                or (row['restored_at'] is not None and (type(row['restored_at']) is not int or row['restored_at'] < row['died_at']
+                                                        or type(row['restored_reason']) is not str))):
+            raise ValueError('Invalid death evidence record')
+        ids.add(row['id'])
+        if row['restored_at'] is None:
+            if row['character'] in open_deaths or alive[row['character']] != 0 or awards.get(row['character']) != row['award']:
+                raise ValueError('Death evidence disagrees with the archived death award')
+            open_deaths.add(row['character'])
+
+
 def validate(bundle):
     if set(bundle) != {'schema', 'created_at', 'revisions', 'game', 'discord'} or type(bundle['schema']) is not int or bundle['schema'] not in GAME_SCHEMAS:
         raise ValueError('Unsupported backup envelope')
@@ -368,11 +424,15 @@ def validate(bundle):
     if bundle['schema'] >= 15:
         validate_pictures(bundle['game'])
     validate_deaths(bundle['game'], bundle['schema'])
+    if bundle['schema'] >= 16:
+        validate_rankings(bundle['game'])
+    if bundle['schema'] >= 17:
+        validate_restorations(bundle['game'])
     return bundle
 
 
 def export(game, discord, output, server_revision, bot_revision, validator_revision):
-    game_data, matched, stored_version = snapshot(game, [*GAME_SCHEMAS.values(), AUTH_GAME, AUTH_SHORE_GAME, AUTH_HISCORES_GAME, AUTH_ACTIONS_GAME, AUTH_SOCIAL_GAME, AUTH_UPDATES_GAME, AUTH_GOLD_GAME, AUTH_GUILDS_GAME, AUTH_REWARDS_GAME, AUTH_SLOTS_GAME, AUTH_VAULTS_GAME, RELOADED_FAME_GAME, RELOADED_GAME], include_schema=True)
+    game_data, matched, stored_version = snapshot(game, [*GAME_SCHEMAS.values(), AUTH_GAME, AUTH_SHORE_GAME, AUTH_HISCORES_GAME, AUTH_ACTIONS_GAME, AUTH_SOCIAL_GAME, AUTH_UPDATES_GAME, AUTH_GOLD_GAME, AUTH_GUILDS_GAME, AUTH_REWARDS_GAME, AUTH_SLOTS_GAME, AUTH_VAULTS_GAME, RELOADED_FAME_GAME, RELOADED_PICTURES_GAME, RELOADED_RANKINGS_GAME, RELOADED_GAME], include_schema=True)
     versions = [v for v, schema in GAME_SCHEMAS.items() if schema == {k: c for k, c in matched.items() if k in game_data}]
     if (stored_version > max(GAME_SCHEMAS) or (max(versions) >= 12 and stored_version != max(versions))
             or (stored_version >= 12 and stored_version not in versions)):
@@ -453,6 +513,10 @@ CREATE TABLE vaults(account INTEGER NOT NULL REFERENCES accounts(id),chest INTEG
         definitions['game'] += "\nALTER TABLE deaths ADD COLUMN equipment_fame INTEGER NOT NULL CHECK(typeof(equipment_fame)='integer' AND equipment_fame BETWEEN 0 AND 2147483647);"
     if bundle['schema'] >= 15:
         definitions['game'] += '\n' + PICTURES_SQL + ';\n' + PICTURE_SEQUENCE_SQL + ';'
+    if bundle['schema'] >= 16:
+        definitions['game'] += '\n' + FAME_LOG_SQL + ';\nCREATE INDEX fame_log_by_time ON fame_log(earned_at);\n' + CROWN_REIGN_SQL + ';'
+    if bundle['schema'] >= 17:
+        definitions['game'] += '\n' + DEATH_EVIDENCE_SQL + ';\nCREATE INDEX death_evidence_by_character ON death_evidence(character);'
     for name, filename in [('game', 'game.db'), ('discord', 'levels.sqlite')]:
         with closing(sqlite3.connect(':memory:')) as db, db:
             db.execute('PRAGMA foreign_keys=ON')

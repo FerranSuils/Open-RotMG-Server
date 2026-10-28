@@ -25,6 +25,8 @@ pub(crate) enum Action {
     Grenade {
         radius: f32,
         damage: i32,
+        /// Lands up to this many tiles away from the target (0 = on the target).
+        scatter: f32,
     },
 }
 #[derive(Clone, Copy, Debug)]
@@ -64,9 +66,19 @@ impl Attack {
     }
     pub(super) fn grenade(radius: f32, damage: i32, interval: u64, range: f32) -> Self {
         Self {
-            action: Action::Grenade { radius, damage },
+            action: Action::Grenade {
+                radius,
+                damage,
+                scatter: 0.,
+            },
             ..Self::fan(0, 1, 0., interval, range)
         }
+    }
+    pub(super) fn scatter(mut self, tiles: f32) -> Self {
+        if let Action::Grenade { scatter, .. } = &mut self.action {
+            *scatter = tiles;
+        }
+        self
     }
     pub(super) fn offset(mut self, degrees: f32) -> Self {
         self.offset += degrees.to_radians();
@@ -231,11 +243,23 @@ pub(crate) fn manor_entry_schedule(kind: u16, stage: u64, elapsed: u64) -> Sched
 }
 
 pub(crate) fn schedule(kind: u16, hp: i32, elapsed: u64) -> Option<Schedule> {
+    if let Some(schedule) = super::patterns::schedule(kind, hp, elapsed) {
+        return Some(schedule);
+    }
     if crate::dungeon::manor::ROSTER.contains(&kind) {
         return Some(manor_schedule(kind, hp, elapsed));
     }
     if crate::dungeon::davy::profile(kind).is_some() {
         return Some(davy_schedule(kind, 1, elapsed));
+    }
+    if crate::dungeon::tomb::ROSTER.contains(&kind) {
+        return Some(tomb_schedule(kind, 0, elapsed));
+    }
+    if crate::dungeon::lab::ROSTER.contains(&kind) {
+        return Some(lab_schedule(kind, 0, elapsed));
+    }
+    if crate::dungeon::shaitan::ROSTER.contains(&kind) {
+        return Some(shaitan_schedule(kind, 0, 0, elapsed));
     }
     if super::landmarks::ROSTER.contains(&kind) {
         return Some(super::landmarks::schedule(kind, hp, 0, 0, elapsed));
@@ -551,6 +575,230 @@ pub(crate) fn davy_schedule(kind: u16, stage: u64, age: u64) -> Schedule {
         ],
         0xe48 if stage == 2 => vec![fan(0, 6, 60., 1000, 10.).once()],
         _ => vec![],
+    };
+    Schedule {
+        state: stage,
+        age,
+        attacks,
+    }
+}
+
+// Volleys follow the pinned realm-src Tomb tables per HP phase; the paired grenade states
+// become two offset channels and the shield windows live in the world mechanics.
+pub(crate) fn tomb_schedule(kind: u16, stage: u64, age: u64) -> Schedule {
+    use crate::dungeon::tomb::{
+        ACTIVE, ATTACKER, DEFENDER, EAGLE, JACKAL, LION, MUMMY, PRIEST, PRIESTESS, SCARAB, SUPPORT,
+    };
+    let fan = Attack::fan;
+    let ring = Attack::ring;
+    let grenade = Attack::grenade;
+    let support_fans = |indexes: [u8; 4], counts: [usize; 4], gaps: [f32; 4]| {
+        (0..4)
+            .map(|i| {
+                fan(indexes[i], counts[i], gaps[i], 2500, 12.).delay(1000 + 500 * i as u64)
+            })
+            .collect::<Vec<_>>()
+    };
+    let attacker_core = || {
+        vec![
+            fan(2, 2, 10., 500, 14.),
+            fan(2, 1, 0., 500, 14.),
+            fan(2, 2, 90., 1000, 14.),
+            fan(2, 2, 90., 1000, 14.).offset(270.),
+            fan(1, 10, 36., 5000, 11.),
+            fan(0, 1, 0., 2000, 12.),
+            fan(0, 2, 45., 2000, 12.),
+        ]
+    };
+    let attacks = match (kind, stage) {
+        (DEFENDER, 1) => vec![ring(3, 20, 6000, 50.)],
+        (DEFENDER, 2) => vec![
+            fan(2, 8, 45., 1000, 50.),
+            fan(1, 3, 120., 5000, 50.),
+            fan(0, 5, 72., 5000, 50.),
+        ],
+        (DEFENDER, 3) => vec![
+            fan(0, 1, 0., 3000, 50.),
+            ring(2, 8, 1000, 50.),
+            fan(1, 3, 15., 3000, 50.),
+            fan(1, 2, 90., 3000, 50.),
+        ],
+        (DEFENDER, 4 | 5) => vec![
+            ring(2, 8, 1000, 50.),
+            fan(0, 2, 10., 3000, 50.),
+            fan(1, 4, 15., 3000, 50.),
+            fan(1, 2, 90., 3000, 50.),
+        ],
+        (DEFENDER, 6) => vec![
+            ring(2, 8, 1000, 50.),
+            fan(0, 3, 10., 3000, 50.),
+            fan(1, 5, 15., 3000, 50.),
+            fan(1, 2, 80., 3000, 50.),
+            fan(1, 2, 90., 3000, 50.),
+        ],
+        (DEFENDER, 7) => vec![
+            fan(4, 10, 10., 750, 50.),
+            fan(4, 5, 10., 500, 50.).offset(180.),
+            fan(0, 1, 0., 1000, 50.),
+            fan(1, 3, 15., 2000, 50.),
+            fan(1, 2, 90., 2000, 50.),
+        ],
+        (SUPPORT, 1) => vec![ring(7, 20, 6000, 50.).delay(2000)],
+        (SUPPORT, 2 | 3 | 4 | 5) => {
+            let mut v = vec![fan(5, 1, 0., 1000, 20.)];
+            if stage >= 3 {
+                v.push(fan(6, 1, 0., 3000, 20.));
+            }
+            if stage == 4 {
+                v.push(fan(8, 2, 10., 1000, 999.).offset(180.));
+            }
+            v.extend(support_fans([1, 2, 3, 4], [3, 4, 5, 6], [120., 90., 72., 60.]));
+            v
+        }
+        (SUPPORT, 6) => {
+            let mut v = vec![fan(5, 2, 15., 1000, 20.), fan(6, 2, 15., 3000, 20.)];
+            v.extend(support_fans([1, 2, 3, 4], [3, 4, 5, 6], [120., 90., 72., 60.]));
+            v
+        }
+        (SUPPORT, 7) => {
+            let mut v = vec![
+                fan(5, 1, 0., 1000, 20.),
+                fan(0, 1, 0., 750, 20.),
+                fan(8, 6, 10., 500, 999.).offset(180.),
+            ];
+            v.extend(support_fans([1, 2, 3, 4], [4, 5, 6, 8], [90., 72., 60., 45.]));
+            v
+        }
+        (ATTACKER, 1) => vec![ring(3, 20, 6000, 50.).delay(2000)],
+        (ATTACKER, 2) => vec![
+            fan(2, 2, 10., 500, 14.),
+            fan(0, 1, 0., 2000, 12.),
+            grenade(3., 160, 3000, 10.),
+            grenade(4., 120, 3000, 10.).delay(1500),
+        ],
+        (ATTACKER, 3) => vec![
+            fan(2, 1, 0., 500, 14.),
+            fan(2, 2, 90., 1000, 14.),
+            fan(2, 2, 90., 1000, 14.).offset(270.),
+            fan(1, 8, 45., 5000, 11.),
+            fan(0, 2, 45., 1500, 12.),
+            fan(4, 1, 0., 500, 99.),
+            grenade(3., 160, 3000, 10.).delay(6000),
+            grenade(4., 120, 3000, 10.).delay(7500),
+        ],
+        (ATTACKER, 4) => {
+            let mut v = attacker_core();
+            v.extend([
+                fan(4, 1, 0., 500, 99.),
+                fan(4, 1, 0., 500, 99.).offset(90.),
+                grenade(3., 160, 3000, 10.),
+                grenade(4., 120, 3000, 10.).delay(1500),
+            ]);
+            v
+        }
+        (ATTACKER, 5 | 6) => {
+            let mut v = attacker_core();
+            v.extend([
+                fan(4, 1, 0., 500, 99.),
+                fan(4, 1, 0., 500, 99.).offset(90.),
+                grenade(5., 45, 4500, 10.).delay(6000),
+                grenade(4., 100, 4500, 10.).delay(7500),
+                grenade(3., 120, 4500, 10.).delay(9000),
+            ]);
+            v
+        }
+        (ATTACKER, 7) => {
+            let mut v = attacker_core();
+            v.extend([
+                grenade(3., 150, 3000, 10.).delay(6000),
+                grenade(4., 120, 3000, 10.).delay(7500),
+            ]);
+            v
+        }
+        (MUMMY, _) => vec![ring(0, 22, 2250, 25.)],
+        (SCARAB, _) => vec![fan(1, 1, 0., 500, 3.)],
+        (EAGLE, _) => vec![ring(1, 12, 3000, 25.)],
+        (PRIEST, _) => vec![ring(1, 3, 3500, 50.), ring(0, 6, 7200, 50.)],
+        (PRIESTESS, _) => vec![ring(1, 6, 3500, 50.), ring(0, 2, 7200, 50.)],
+        (ACTIVE, _) => vec![ring(0, 8, 3000, 10.)],
+        (0xd22..=0xd24, _) => vec![ring(0, 3, 2500, 3.)],
+        (0xd1c..=0xd21, _) => vec![ring(0, 3, 2500, 12.)],
+        (JACKAL, _) => vec![fan(0, 3, 20., 1500, 10.), fan(1, 1, 0., 3000, 10.)],
+        (LION, _) => {
+            let mut v = vec![fan(1, 3, 10., 1250, 25.)];
+            v.extend((0..4).map(|i| fan(2, 1, 0., 6000, 25.).fixed(((90 * i) as f32).to_radians())));
+            v
+        }
+        (0xd31..=0xd33, _) => {
+            // The spin is clocked from the activation, not from a world phase.
+            return match crate::dungeon::tomb::turret_spin(age) {
+                Some(t) => Schedule {
+                    state: 1 + age / 7000,
+                    age: t,
+                    attacks: (0..8)
+                        .map(|i| {
+                            fan(0, 5, 60., 1200, 0.)
+                                .fixed(((15 * i) as f32).to_radians())
+                                .delay(150 * i as u64)
+                        })
+                        .collect(),
+                },
+                None => Schedule {
+                    state: 0,
+                    age: 0,
+                    attacks: vec![],
+                },
+            };
+        }
+        _ => vec![],
+    };
+    Schedule {
+        state: stage,
+        age,
+        attacks,
+    }
+}
+
+/// Head stage = phase * 10 + step (guard 1, fire 3, entry 5 shoot); hands 2 = fixed fan, 3 = paralysing
+/// fan while chasing; a smasher in stage 1 is lit and bursts. `state` re-arms the clocks every step.
+pub(crate) fn shaitan_schedule(kind: u16, stage: u64, state: u64, age: u64) -> Schedule {
+    use crate::dungeon::shaitan::*;
+    let fan = Attack::fan;
+    let attacks = match (kind, stage % 10) {
+        (HEAD, 1 | 5) => vec![fan(0, 1, 0., 1000, 9.)],
+        (HEAD, 3) => vec![fan((stage >= 10) as u8, 7, 15., 1000, 8.).predict(1.)],
+        (HAND_R | HAND_L, 2) => {
+            let angle = if kind == HAND_R { 45f32 } else { 135f32 };
+            vec![fan(0, 6, 25., 500, 999.).fixed(angle.to_radians())]
+        }
+        (HAND_R | HAND_L, 3) => vec![fan(2, 6, 60., 750, 999.).offset(25.)],
+        (SMASH_R | SMASH_L, 1) => vec![Attack::ring(0, 10, 50, 0.).fixed(0.).delay(600).once()],
+        (CREEPY_HANDS, _) => vec![fan(0, 6, 60., 1500, 4.)],
+        (CREEPY_HEAD, _) => vec![fan(0, 2, 10., 400, 6.)],
+        _ => vec![],
+    };
+    Schedule {
+        state,
+        age,
+        attacks,
+    }
+}
+
+pub(crate) fn lab_schedule(kind: u16, stage: u64, age: u64) -> Schedule {
+    use crate::dungeon::lab::{BOSS, CRUSHER, CYBORG, ENFORCER, EXPERIMENT, MINI_BOT, POTION, TURRET};
+    let fan = Attack::fan;
+    let ring = Attack::ring;
+    let attacks = match (kind, stage) {
+        (POTION, _) => vec![ring(0, 6, 50, 0.).fixed(0.).delay(2000).once()],
+        (TURRET, _) | (MINI_BOT | 0x1e25, _) => vec![fan(0, 2, 20., 1000, 10.)],
+        (0x993..=0x996, 1) => vec![ring(0, 20, 2000, 0.).fixed(0.)],
+        (CYBORG | 0x1e24, 0 | 1) => vec![fan(stage as u8, 1, 0., 800, 10.).predict(1.)],
+        (CYBORG | 0x1e24, _) => vec![ring(2, 8, 50, 0.).fixed(0.).delay(2000).once()],
+        (EXPERIMENT | 0x1e23, _) => vec![fan(0, 1, 0., 800, 10.).predict(1.)],
+        (ENFORCER, _) => vec![fan(0, 3, 20., 1000, 10.), fan(1, 4, 20., 1000, 10.)],
+        (CRUSHER, 0) => vec![fan(0, 3, 20., 1000, 10.)],
+        (CRUSHER, s) => vec![fan(s.min(3) as u8, 2, 20., 1000, 10.)],
+        (BOSS, _) | _ => vec![],
     };
     Schedule {
         state: stage,

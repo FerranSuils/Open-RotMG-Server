@@ -111,7 +111,7 @@ async fn lifecycle_finalize_qa_spawn_cancel_after_create_keeps_owned_publication
             .unwrap(),
         1
     );
-    fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 async fn script_leave(app: App, id: i32) -> (axum::http::StatusCode, String) {
@@ -314,7 +314,7 @@ async fn duplicate_script_leave(fault: &str) {
     let claim = app.claim(peer_account).unwrap();
     drop(claim);
     assert_eq!(writes(), if fault == "sql" { 0 } else { 1 });
-    fs::remove_dir_all(dir).unwrap();
+    crate::test_fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

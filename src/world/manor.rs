@@ -6,8 +6,8 @@ use crate::{
 };
 
 pub(super) struct Toss {
-    parent: i32,
-    kind: u16,
+    pub(super) parent: i32,
+    pub(super) kind: u16,
     position: Pos,
     deadline: u64,
     lifetime: u64,

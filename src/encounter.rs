@@ -5,6 +5,7 @@ pub(crate) mod attacks;
 pub(crate) mod fauna;
 pub(crate) mod jungle;
 pub(crate) mod landmarks;
+pub(crate) mod patterns;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Anchor {
@@ -78,6 +79,9 @@ pub(crate) fn nr_speed(rate: f32) -> f32 {
     (5.55 * rate + 0.74) * 1.5
 }
 pub fn profile(kind: u16) -> Option<Profile> {
+    if let Some(profile) = crate::dungeon::procedural::profile(kind) {
+        return Some(profile);
+    }
     if matches!(
         kind,
         crate::dungeon::beach::BOSS | crate::dungeon::beach::BUM
@@ -91,6 +95,15 @@ pub fn profile(kind: u16) -> Option<Profile> {
         return Some(crate::dungeon::manor::profile(kind));
     }
     if let Some(profile) = crate::dungeon::davy::profile(kind) {
+        return Some(profile);
+    }
+    if let Some(profile) = crate::dungeon::tomb::profile(kind) {
+        return Some(profile);
+    }
+    if let Some(profile) = crate::dungeon::lab::profile(kind) {
+        return Some(profile);
+    }
+    if let Some(profile) = crate::dungeon::shaitan::profile(kind) {
         return Some(profile);
     }
     if let Some(profile) = crate::dungeon::trench::profile(kind) {
@@ -397,7 +410,7 @@ pub fn movement(kind: u16, hp: i32, elapsed: u64) -> (Motion, f32) {
         _ => (p.motion, p.speed),
     }
 }
-fn spread(index: u8, count: usize, gap: f32, heading: f32) -> Vec<(u8, f32)> {
+pub(crate) fn spread(index: u8, count: usize, gap: f32, heading: f32) -> Vec<(u8, f32)> {
     (0..count)
         .map(|i| {
             (
@@ -407,7 +420,7 @@ fn spread(index: u8, count: usize, gap: f32, heading: f32) -> Vec<(u8, f32)> {
         })
         .collect()
 }
-fn ring(index: u8, count: usize, offset: f32) -> Vec<(u8, f32)> {
+pub(crate) fn ring(index: u8, count: usize, offset: f32) -> Vec<(u8, f32)> {
     (0..count)
         .map(|i| {
             (
@@ -421,6 +434,9 @@ fn ring(index: u8, count: usize, offset: f32) -> Vec<(u8, f32)> {
 pub fn phased_attacks(kind: u16, hp: i32, heading: f32, elapsed: u64) -> Vec<(u8, f32)> {
     if crate::dungeon::abyss::ROSTER.contains(&kind) {
         return crate::dungeon::abyss::attacks(kind, heading, elapsed);
+    }
+    if let Some(shots) = crate::dungeon::procedural::attacks(kind, heading) {
+        return shots;
     }
     if let Some(schedule) = attacks::schedule(kind, hp, elapsed) {
         return schedule.snapshot(heading);
@@ -549,6 +565,35 @@ pub fn validate(content: &Content, kind: u16) -> Result<()> {
     if crate::dungeon::trench::ROSTER.contains(&kind) {
         return crate::dungeon::trench::validate(content, kind);
     }
+    let tomb = crate::dungeon::tomb::ROSTER.contains(&kind);
+    let shaitan = crate::dungeon::shaitan::ROSTER.contains(&kind);
+    if tomb || shaitan || crate::dungeon::lab::ROSTER.contains(&kind) {
+        ensure!(profile(kind).is_some(), "missing epoch dungeon profile for {kind:#x}");
+        for stage in 0..=16 {
+            let schedule = if tomb {
+                attacks::tomb_schedule(kind, stage, 0)
+            } else if shaitan {
+                attacks::shaitan_schedule(kind, stage, 0, 0)
+            } else {
+                attacks::lab_schedule(kind, stage, 0)
+            };
+            for attack in schedule.attacks {
+                ensure!(
+                    attack.interval.is_none_or(|ms| ms > 0 && ms.is_multiple_of(50))
+                        && attack.delay.is_multiple_of(50)
+                        && (1..=255).contains(&attack.count),
+                    "invalid epoch dungeon attack channel for {kind:#x}"
+                );
+                if let attacks::Action::Shoot { projectile, .. } = attack.action {
+                    ensure!(
+                        content.get(kind)?.projectiles.contains_key(&projectile),
+                        "missing epoch dungeon projectile {kind:#x}/{projectile}"
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
     if crate::quest::ROSTER.contains(&kind) {
         return crate::quest::validate(content, kind);
     }
@@ -594,7 +639,7 @@ pub fn validate(content: &Content, kind: u16) -> Result<()> {
                                 );
                             }
                         }
-                        attacks::Action::Grenade { radius, damage } => {
+                        attacks::Action::Grenade { radius, damage, .. } => {
                             ensure!(radius > 0. && damage > 0, "invalid grenade for {kind:#x}")
                         }
                     }

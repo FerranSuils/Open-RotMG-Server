@@ -225,6 +225,15 @@ impl World {
         if crate::dungeon::davy::profile(self.entities[&id].kind).is_some() {
             return self.locker_mechanics(id, target, elapsed);
         }
+        if crate::dungeon::tomb::ROSTER.contains(&self.entities[&id].kind) {
+            return self.tomb_mechanics(id, target, elapsed);
+        }
+        if crate::dungeon::lab::ROSTER.contains(&self.entities[&id].kind) {
+            return self.lab_mechanics(id, target, elapsed);
+        }
+        if crate::dungeon::shaitan::ROSTER.contains(&self.entities[&id].kind) {
+            return self.shaitan_mechanics(id, target);
+        }
         if self.entities[&id].kind == crate::dungeon::snake::BOSS {
             return self.snake_mechanics(id, elapsed);
         }
@@ -550,7 +559,7 @@ impl World {
                 }
             } else if matches!(
                 self.entities[&id].kind,
-                0x91a | 0xd50 | crate::dungeon::manor::CREATURE
+                0x91a | 0xd50 | crate::dungeon::manor::CREATURE | crate::dungeon::shaitan::HEAD
             ) && self.entities[&id]
                 .expires
                 .is_some_and(|deadline| deadline <= self.now)
@@ -574,6 +583,15 @@ impl World {
         }
         if crate::dungeon::manor::ROSTER.contains(&defeated.kind) {
             return self.manor_death(defeated);
+        }
+        if crate::dungeon::tomb::ROSTER.contains(&defeated.kind) {
+            return self.tomb_death(defeated);
+        }
+        if crate::dungeon::lab::ROSTER.contains(&defeated.kind) {
+            return self.lab_death(defeated);
+        }
+        if crate::dungeon::shaitan::ROSTER.contains(&defeated.kind) {
+            return self.shaitan_death(defeated);
         }
         if defeated.kind == 0xe37 {
             self.ghost_ship_locker_reward(defeated)?;

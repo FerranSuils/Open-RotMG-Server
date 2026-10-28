@@ -23,10 +23,13 @@ pub(crate) mod gold;
 mod guilds;
 mod hiscores;
 mod legends;
+pub(crate) mod moderation;
 pub use guilds::{Guild, GuildAction, Membership as GuildMembership};
 pub(crate) mod pictures;
 
 mod purchases;
+mod rankings;
+pub(crate) mod restoration;
 mod resurrection;
 mod social;
 pub use purchases::Purchase;
@@ -156,6 +159,45 @@ pub struct Character {
     pub beaches: u64,
     #[serde(default)]
     pub davy_lockers: u64,
+    /// Cripta, Lava, Selva and Hielo clears, in procedural::THEMES order.
+    #[serde(default)]
+    pub themed_dungeons: [u64; 4],
+    #[serde(default)]
+    pub tombs: u64,
+    #[serde(default)]
+    pub mad_labs: u64,
+    #[serde(default)]
+    pub shaitans: u64,
+    /// Dreamscape, Kitchen, Candyland, Cemetery and Treasure Cave clears (THEMES 4..=8).
+    #[serde(default)]
+    pub themed_more: [u64; 5],
+    /// Fame augment levels by crate::augments::AUGMENTS index.
+    #[serde(default)]
+    pub augments: Vec<u8>,
+    /// Augments offered for the next pick, chosen with /augment.
+    #[serde(default)]
+    pub augment_offer: Vec<u8>,
+    /// Opt-in card overlay for augment offers (default: /augment in chat only).
+    #[serde(default)]
+    pub augment_panel: bool,
+    /// How /autoshot picks its target (the on/off switch is not saved).
+    #[serde(default)]
+    pub autoshot: crate::autoshot::Settings,
+    // Death bonus counters (store::death_awards).
+    #[serde(default)]
+    pub potions: u64,
+    #[serde(default)]
+    pub abilities: u64,
+    #[serde(default)]
+    pub teleports: u64,
+    #[serde(default)]
+    pub god_kills: u64,
+    #[serde(default)]
+    pub cube_kills: u64,
+    #[serde(default)]
+    pub oryx_kills: u64,
+    #[serde(default)]
+    pub level_assists: u64,
 }
 pub fn level_start(level: i32) -> Result<i32> {
     ensure!((1..=20).contains(&level), "invalid character level {level}");
@@ -166,6 +208,13 @@ pub fn experience_goal(level: i32) -> Result<i32> {
     Ok(50 + (level - 1) * 100)
 }
 impl Character {
+    pub fn record_kill(&mut self, kind: u16, quest: bool, group: &str) {
+        self.kills += 1;
+        self.quests += u64::from(quest);
+        self.god_kills += u64::from(group == "Gods");
+        self.cube_kills += u64::from(group.starts_with("Cube"));
+        self.oryx_kills += u64::from(kind == 0x932);
+    }
     pub fn gain_experience(
         &mut self,
         content: &Content,
@@ -262,6 +311,10 @@ impl Character {
                     .context("effective stat overflow")?;
             }
         }
+        crate::augments::validate(self)?;
+        for (stat, bonus) in stats.iter_mut().zip(crate::augments::stat_bonus(self)) {
+            *stat = stat.checked_add(bonus).context("augment stat overflow")?;
+        }
         ensure!(stats.iter().all(|v| *v >= 0), "negative effective stat");
         Ok(stats)
     }
@@ -350,7 +403,10 @@ impl Store {
         let mut c = Connection::open(path)?;
         let version: i32 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(
-            matches!(version, 0 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15),
+            matches!(
+                version,
+                0 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18
+            ),
             "unsupported game database schema {version}"
         );
         death_awards::check_schema(&c, version)?;
@@ -435,6 +491,9 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         vaults::migrate(&migration, version)?;
         death_awards::migrate(&migration, version, legacy_base)?;
         pictures::migrate(&migration, version)?;
+        rankings::migrate(&migration, version)?;
+        restoration::migrate(&migration, version)?;
+        moderation::migrate(&migration)?;
         let records = {
             let mut q = migration.prepare("SELECT id,stats FROM characters ORDER BY id")?;
             q.query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))?
@@ -507,7 +566,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             );
         }
         death_awards::validate_wallets(&migration)?;
-        migration.pragma_update(None, "user_version", 15)?;
+        migration.pragma_update(None, "user_version", 18)?;
         migration.commit()?;
         if migrated > 0 {
             tracing::info!(
@@ -821,6 +880,22 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 manors: 0,
                 beaches: 0,
                 davy_lockers: 0,
+                themed_dungeons: [0; 4],
+                tombs: 0,
+                mad_labs: 0,
+                shaitans: 0,
+                themed_more: [0; 5],
+                augments: Vec::new(),
+                augment_offer: Vec::new(),
+                augment_panel: false,
+                autoshot: Default::default(),
+                potions: 0,
+                abilities: 0,
+                teleports: 0,
+                god_kills: 0,
+                cube_kills: 0,
+                oryx_kills: 0,
+                level_assists: 0,
             };
             tx.execute(
                 "INSERT INTO characters(account,stats,items) VALUES(?1,?2,?3)",
@@ -990,7 +1065,7 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             let saved: Character = serde_json::from_str(&raw)?;
             ensure!(saved.schema == ch.schema && saved.class == ch.class && saved.base == ch.base
                 && saved.level == ch.level && saved.exp == ch.exp && saved.fame == ch.fame
-                && saved.pirate_caves == ch.pirate_caves && saved.dungeons == ch.dungeons && saved.abysses == ch.abysses && saved.trenches == ch.trenches && saved.spider_dens == ch.spider_dens && saved.jungles == ch.jungles && saved.manors == ch.manors && saved.beaches == ch.beaches && saved.davy_lockers == ch.davy_lockers
+                && saved.pirate_caves == ch.pirate_caves && saved.dungeons == ch.dungeons && saved.abysses == ch.abysses && saved.trenches == ch.trenches && saved.spider_dens == ch.spider_dens && saved.jungles == ch.jungles && saved.manors == ch.manors && saved.beaches == ch.beaches && saved.davy_lockers == ch.davy_lockers && saved.themed_dungeons == ch.themed_dungeons && saved.tombs == ch.tombs && saved.mad_labs == ch.mad_labs && saved.shaitans == ch.shaitans && saved.themed_more == ch.themed_more
                 && serde_json::from_str::<Vec<i32>>(&items)? == ch.items,
                 "permanent potion reservation changed");
             ch.base[index] += amount;
@@ -1022,6 +1097,10 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
         self.call(move |c| {
             let tx = c.transaction()?;
             for ch in characters {
+                let raw: Option<String> = tx.query_row("SELECT stats FROM characters WHERE id=?1 AND account=?2 AND alive=1", params![ch.id, ch.account], |r| r.get(0)).optional()?;
+                if let Some(raw) = raw {
+                    rankings::log_gain(&tx, &ch, serde_json::from_str::<serde_json::Value>(&raw)?["fame"].as_i64().unwrap_or(0) as i32)?;
+                }
                 let n = tx.execute("UPDATE characters SET stats=?3 WHERE id=?1 AND account=?2 AND alive=1 AND revision=?4", params![ch.id, ch.account, serde_json::to_string(&ch)?, ch.revision])?;
                 ensure!(n == 1, "progress conflict: dead, missing or stale character {} at revision {}", ch.id, ch.revision);
             }
@@ -1029,7 +1108,12 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
             Ok(())
         }).await
     }
-    pub async fn death(&self, mut ch: Character, killed_by: String) -> Result<()> {
+    pub async fn death(
+        &self,
+        mut ch: Character,
+        killed_by: String,
+        evidence: serde_json::Value,
+    ) -> Result<()> {
         ch.xp_boost.active = false;
         ensure!(
             !ch.alive && ch.hp == 0 && ch.fame >= 0 && ch.revision >= 0 && ch.revision < i32::MAX,
@@ -1047,26 +1131,29 @@ CREATE INDEX IF NOT EXISTS deaths_by_time ON deaths(died_at);")?;
                 && ch.fame >= saved.fame && ch.xp_boost.bonus_exp >= saved.xp_boost.bonus_exp
                 && serde_json::from_str::<Vec<i32>>(&items)? == ch.items,
                 "death snapshot lost committed progress or equipment");
-            let bonus = death_awards::equipment(&ch, &content)?;
+            let bonuses = death_awards::bonuses(&tx, &ch, &content)?;
+            let bonus: i32 = bonuses.iter().map(|b| b.2).sum();
             let total = death_awards::total(&ch, bonus)?;
             let snapshot = serde_json::to_string(&ch)?;
             let n = tx.execute("UPDATE characters SET alive=0,stats=?3,items=?4,revision=revision+1 WHERE id=?1 AND account=?2 AND alive=1 AND revision=?5",
                 params![ch.id,ch.account,snapshot,serde_json::to_string(&[-1;12])?,ch.revision])?;
             ensure!(n == 1, "death lost its reservation");
-            tx.execute("INSERT INTO deaths(character,snapshot,killed_by,equipment_fame) VALUES(?1,?2,?3,?4)",
-                params![ch.id,snapshot,killed_by,bonus])?;
+            tx.execute("INSERT INTO deaths(character,snapshot,killed_by,bonus_fame,bonuses) VALUES(?1,?2,?3,?4,?5)",
+                params![ch.id,snapshot,killed_by,bonus,serde_json::to_string(&bonuses)?])?;
             ensure!(tx.execute("UPDATE account_fame SET balance=balance+?2,earned=earned+?2 WHERE account=?1",params![ch.account,total])? == 1,
                 "account fame wallet missing");
             guilds::credit_death(&tx,ch.account,total)?;
+            rankings::log_gain(&tx, &ch, saved.fame)?;
+            restoration::record(&tx, &ch, total, &evidence)?;
             tx.commit()?;
-            tracing::info!(account=ch.account, character=ch.id, base_fame=ch.fame, equipment_fame=bonus, total_fame=total, "permanent death award committed");
+            tracing::info!(account=ch.account, character=ch.id, base_fame=ch.fame, bonus_fame=bonus, total_fame=total, bonuses=?bonuses.iter().map(|b| b.0.as_str()).collect::<Vec<_>>(), "permanent death award committed");
             Ok(())
         }).await
     }
     pub async fn fame(&self, account: i32, id: i32) -> Result<String> {
         let legacy_base = self.legacy_base;
         // The legacy field is called CreatedOn, but the client labels it as the death date.
-        self.call(move|db|{let (snapshot,killer,died_at,bonus):(String,String,u64,i32)=db.query_row("SELECT snapshot,killed_by,died_at,equipment_fame FROM deaths JOIN characters ON characters.id=deaths.character WHERE characters.account=?1 AND deaths.character=?2",params![account,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;let c = decode_character(&snapshot, legacy_base)?;ensure!(c.id==id && c.account==account && !c.alive && c.hp==0 && c.items.len()==12,"invalid archived death snapshot");let total=death_awards::total(&c,bonus)?;let equipment=if bonus>0 {format!("<Bonus id=\"Well Equipped\" desc=\"Bonus for equipment\">{bonus}</Bonus>")}else{String::new()};ensure!(died_at>0 && died_at<=8_640_000_000_000,"invalid recorded death time");Ok(format!("<Fame><Char id=\"{}\"><Account><Name>{}</Name></Account><ObjectType>{}</ObjectType><Level>{}</Level><Tex1>{}</Tex1><Tex2>{}</Tex2></Char><CreatedOn>{}</CreatedOn><KilledBy>{}</KilledBy><TotalFame>{}</TotalFame><Shots>{}</Shots><ShotsThatDamage>{}</ShotsThatDamage><TilesUncovered>{}</TilesUncovered><MonsterKills>{}</MonsterKills><GodKills>0</GodKills><OryxKills>0</OryxKills><QuestsCompleted>{}</QuestsCompleted><PirateCavesCompleted>{}</PirateCavesCompleted><UndeadLairsCompleted>{}</UndeadLairsCompleted><AbyssOfDemonsCompleted>{}</AbyssOfDemonsCompleted><SnakePitsCompleted>{}</SnakePitsCompleted><SpiderDensCompleted>{}</SpiderDensCompleted><SpriteWorldsCompleted>{}</SpriteWorldsCompleted><TombsCompleted>0</TombsCompleted><LevelUpAssists>0</LevelUpAssists><BaseFame>{}</BaseFame>{}</Fame>",c.id,xml_escape(&c.name),c.class,c.level,c.tex1,c.tex2,died_at,xml_escape(&killer),total,c.shots,c.hits,c.tiles,c.kills,c.quests,c.pirate_caves,c.dungeons[2],c.abysses,c.dungeons[0],c.spider_dens,c.dungeons[1],c.fame,equipment))}).await
+        self.call(move|db|{let (snapshot,killer,died_at,bonus,bonuses):(String,String,u64,i32,String)=db.query_row("SELECT snapshot,killed_by,died_at,bonus_fame,bonuses FROM deaths JOIN characters ON characters.id=deaths.character WHERE characters.account=?1 AND deaths.character=?2",params![account,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?;let c = decode_character(&snapshot, legacy_base)?;ensure!(c.id==id && c.account==account && !c.alive && c.hp==0 && c.items.len()==12,"invalid archived death snapshot");let total=death_awards::total(&c,bonus)?;let bonuses=serde_json::from_str::<Vec<death_awards::Bonus>>(&bonuses)?.iter().map(|(id,desc,fame)|format!("<Bonus id=\"{}\" desc=\"{}\">{fame}</Bonus>",xml_escape(id),xml_escape(desc))).collect::<String>();ensure!(died_at>0 && died_at<=8_640_000_000_000,"invalid recorded death time");Ok(format!("<Fame><Char id=\"{}\"><Account><Name>{}</Name></Account><ObjectType>{}</ObjectType><Level>{}</Level><Tex1>{}</Tex1><Tex2>{}</Tex2></Char><CreatedOn>{}</CreatedOn><KilledBy>{}</KilledBy><TotalFame>{}</TotalFame><Shots>{}</Shots><ShotsThatDamage>{}</ShotsThatDamage><TilesUncovered>{}</TilesUncovered><MonsterKills>{}</MonsterKills><GodKills>{}</GodKills><OryxKills>{}</OryxKills><QuestsCompleted>{}</QuestsCompleted><PirateCavesCompleted>{}</PirateCavesCompleted><UndeadLairsCompleted>{}</UndeadLairsCompleted><AbyssOfDemonsCompleted>{}</AbyssOfDemonsCompleted><SnakePitsCompleted>{}</SnakePitsCompleted><SpiderDensCompleted>{}</SpiderDensCompleted><SpriteWorldsCompleted>{}</SpriteWorldsCompleted><TombsCompleted>{}</TombsCompleted><LevelUpAssists>{}</LevelUpAssists><BaseFame>{}</BaseFame>{}</Fame>",c.id,xml_escape(&c.name),c.class,c.level,c.tex1,c.tex2,died_at,xml_escape(&killer),total,c.shots,c.hits,c.tiles,c.kills,c.god_kills,c.oryx_kills,c.quests,c.pirate_caves,c.dungeons[2],c.abysses,c.dungeons[0],c.spider_dens,c.dungeons[1],c.tombs,c.level_assists,c.fame,bonuses))}).await
     }
     #[cfg(test)]
     pub async fn rename(&self, account: i32, name: String) -> Result<()> {
@@ -1371,7 +1458,9 @@ mod tests {
         let mut dead = ch.clone();
         dead.alive = false;
         dead.hp = 0;
-        s.death(dead, "potion regression".into()).await.unwrap();
+        s.death(dead, "potion regression".into(), serde_json::json!({}))
+            .await
+            .unwrap();
         assert!(s.consume_stat(ch, Some(4), 4, 1, Vec::new()).await.is_err());
     }
     #[tokio::test]
@@ -1528,7 +1617,11 @@ mod tests {
         dead.hp = 0;
         dead.alive = false;
         store
-            .death(dead, "prepared retry regression".into())
+            .death(
+                dead,
+                "prepared retry regression".into(),
+                serde_json::json!({}),
+            )
             .await
             .unwrap();
         let replacement = store
@@ -1592,7 +1685,9 @@ mod tests {
             assert_eq!(saved.beaches, 8);
             saved.alive = false;
             saved.hp = 0;
-            s.death(saved, "test clear snapshot".into()).await.unwrap();
+            s.death(saved, "test clear snapshot".into(), serde_json::json!({}))
+                .await
+                .unwrap();
             let fame = s.fame(ch.account, ch.id).await.unwrap();
             for counter in [
                 "<PirateCavesCompleted>1</PirateCavesCompleted>",
@@ -1704,7 +1799,9 @@ mod tests {
         ch.hp = 0;
         ch.alive = false;
         let dead_id = ch.id;
-        s.death(ch, "vault test".into()).await.unwrap();
+        s.death(ch, "vault test".into(), serde_json::json!({}))
+            .await
+            .unwrap();
         let replacement = s
             .create(owner.id, content.get(WIZARD).unwrap())
             .await
@@ -1737,7 +1834,9 @@ mod tests {
         s.progress(ch.clone()).await.unwrap();
         ch.hp = 0;
         ch.alive = false;
-        s.death(ch, "record test".into()).await.unwrap();
+        s.death(ch, "record test".into(), serde_json::json!({}))
+            .await
+            .unwrap();
         let account = s.list("class-records".into()).await.unwrap();
         assert_eq!(account.best_levels.get(&WIZARD), Some(&5));
         assert!(account.characters.is_empty());
@@ -1772,9 +1871,13 @@ mod tests {
         s.progress(wizard.clone()).await.unwrap();
         wizard.hp = 0;
         wizard.alive = false;
-        s.death(wizard, "ordinary death fixture".into())
-            .await
-            .unwrap();
+        s.death(
+            wizard,
+            "ordinary death fixture".into(),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
         assert!(s.create(a.id, c.get(PRIEST).unwrap()).await.is_err());
         let mut wizard = s.create(a.id, c.get(WIZARD).unwrap()).await.unwrap();
         wizard.level = 5;
@@ -1783,9 +1886,13 @@ mod tests {
         assert!(s.create(a.id, c.get(PRIEST).unwrap()).await.is_err());
         wizard.hp = 0;
         wizard.alive = false;
-        s.death(wizard, "ordinary death fixture".into())
-            .await
-            .unwrap();
+        s.death(
+            wizard,
+            "ordinary death fixture".into(),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
         let priest = s.create(a.id, c.get(PRIEST).unwrap()).await.unwrap();
         assert_eq!(priest.class, PRIEST);
         assert_eq!(priest.base, c.classes[&PRIEST].base);
@@ -1830,9 +1937,13 @@ mod tests {
         assert!(s.create(a.id, c.get(ARCHER).unwrap()).await.is_err());
         priest.hp = 0;
         priest.alive = false;
-        s.death(priest, "ordinary death fixture".into())
-            .await
-            .unwrap();
+        s.death(
+            priest,
+            "ordinary death fixture".into(),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
         let archer = s.create(a.id, c.get(ARCHER).unwrap()).await.unwrap();
         assert_eq!(archer.base, c.classes[&ARCHER].base);
         assert_eq!(archer.items, c.get(ARCHER).unwrap().equipment);
@@ -1889,9 +2000,13 @@ mod tests {
                 assert!(s.create(a.id, c.get(class).unwrap()).await.is_err());
                 previous.alive = false;
                 previous.hp = 0;
-                s.death(previous, "ordinary death fixture".into())
-                    .await
-                    .unwrap();
+                s.death(
+                    previous,
+                    "ordinary death fixture".into(),
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap();
             }
             let created = s.create(a.id, c.get(class).unwrap()).await.unwrap();
             let loaded = s.load(a.id, created.id).await.unwrap();
@@ -1951,7 +2066,11 @@ mod tests {
         wizard.hp = 0;
         wizard.alive = false;
         store
-            .death(wizard.clone(), "prepared lifecycle fixture".into())
+            .death(
+                wizard.clone(),
+                "prepared lifecycle fixture".into(),
+                serde_json::json!({}),
+            )
             .await
             .unwrap();
         let replacement = store
@@ -2019,7 +2138,10 @@ mod tests {
         assert_eq!(resumed.shots, 4);
         bot.hp = 0;
         bot.alive = false;
-        store.death(bot, "test enemy".into()).await.unwrap();
+        store
+            .death(bot, "test enemy".into(), serde_json::json!({}))
+            .await
+            .unwrap();
         let replacement = reopened
             .shore_character("Bayleaf".into(), "Triceps".into(), &content, true)
             .await
@@ -2061,7 +2183,7 @@ mod tests {
         assert_eq!(records, 2);
         drop(reopened);
         drop(store);
-        std::fs::remove_file(path).unwrap();
+        crate::test_fs::remove_file(&path);
     }
     #[tokio::test]
     async fn legacy_metadata_migration_preserves_immutable_death_bytes() {
@@ -2084,7 +2206,9 @@ mod tests {
         let mut dead = characters[1].clone();
         dead.hp = 0;
         dead.alive = false;
-        s.death(dead.clone(), "legacy pirate".into()).await.unwrap();
+        s.death(dead.clone(), "legacy pirate".into(), serde_json::json!({}))
+            .await
+            .unwrap();
         let legacy = |ch: &Character| {
             let mut value = serde_json::to_value(ch).unwrap();
             for key in ["schema", "class", "base", "pirate_caves"] {
@@ -2142,7 +2266,7 @@ mod tests {
         assert!(decode_character("{\"level\":1,\"exp\":0,\"class\":784}", migrated.base).is_err());
         assert!(decode_character("{\"level\":2,\"exp\":50}", migrated.base).is_err());
         drop(s);
-        std::fs::remove_file(path).unwrap();
+        crate::test_fs::remove_file(&path);
     }
     #[tokio::test]
     async fn exchange_is_atomic_and_rejects_stale_or_foreign_owners() {
@@ -2220,9 +2344,15 @@ mod tests {
         ch.items = inv;
         ch.hp = 0;
         ch.alive = false;
-        s.death(ch.clone(), "test enemy".into()).await.unwrap();
+        s.death(ch.clone(), "test enemy".into(), serde_json::json!({}))
+            .await
+            .unwrap();
         assert!(s.load(a.id, ch.id).await.is_err());
-        assert!(s.death(ch.clone(), "test enemy".into()).await.is_err());
+        assert!(
+            s.death(ch.clone(), "test enemy".into(), serde_json::json!({}))
+                .await
+                .is_err()
+        );
         let fame = s.fame(a.id, ch.id).await.unwrap();
         let root = roxmltree::Document::parse(&fame).unwrap();
         assert_eq!(root.root_element().tag_name().name(), "Fame");
