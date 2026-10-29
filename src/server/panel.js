@@ -77,6 +77,10 @@
   async function choose(slot) {
     // pickLock / choosing also block keyboard 1–3 (ap-busy only kills pointer events).
     if (sending || pickLock || state.choosing || !state.open || !state.cards?.some(c => c.slot === slot)) return;
+    // Snapshot the posted offer BEFORE await. A concurrent poll can land the post-apply
+    // deal on `state` while POST is in flight; locking that next offer would strand picks.
+    const snapPending = state.pending;
+    const snapSig = offerSig(state.cards);
     sending = true; render();
     let applied = false;
     try {
@@ -91,8 +95,8 @@
       // must not keep the old offer clickable (pending>1 redeals; wrong second pick).
       if (applied) {
         pickLock = true;
-        lockedPending = state.pending;
-        lockedSig = offerSig(state.cards);
+        lockedPending = snapPending;
+        lockedSig = snapSig;
         state = {...state, cards: [], choosing: true};
       }
       render();

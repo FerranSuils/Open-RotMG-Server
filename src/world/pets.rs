@@ -71,6 +71,12 @@ impl World {
             .collect();
         for (id, ability) in due {
             let p = self.players.get_mut(&id).unwrap();
+            // Fireball is combat like autoshot; pause it for the invuln card overlay.
+            // Heal/Mana stay useful while choosing. Do not consume the pulse so fire
+            // resumes as soon as the panel closes (range can exceed the calm ring).
+            if matches!(ability, Ability::Fireball) && p.panel_open {
+                continue;
+            }
             p.pet_at = now + PULSE_MS;
             let result = match ability {
                 Ability::Heal(amount)
@@ -280,5 +286,58 @@ mod tests {
         }
         let angle = angle.expect("the dragon fired");
         assert!((angle - std::f32::consts::FRAC_PI_2).abs() < 0.2, "{angle}");
+    }
+
+    #[test]
+    fn dragon_fireball_pauses_while_augment_panel_is_open() {
+        let (mut w, p) = with_pet("Ember Dragon");
+        let at = w.players[&p].pos;
+        let kind = *w
+            .content
+            .objects
+            .iter()
+            .find(|(_, o)| o.name == "Shore Crab")
+            .unwrap()
+            .0;
+        // Same spacing as dragon_breathes_fire… — Fire Wand also reaches past the calm
+        // ring (~10.01 > 9), which is why the panel_open gate matters in live play.
+        let crab = w
+            .spawn_entity(
+                kind,
+                Pos {
+                    x: at.x,
+                    y: at.y + 3.,
+                },
+                vec![],
+            )
+            .unwrap();
+        w.entities.get_mut(&crab).unwrap().condition |=
+            crate::condition::bit(crate::condition::PARALYZED);
+        {
+            let ch = &mut w.players.get_mut(&p).unwrap().character;
+            ch.augment_panel = true;
+            ch.augment_offer = vec![0, 1, 2];
+        }
+        w.players.get_mut(&p).unwrap().last_combat_at = 0;
+        for _ in 0..200 {
+            w.panel_state(p);
+            w.step();
+            if w.players[&p].panel_open {
+                break;
+            }
+        }
+        assert!(w.players[&p].panel_open, "panel should open with a live offer");
+        // dragon_breathes_fire_at_the_nearest_enemy covers the happy path; this locks the gate.
+        for _ in 0..40 {
+            w.panel_state(p);
+            w.apply_condition(p, crate::condition::INVULNERABLE, 200)
+                .unwrap();
+            w.step();
+            assert!(w.players[&p].panel_open, "panel stays open while offered");
+            assert!(
+                w.bullets.iter().all(|b| b.owner != p || b.id < 128),
+                "dragon must not fire while the card overlay is open"
+            );
+        }
     }
 }
