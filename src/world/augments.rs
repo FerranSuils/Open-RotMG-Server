@@ -119,16 +119,29 @@ impl World {
             .ok()
             .filter(|n| (1..=p.character.augment_offer.len()).contains(n))
             .ok_or_else(|| controller("Usage: /augment 1, 2 or 3 when an augment is available (/augments to list them)."))?;
+        // Also reject while a progress save is in flight: pending_progress_where takes
+        // augment_choice immediately, so is_none alone leaves a window where a second pick
+        // queues against the old (or redealt) offer before finish_progress publishes.
         ensure!(
-            p.augment_choice.is_none(),
+            p.augment_choice.is_none() && !p.pending,
             controller("Already applying an augment; wait a moment.")
         );
         p.augment_choice = Some(slot - 1);
         tracing::info!(player = id, slot, "augment chosen");
         Ok(())
     }
+    fn enemy_near(&self, pos: Pos, radius: f32) -> bool {
+        // Spatial scan — panel_step only needs emptiness; avoid a full-map actors() walk.
+        // actors_near uses strict <; query radius+1 then keep the historical inclusive <=.
+        self.actors_near(pos, radius + 1.).any(|e| {
+            e.hp > 0
+                && self.content.objects[&e.kind].enemy
+                && self.content.objects[&e.kind].class != "Wall"
+                && e.pos.distance(pos) <= radius
+        })
+    }
     fn augment_targets(&self, pos: Pos, radius: f32) -> Vec<i32> {
-        self.actors()
+        self.actors_near(pos, radius + 1.)
             .filter(|e| {
                 e.hp > 0
                     && self.content.objects[&e.kind].enemy
@@ -159,7 +172,7 @@ impl World {
         let ids: Vec<i32> = self.players.keys().copied().collect();
         for id in ids {
             let pos = self.players[&id].pos;
-            let fighting = !self.augment_targets(pos, COMBAT_RADIUS).is_empty();
+            let fighting = self.enemy_near(pos, COMBAT_RADIUS);
             let now = self.now;
             let p = self.players.get_mut(&id).unwrap();
             if fighting {
@@ -211,8 +224,12 @@ impl World {
                     "weapon": !matches!(augment.effect, Effect::Stat { .. })})
             })
             .collect();
+        // Sticky choosing while p.pending: after take() and before finish_progress the live
+        // offer is still the old cards but augment_choice is None — without this the overlay
+        // would show them clickable again.
         serde_json::json!({"open": p.panel_open, "enabled": ch.augment_panel,
-            "choosing": p.augment_choice.is_some(), "pending": crate::augments::pending(ch), "cards": cards})
+            "choosing": p.augment_choice.is_some() || p.pending,
+            "pending": crate::augments::pending(ch), "cards": cards})
     }
     /// Swarm-style weapons fire on their own; stat augments live in Character::effective.
     pub(super) fn augments_step(&mut self) -> Result<()> {
@@ -449,6 +466,50 @@ mod tests {
             w.now += 50;
             w.augments_step().unwrap();
         }
+    }
+
+    #[test]
+    fn in_flight_pick_rejects_a_second_choice_and_keeps_choosing_sticky() {
+        let mut w = arena(0);
+        let mut c = ch(&w);
+        c.exp = 60_000;
+        c.fame = 60;
+        let p = w.enter(c, None).unwrap();
+        let (pid, snapshot) = w
+            .pending_progress_where(|_, _| true)
+            .into_iter()
+            .next()
+            .unwrap();
+        w.finish_progress(pid, snapshot).unwrap();
+        assert_eq!(
+            w.players[&p].character.augment_offer.len(),
+            crate::augments::OFFER
+        );
+        w.augment_command(p, "1").unwrap();
+        let (pid, snapshot) = w
+            .pending_progress_where(|_, _| true)
+            .into_iter()
+            .next()
+            .unwrap();
+        // Between take and finish: choice is gone, offer still old, progress pending.
+        assert!(w.players[&p].pending);
+        assert!(w.players[&p].augment_choice.is_none());
+        assert!(
+            w.augment_command(p, "2").is_err(),
+            "second pick must not queue while the first save is in flight"
+        );
+        let state = w.panel_state(p);
+        assert_eq!(
+            state["choosing"], true,
+            "overlay stays busy so cards are not clickable during the gap"
+        );
+        assert_eq!(
+            state["cards"].as_array().unwrap().len(),
+            crate::augments::OFFER
+        );
+        w.finish_progress(pid, snapshot).unwrap();
+        assert!(!w.players[&p].pending);
+        assert_eq!(w.panel_state(p)["choosing"], false);
     }
 
     #[test]

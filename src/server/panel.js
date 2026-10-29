@@ -48,10 +48,13 @@
   new ResizeObserver(() => layer.style.setProperty('--ap-scale', client.clientWidth / 800)).observe(client);
   const esc = s => String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
   let state = {open: false}, shown = '', sending = false;
+  // After a successful POST, suppress stale cards until the server reports choosing (in-flight
+  // save) or an empty offer — a bare successful GET can briefly re-publish the pre-take offer.
+  let pickLock = false, sawChoosing = false;
   function render() {
     const visible = state.open && state.cards && state.cards.length > 0;
     layer.classList.toggle('on', visible);
-    layer.classList.toggle('ap-busy', !!state.choosing || sending);
+    layer.classList.toggle('ap-busy', !!state.choosing || sending || pickLock);
     if (!visible) { shown = ''; return; }
     const signature = JSON.stringify(state.cards) + state.pending;
     if (signature === shown) return;
@@ -68,12 +71,27 @@
       <div class="ap-foot">Click a card or press 1, 2 or 3</div></div>`;
   }
   async function choose(slot) {
-    if (sending || !state.open || !state.cards.some(c => c.slot === slot)) return;
+    if (sending || !state.open || !state.cards?.some(c => c.slot === slot)) return;
     sending = true; render();
+    let applied = false;
     try {
-      await fetch('/api/augments/panel', {method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({key, slot})});
-    } finally { sending = false; poll(); }
+      const r = await fetch('/api/augments/panel', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key, slot}), signal: AbortSignal.timeout(1500)});
+      applied = r.ok;
+    } catch { /* timeout/network: leave cards up; poll() refreshes */ }
+    finally {
+      // Un-busy before poll: a soft-fail GET would skip render and leave pointer-events:none.
+      sending = false;
+      // Drop choosable cards once the server accepted the pick. A following soft-fail GET
+      // must not keep the old offer clickable (pending>1 redeals; wrong second pick).
+      if (applied) {
+        pickLock = true;
+        sawChoosing = false;
+        state = {...state, cards: [], choosing: true};
+      }
+      render();
+      poll();
+    }
   }
   layer.addEventListener('click', e => { const card = e.target.closest('.ap-card'); if (card) choose(+card.dataset.slot); });
   // Capture phase: keys 1-3 go to the cards, not the game, only while they are visible.
@@ -82,13 +100,79 @@
     e.preventDefault(); e.stopImmediatePropagation();
     choose(+e.key);
   }, true);
-  async function poll() {
-    try {
-      const r = await fetch(`/api/augments/panel?key=${key}`, {cache: 'no-store'});
-      state = r.ok ? await r.json() : {open: false};
-    } catch { state = {open: false}; }
+  // Mirror server OVERLAY_ALIVE_MS: after this without a confirmed poll, invuln is gone.
+  const OVERLAY_ALIVE_MS = 2000;
+  let timer = 0, generation = 0, lastBeat = 0, recoverUntil = 0;
+  function leaseAlive() {
+    // lastBeat is stamped at request start so soft-fail grace cannot outrun the server lease by RTT.
+    return lastBeat > 0 && Date.now() - lastBeat <= OVERLAY_ALIVE_MS;
+  }
+  // Fast cadence only while cards are up or in the post-release recover window.
+  // Do NOT key off leaseAlive: every successful idle poll would reset lastBeat and lock 400ms forever.
+  function fastPoll() {
+    return state.open || Date.now() < recoverUntil;
+  }
+  /** Soft failures keep cards briefly; once the server lease is past, drop the local overlay
+   *  so clicks reach the map, but keep a short fast-retry window to recover. */
+  function releaseIfStale() {
+    if (!state.open || leaseAlive()) return;
+    state = {open: false};
+    recoverUntil = Date.now() + OVERLAY_ALIVE_MS;
     render();
   }
+  function schedule() {
+    clearTimeout(timer);
+    // Idle polls pause while hidden. Keep the open-panel / recovery heartbeat running:
+    // the server drops overlay invulnerability if panel_state is not hit within OVERLAY_ALIVE_MS.
+    if (document.hidden && !fastPoll()) return;
+    // Poll often while cards are up or recovering; idle below the 2s overlay heartbeat otherwise.
+    timer = setTimeout(poll, fastPoll() ? 400 : 1000);
+  }
+  async function poll() {
+    // Cancel a pending timer so resume/choose cannot overlap a scheduled tick (double GET + gen bump).
+    clearTimeout(timer);
+    timer = 0;
+    const gen = ++generation;
+    const beatAt = Date.now();
+    try {
+      const r = await fetch(`/api/augments/panel?key=${key}`, {
+        cache: 'no-store', signal: AbortSignal.timeout(1500)});
+      if (r.ok) {
+        let next = await r.json();
+        // Check after body parse so a slow older poll cannot overwrite a newer resume/choose.
+        if (gen !== generation) return;
+        lastBeat = beatAt;
+        recoverUntil = 0;
+        if (pickLock) {
+          if (next.choosing) sawChoosing = true;
+          if (sawChoosing && !next.choosing) {
+            pickLock = false;
+          } else if (!next.choosing && next.cards?.length) {
+            // Pre-take offer still live without sticky choosing — keep it non-clickable.
+            next = {...next, cards: [], choosing: true};
+          } else if (!next.choosing && !next.cards?.length) {
+            pickLock = false;
+          }
+        }
+        state = next;
+        render();
+      } else {
+        // Soft failure: keep prior state until the server lease would have expired.
+        releaseIfStale();
+      }
+    } catch {
+      releaseIfStale();
+    }
+    if (gen !== generation) return;
+    schedule();
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      if (!fastPoll()) clearTimeout(timer);
+      // else leave the open-panel / recovery heartbeat running
+    } else {
+      poll();
+    }
+  });
   poll();
-  setInterval(poll, 400);
 })();
