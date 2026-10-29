@@ -119,11 +119,12 @@ impl World {
             .ok()
             .filter(|n| (1..=p.character.augment_offer.len()).contains(n))
             .ok_or_else(|| controller("Usage: /augment 1, 2 or 3 when an augment is available (/augments to list them)."))?;
-        // Also reject while a progress save is in flight: pending_progress_where takes
+        // Also reject while an augment pick save is in flight: pending_progress_where takes
         // augment_choice immediately, so is_none alone leaves a window where a second pick
         // queues against the old (or redealt) offer before finish_progress publishes.
+        // Use augment_applying — not generic p.pending — so XP/clear/pet saves do not block picks.
         ensure!(
-            p.augment_choice.is_none() && !p.pending,
+            p.augment_choice.is_none() && !p.augment_applying,
             controller("Already applying an augment; wait a moment.")
         );
         p.augment_choice = Some(slot - 1);
@@ -224,11 +225,11 @@ impl World {
                     "weapon": !matches!(augment.effect, Effect::Stat { .. })})
             })
             .collect();
-        // Sticky choosing while p.pending: after take() and before finish_progress the live
-        // offer is still the old cards but augment_choice is None — without this the overlay
-        // would show them clickable again.
+        // Sticky choosing while augment_applying: after take() and before finish_progress the
+        // live offer is still the old cards but augment_choice is None — without this the
+        // overlay would show them clickable again. Generic p.pending (XP/…) must not busy cards.
         serde_json::json!({"open": p.panel_open, "enabled": ch.augment_panel,
-            "choosing": p.augment_choice.is_some() || p.pending,
+            "choosing": p.augment_choice.is_some() || p.augment_applying,
             "pending": crate::augments::pending(ch), "cards": cards})
     }
     /// Swarm-style weapons fire on their own; stat augments live in Character::effective.
@@ -491,8 +492,9 @@ mod tests {
             .into_iter()
             .next()
             .unwrap();
-        // Between take and finish: choice is gone, offer still old, progress pending.
+        // Between take and finish: choice is gone, offer still old, pick save in flight.
         assert!(w.players[&p].pending);
+        assert!(w.players[&p].augment_applying);
         assert!(w.players[&p].augment_choice.is_none());
         assert!(
             w.augment_command(p, "2").is_err(),
@@ -509,7 +511,46 @@ mod tests {
         );
         w.finish_progress(pid, snapshot).unwrap();
         assert!(!w.players[&p].pending);
+        assert!(!w.players[&p].augment_applying);
         assert_eq!(w.panel_state(p)["choosing"], false);
+    }
+
+    #[test]
+    fn xp_only_pending_does_not_sticky_busy_or_block_picks() {
+        let mut w = arena(0);
+        let mut c = ch(&w);
+        c.exp = 60_000;
+        c.fame = 60;
+        let p = w.enter(c, None).unwrap();
+        let (pid, snapshot) = w
+            .pending_progress_where(|_, _| true)
+            .into_iter()
+            .next()
+            .unwrap();
+        w.finish_progress(pid, snapshot).unwrap();
+        assert_eq!(
+            w.players[&p].character.augment_offer.len(),
+            crate::augments::OFFER
+        );
+        // Queue XP only (no augment pick) and start a progress save.
+        w.players.get_mut(&p).unwrap().experience_queued = 10;
+        let (pid, snapshot) = w
+            .pending_progress_where(|_, _| true)
+            .into_iter()
+            .next()
+            .expect("xp-only save queues");
+        assert!(w.players[&p].pending);
+        assert!(
+            !w.players[&p].augment_applying,
+            "XP save must not mark an augment pick in flight"
+        );
+        assert_eq!(
+            w.panel_state(p)["choosing"], false,
+            "overlay must stay clickable during non-pick progress"
+        );
+        w.augment_command(p, "1").unwrap();
+        assert_eq!(w.players[&p].augment_choice, Some(0));
+        w.finish_progress(pid, snapshot).unwrap();
     }
 
     #[test]

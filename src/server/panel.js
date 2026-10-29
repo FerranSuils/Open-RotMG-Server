@@ -48,9 +48,13 @@
   new ResizeObserver(() => layer.style.setProperty('--ap-scale', client.clientWidth / 800)).observe(client);
   const esc = s => String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
   let state = {open: false}, shown = '', sending = false;
-  // After a successful POST, suppress stale cards until the server reports choosing (in-flight
-  // save) or an empty offer — a bare successful GET can briefly re-publish the pre-take offer.
-  let pickLock = false, sawChoosing = false;
+  // After a successful POST, suppress the pre-take offer until durable evidence the save
+  // advanced (pending dropped or offer signature changed). Do not require observing a
+  // transient choosing:true pulse — a fast finish can skip it and strand later picks.
+  let pickLock = false, lockedPending = 0, lockedSig = '';
+  function offerSig(cards) {
+    return JSON.stringify(cards || []);
+  }
   function render() {
     const visible = state.open && state.cards && state.cards.length > 0;
     layer.classList.toggle('on', visible);
@@ -71,7 +75,8 @@
       <div class="ap-foot">Click a card or press 1, 2 or 3</div></div>`;
   }
   async function choose(slot) {
-    if (sending || !state.open || !state.cards?.some(c => c.slot === slot)) return;
+    // pickLock / choosing also block keyboard 1–3 (ap-busy only kills pointer events).
+    if (sending || pickLock || state.choosing || !state.open || !state.cards?.some(c => c.slot === slot)) return;
     sending = true; render();
     let applied = false;
     try {
@@ -86,7 +91,8 @@
       // must not keep the old offer clickable (pending>1 redeals; wrong second pick).
       if (applied) {
         pickLock = true;
-        sawChoosing = false;
+        lockedPending = state.pending;
+        lockedSig = offerSig(state.cards);
         state = {...state, cards: [], choosing: true};
       }
       render();
@@ -144,14 +150,20 @@
         lastBeat = beatAt;
         recoverUntil = 0;
         if (pickLock) {
-          if (next.choosing) sawChoosing = true;
-          if (sawChoosing && !next.choosing) {
+          if (next.choosing) {
+            // In-flight save: keep lock; busy via choosing so keys/clicks stay blocked.
+          } else if (!next.cards?.length) {
             pickLock = false;
-          } else if (!next.choosing && next.cards?.length) {
-            // Pre-take offer still live without sticky choosing — keep it non-clickable.
-            next = {...next, cards: [], choosing: true};
-          } else if (!next.choosing && !next.cards?.length) {
-            pickLock = false;
+          } else {
+            const sig = offerSig(next.cards);
+            const advanced = (typeof next.pending === 'number' && next.pending < lockedPending)
+              || sig !== lockedSig;
+            if (advanced) {
+              pickLock = false;
+            } else {
+              // Same pre-take offer still live — keep it non-clickable.
+              next = {...next, cards: [], choosing: true};
+            }
           }
         }
         state = next;

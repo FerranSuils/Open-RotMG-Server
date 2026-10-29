@@ -342,6 +342,9 @@ pub struct Player {
     pub experience_queued: i32,
     /// Offer slot chosen with /augment, applied by the next progress save.
     augment_choice: Option<usize>,
+    /// True between taking an augment pick into a progress snapshot and finish_progress.
+    /// Distinct from `pending` (any XP/clear/pet/… save) so overlay sticky-busy only covers picks.
+    augment_applying: bool,
     /// Pending /augment panel preference, persisted by the next progress save.
     augment_panel_toggle: Option<bool>,
     /// Pending /pet choice (None inside = no pet), persisted by the next progress save.
@@ -2386,6 +2389,7 @@ impl World {
                 pending: false,
                 experience_queued: 0,
                 augment_choice: None,
+                augment_applying: false,
                 augment_panel_toggle: None,
                 pet_choice: None,
                 autoshot_on: false,
@@ -4090,7 +4094,12 @@ impl World {
                         .checked_add(queued)
                         .context("dungeon clear counter overflow")?;
                 }
-                crate::augments::advance(&mut snapshot, p.augment_choice.take(), &mut self.rng)?;
+                let choice = p.augment_choice.take();
+                // Latch before advance so a prep failure after take still sticky-blocks picks.
+                if choice.is_some() {
+                    p.augment_applying = true;
+                }
+                crate::augments::advance(&mut snapshot, choice, &mut self.rng)?;
                 if let Some(pet) = p.pet_choice.take() {
                     snapshot.pet_kind = pet;
                 }
@@ -4191,6 +4200,7 @@ impl World {
         }
         p.pending = false;
         p.progress_started = false;
+        p.augment_applying = false;
         let pos = p.pos;
         if leveled {
             for (other, p) in &mut self.players {
