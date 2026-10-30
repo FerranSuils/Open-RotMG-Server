@@ -454,9 +454,10 @@ impl World {
                 }
                 continue;
             }
+            // Spatial scan — same pattern as autoshot / pet Fireball / panel calm.
+            // actors_near is strict <; query radius+1 then keep inclusive <= reach.
             let target = self
-                .entities
-                .values()
+                .actors_near(position, 6.)
                 .filter(|e| {
                     e.hp > 0
                         && self.content.objects[&e.kind].enemy
@@ -477,8 +478,7 @@ impl World {
                 0x1400 => {
                     let center = self.entities[&target].pos;
                     let targets: Vec<_> = self
-                        .entities
-                        .values()
+                        .actors_near(center, 2.)
                         .filter(|e| {
                             e.hp > 0
                                 && self.content.objects[&e.kind].enemy
@@ -993,6 +993,57 @@ mod tests {
         assert!(
             w.entities[&enemy].hp < 1000,
             "purple drake resumes combat when the panel closes"
+        );
+    }
+
+    #[test]
+    fn purple_drake_spatial_scan_keeps_inclusive_reach() {
+        // actors_near is strict <; combat must still hit exactly at reach 5 (historical
+        // entities.values() walk used inclusive <=) and miss just beyond.
+        let (mut w, id) = fixture(0xaa9);
+        let plan = stage(&mut w, id, 5);
+        let entity = plan.companion.as_ref().unwrap().entity.unwrap();
+        commit(&mut w, plan);
+        let pos = w.entities[&entity].pos;
+        let in_reach = w
+            .spawn_entity(
+                0x600,
+                Pos {
+                    x: pos.x + 5.,
+                    y: pos.y,
+                },
+                vec![],
+            )
+            .unwrap();
+        w.entities.get_mut(&in_reach).unwrap().hp = 1000;
+        w.now += 50;
+        w.companion_step().unwrap();
+        assert!(
+            w.entities[&in_reach].hp < 1000,
+            "enemy at exactly 5 tx must stay in purple-drake reach after spatial scan"
+        );
+
+        let (mut w, id) = fixture(0xaa9);
+        let plan = stage(&mut w, id, 5);
+        let entity = plan.companion.as_ref().unwrap().entity.unwrap();
+        commit(&mut w, plan);
+        let pos = w.entities[&entity].pos;
+        let out = w
+            .spawn_entity(
+                0x600,
+                Pos {
+                    x: pos.x + 5.01,
+                    y: pos.y,
+                },
+                vec![],
+            )
+            .unwrap();
+        w.entities.get_mut(&out).unwrap().hp = 1000;
+        w.now += 50;
+        w.companion_step().unwrap();
+        assert_eq!(
+            w.entities[&out].hp, 1000,
+            "enemy past 5 tx must stay outside purple-drake reach"
         );
     }
 }

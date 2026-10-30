@@ -143,7 +143,10 @@ impl World {
             .collect()
     }
     fn ability_enemies(&self, pos: Pos, radius: f32) -> Vec<i32> {
-        self.actors()
+        // Spatial scan — same pattern as augment_targets / autoshot. actors_near is
+        // strict <; query radius+1 then keep inclusive <= so trap/poison/nova reach
+        // matches the historical full-map actors() walk.
+        self.actors_near(pos, radius + 1.)
             .filter(|e| {
                 e.hp > 0 && self.content.objects[&e.kind].enemy && e.pos.distance(pos) <= radius
             })
