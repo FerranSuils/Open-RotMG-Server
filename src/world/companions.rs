@@ -387,8 +387,12 @@ impl World {
             if owner.paused {
                 continue;
             }
+            // Automatic combat (like autoshot / dragon fire): pause while the invuln
+            // card overlay is open. Do not consume pulse/remaining so fire resumes
+            // when the panel closes. Follow + White Drake heal still run.
+            let panel_open = owner.panel_open;
             if matches!(kind, 0x1407 | 0x1408) {
-                if pet.remaining > 0 && pet.pulse <= self.now {
+                if !panel_open && pet.remaining > 0 && pet.pulse <= self.now {
                     self.firecracker_pulse(id, kind)?;
                 }
                 continue;
@@ -410,6 +414,11 @@ impl World {
             }
             let pet = self.companions.active.get_mut(&id).unwrap();
             if pet.permanent || pet.pulse > self.now {
+                continue;
+            }
+            // Damaging period pets reach from the companion (lag ≤12 + attack ≤5),
+            // past the player's 9 tx calm ring — same class as Fireball.
+            if panel_open && kind != 0x1401 {
                 continue;
             }
             pet.pulse = self.now
@@ -910,5 +919,80 @@ mod tests {
             assert_eq!(saved.revision, revision);
             assert_eq!(saved.pet_kind, None);
         }
+    }
+
+    #[test]
+    fn firecracker_combat_pauses_while_augment_panel_is_open() {
+        use rand::{Rng, SeedableRng};
+        let (mut w, id) = firecracker_fixture(0xc2b);
+        w.rng = rand::rngs::StdRng::seed_from_u64(42);
+        let plan = stage(&mut w, id, 5);
+        let entity = plan.companion.as_ref().unwrap().entity.unwrap();
+        commit(&mut w, plan);
+        let origin = w.entities[&entity].pos;
+        let enemy = w.spawn_entity(0x600, origin, vec![]).unwrap();
+        w.entities.get_mut(&enemy).unwrap().hp = 2000;
+        w.players.get_mut(&id).unwrap().panel_open = true;
+        let remaining = w.companions.active[&entity].remaining;
+        let pulse = w.companions.active[&entity].pulse;
+        assert!(remaining > 0 && pulse <= w.now, "first pulse is due on publish");
+        w.companion_step().unwrap();
+        assert_eq!(w.entities[&enemy].hp, 2000, "no firecracker damage during panel");
+        assert_eq!(
+            w.companions.active[&entity].remaining, remaining,
+            "panel pause must not consume remaining pulses"
+        );
+        assert_eq!(
+            w.companions.active[&entity].pulse, pulse,
+            "panel pause must not advance the pulse clock"
+        );
+        // Predict the jump firecracker_pulse will take so the enemy is in radius 1.
+        let mut rng = w.rng.clone();
+        let land = Pos {
+            x: origin.x + rng.gen_range(-2..2) as f32,
+            y: origin.y + rng.gen_range(-2..2) as f32,
+        };
+        w.position_entity(enemy, land).unwrap();
+        w.players.get_mut(&id).unwrap().panel_open = false;
+        w.companion_step().unwrap();
+        assert_eq!(w.entities[&enemy].hp, 1900, "firecracker resumes when panel closes");
+        assert_eq!(w.companions.active[&entity].remaining, remaining - 1);
+    }
+
+    #[test]
+    fn purple_drake_combat_pauses_while_augment_panel_is_open() {
+        let (mut w, id) = fixture(0xaa9);
+        let plan = stage(&mut w, id, 5);
+        let entity = plan.companion.as_ref().unwrap().entity.unwrap();
+        commit(&mut w, plan);
+        assert_eq!(w.entities[&entity].kind, 0x1400);
+        let pos = w.entities[&entity].pos;
+        let enemy = w
+            .spawn_entity(
+                0x600,
+                Pos {
+                    x: pos.x + 2.,
+                    y: pos.y,
+                },
+                vec![],
+            )
+            .unwrap();
+        w.entities.get_mut(&enemy).unwrap().hp = 1000;
+        // Publish schedules combat after 50ms; advance so the pulse is due.
+        w.now += 50;
+        w.players.get_mut(&id).unwrap().panel_open = true;
+        let pulse = w.companions.active[&entity].pulse;
+        w.companion_step().unwrap();
+        assert_eq!(w.entities[&enemy].hp, 1000, "drake must not hit during panel");
+        assert_eq!(
+            w.companions.active[&entity].pulse, pulse,
+            "panel pause must not consume the combat pulse"
+        );
+        w.players.get_mut(&id).unwrap().panel_open = false;
+        w.companion_step().unwrap();
+        assert!(
+            w.entities[&enemy].hp < 1000,
+            "purple drake resumes combat when the panel closes"
+        );
     }
 }
